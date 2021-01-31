@@ -1,0 +1,16 @@
+[package]
+name = "graal"
+version = "0.1.0"
+authors = ["Alexandre Bléron <alex.bleron@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+ash = "0.31.0"
+vk-mem = "0.2.2"
+lazy_static = "1.4.0"
+raw-window-handle = "0.3.3"
+slotmap = "1.0.2"
+fixedbitset = "0.3.2"
+
+[dev-dependencies]
+winit = "0.24.0"
