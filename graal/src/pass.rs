@@ -80,11 +80,18 @@ pub(crate) struct Pass {
     pub(crate) wait_before: bool,
     pub(crate) wait_serials: [u64; MAX_QUEUES],
     pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
-    pub(crate) wait_binary_semaphores: UniqueHandleVec<vk::Semaphore>,
+    pub(crate) wait_binary_semaphores: Vec<vk::Semaphore>,
     pub(crate) kind: PassKind,
 }
 
 impl Pass {
+    pub(crate) fn is_present(&self) -> bool {
+        match self.kind{
+            PassKind::Present {..} => true,
+            _ => false
+        }
+    }
+
     pub(crate) fn new_render_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass {
         Self::new(name, batch_index, snn, PassKind::Render {})
     }
@@ -131,7 +138,7 @@ impl Pass {
             wait_before: false,
             wait_serials: [0; MAX_QUEUES],
             wait_dst_stages: [Default::default(); MAX_QUEUES],
-            wait_binary_semaphores: UniqueHandleVec::new(),
+            wait_binary_semaphores: Vec::new(),
             kind,
             batch_index
         }

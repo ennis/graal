@@ -11,6 +11,8 @@ use slotmap::{new_key_type, Key, SecondaryMap, SlotMap};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::mem;
+use std::mem::swap;
+use std::ops::Sub;
 use std::os::raw::c_void;
 use std::rc::Rc;
 
@@ -28,11 +30,28 @@ fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
 }
 
 #[derive(Copy, Clone, Debug, Default)]
-pub struct ImageProperties {
+pub struct ResourceCreateInfo {
+    pub transient: bool,
+    pub mem_required_flags: vk::MemoryPropertyFlags,
+    pub mem_preferred_flags: vk::MemoryPropertyFlags,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ImageResourceCreateInfo {
+    pub image_type: vk::ImageType,
+    pub usage: vk::ImageUsageFlags,
+    pub format: vk::Format,
+    pub extent: vk::Extent3D,
     pub mip_levels: u32,
     pub array_layers: u32,
     pub samples: u32,
     pub tiling: vk::ImageTiling,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BufferResourceCreateInfo {
+    pub usage: vk::BufferUsageFlags,
+    pub byte_size: u64,
 }
 
 fn get_mip_level_count(width: u32, height: u32) -> u32 {
@@ -202,13 +221,19 @@ impl Default for ResourceTrackingInfo {
 struct Resource {
     name: String,
     user_ref_count: usize,
-    owned: bool,
     allocation_requirements: AllocationRequirements,
-    allocation: vk_mem::Allocation,
-    allocation_info: Option<vk_mem::AllocationInfo>,
+    allocation: Option<vk_mem::Allocation>,
     tracking: ResourceTrackingInfo,
     tmp_index: Option<usize>,
     kind: ResourceKind,
+}
+
+unsafe fn bind_resource_memory(
+    device: &ash::Device,
+    resource: &Resource,
+    device_memory: vk::DeviceMemory,
+    offset: vk::DeviceSize,
+) {
 }
 
 /// Adds an execution dependency between a source and destination pass, identified by their submission numbers.
@@ -298,7 +323,7 @@ fn compute_reachability(passes: &[Pass]) -> Reachability {
 }
 
 pub struct Batch<'ctx> {
-    start_serial: u64,
+    base_serial: u64,
     context: &'ctx mut Context,
     /// Map temporary index -> resource
     temporaries: Vec<ResourceId>,
@@ -311,7 +336,7 @@ pub struct Batch<'ctx> {
 impl<'ctx> Batch<'ctx> {
     fn new(context: &'ctx mut Context) -> Batch<'ctx> {
         Batch {
-            start_serial: context.next_serial,
+            base_serial: context.next_serial,
             context,
             temporaries: vec![],
             temporary_set: TemporarySet::new(),
@@ -412,7 +437,7 @@ impl<'ctx> Batch<'ctx> {
         // handle external semaphore dependency
         let semaphore = mem::take(&mut resource.tracking.wait_binary_semaphore);
         if !semaphore.is_null() {
-            pass.wait_binary_semaphores.push(semaphore);
+            pass.wait_binary_semaphores.push(semaphore.into_inner());
             pass.wait_before = true;
         }
 
@@ -422,7 +447,7 @@ impl<'ctx> Batch<'ctx> {
                 add_execution_dependency(
                     resource.tracking.writer,
                     Self::get_pass_mut(
-                        self.start_serial,
+                        self.base_serial,
                         &mut self.passes,
                         resource.tracking.writer,
                     ),
@@ -436,7 +461,7 @@ impl<'ctx> Batch<'ctx> {
                         let src_snn = SubmissionNumber::new(q as u8, resource.tracking.readers[q]);
                         add_execution_dependency(
                             src_snn,
-                            Self::get_pass_mut(self.start_serial, &mut self.passes, src_snn),
+                            Self::get_pass_mut(self.base_serial, &mut self.passes, src_snn),
                             pass,
                             access.input_stage,
                         );
@@ -454,7 +479,7 @@ impl<'ctx> Batch<'ctx> {
                 add_execution_dependency(
                     resource.tracking.writer,
                     Self::get_pass_mut(
-                        self.start_serial,
+                        self.base_serial,
                         &mut self.passes,
                         resource.tracking.writer,
                     ),
@@ -594,7 +619,7 @@ impl<'ctx> Batch<'ctx> {
         }
 
         println!("Final resource states: ");
-        for id in self.temporaries {
+        for &id in self.temporaries.iter() {
             let resource = self.context.resources.get(id).unwrap();
             println!("`{}`", resource.name);
             println!("    stages={:?}", resource.tracking.stages);
@@ -621,64 +646,127 @@ impl<'ctx> Batch<'ctx> {
                 println!("    writer: {:?}", resource.tracking.writer);
             }
         }
+
+        self.context
+            .enqueue_passes(self.base_serial, self.temporaries, self.passes)
     }
 }
 
 /// Represents a queue submission (a call to vkQueueSubmit or vkQueuePresent)
-struct QueueSubmission {
+struct SubmissionBatch {
     wait_serials: [u64; MAX_QUEUES],
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
-    base_snn: SubmissionNumber,
     signal_snn: SubmissionNumber,
-    wait_binary_semaphores: Vec<vk::Semaphore>,
-    signal_binary_semaphores: Vec<vk::Semaphore>,
-    render_finished_semaphore: Option<vk::Semaphore>,
-    swapchains: Vec<vk::SwapchainKHR>,
-    swapchain_image_indices: Vec<u32>,
-    command_buffer: vk::CommandBuffer,
+    wait_binary_semaphores: Vec<vk::Semaphore>, // TODO arrayvec
+    signal_binary_semaphores: Vec<vk::Semaphore>, // TODO arrayvec
+    command_buffers: Vec<vk::CommandBuffer>,
 }
 
-impl QueueSubmission {
-    fn new() -> QueueSubmission {
-        QueueSubmission {
+impl SubmissionBatch {
+    fn new() -> SubmissionBatch {
+        SubmissionBatch {
             wait_serials: [0; MAX_QUEUES],
             wait_dst_stages: [Default::default(); MAX_QUEUES],
-            base_snn: Default::default(),
             signal_snn: Default::default(),
             wait_binary_semaphores: vec![],
             signal_binary_semaphores: vec![],
-            render_finished_semaphore: Default::default(),
-            swapchains: vec![],
-            swapchain_image_indices: vec![],
-            command_buffer: Default::default(),
-        }
-    }
-}
-
-struct SubmissionBuilder {
-    open_submissions: [Option<usize>; MAX_QUEUES],
-    submissions: Vec<QueueSubmission>,
-}
-
-impl SubmissionBuilder {
-    fn new() -> SubmissionBuilder {
-        SubmissionBuilder {
-            open_submissions: [None; MAX_QUEUES],
-            submissions: Vec::new(),
+            command_buffers: Vec::new(),
         }
     }
 
-    fn get_open_submission(&mut self, queue: u8) -> &mut QueueSubmission {
-        if let Some(i) = self.open_submissions[queue as usize] {
-            &mut self.submissions[i]
+    /// A submission batch is considered empty if there are no command buffers to submit and
+    /// nothing to signal.
+    /// Even if there are no command buffers, a batch may still submitted if the batch defines
+    /// a wait and a signal operation, as a way of sequencing a timeline semaphore wait and a binary semaphore signal, for instance.
+    fn is_empty(&self) -> bool {
+        !self.signal_snn.is_valid() && self.command_buffers.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.wait_serials = Default::default();
+        self.wait_dst_stages = Default::default();
+        self.wait_serials = Default::default();
+        self.signal_snn = Default::default();
+        self.wait_binary_semaphores.clear();
+        self.signal_binary_semaphores.clear();
+    }
+}
+
+impl Default for SubmissionBatch {
+    fn default() -> Self {
+        SubmissionBatch::new()
+    }
+}
+
+/*struct SubmissionBatchBuilder {
+    open_batches: [Option<usize>; MAX_QUEUES],
+    batches: Vec<SubmissionBatch>,
+}
+
+impl SubmissionBatchBuilder {
+    fn new() -> SubmissionBatchBuilder {
+        SubmissionBatchBuilder {
+            open_batches: [None; MAX_QUEUES],
+            batches: Vec::new(),
+        }
+    }
+
+    fn get_open_batch(&mut self, queue: u8) -> &mut SubmissionBatch {
+        let q = queue as usize;
+        if let Some(i) = self.open_batches[q] {
+            &mut self.batches[i]
         } else {
-            let i = self.submissions.len();
-            self.open_submissions[queue as usize] = Some(i);
-            self.submissions.push(QueueSubmission::new());
-            self.submissions.last_mut().unwrap()
+            let i = self.batches.len();
+            self.open_batches[q] = Some(i);
+            self.batches.push(SubmissionBatch::new());
+            self.batches.last_mut().unwrap()
         }
     }
-}
+
+    fn add_pass(&mut self, pass: &Pass) {
+        let submission = self.get_open_batch(pass.snn.queue());
+        submission.signal_snn = SubmissionNumber::new(
+            pass.snn.queue(),
+            submission.signal_snn.serial().max(pass.snn.serial()),
+        );
+    }
+
+    fn start_batch(
+        &mut self,
+        queue: u8,
+        wait_serials: [u64; MAX_QUEUES],
+        wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
+        wait_binary_semaphores: &[vk::Semaphore],
+    ) {
+        for iq in 0..MAX_QUEUES {
+            if wait_serials[iq] != 0 || iq == queue {
+                self.end_batch(iq as u8);
+            }
+        }
+        let batch = self.get_open_batch(queue);
+        batch.wait_serials = wait_serials;
+        batch.wait_dst_stages = wait_dst_stages;
+        batch.wait_binary_semaphores = wait_binary_semaphores.into();
+    }
+
+    fn end_batch(&mut self, queue: u8) {
+        self.open_batches[queue as usize] = None;
+    }
+
+    fn end_batch_and_present(
+        &mut self,
+        queue: u8,
+        swapchains: &[vk::SwapchainKHR],
+        swapchain_image_indices: &[u32],
+        render_finished_semaphores: &[vk::Semaphore],
+    ) {
+        let b = self.get_open_batch(queue);
+        b.swapchains = swapchains;
+        b.swapchain_image_indices = swapchain_image_indices;
+        b.render_finished_semaphore = Some(render_finished_semaphore);
+        self.end_batch(queue);
+    }
+}*/
 
 pub struct PassBuilder<'ctx, 'batch> {
     batch: &'batch mut Batch<'ctx>,
@@ -724,184 +812,30 @@ struct QueueSubmissionContext<'a> {
     allocation_info: vk_mem::AllocationInfo,
 }*/
 
-struct ResourceAllocationState {
-    index: usize,
-    dead_and_recycled: bool,
-}
-
-struct ResourceAllocationBuilder {
-    allocations: Vec<AllocationRequirements>,
-    allocation_map: SecondaryMap<ResourceId, ResourceAllocationState>,
-}
-
-impl ResourceAllocationBuilder {
-    fn new() -> ResourceAllocationBuilder {
-        ResourceAllocationBuilder {
-            allocations: vec![],
-            allocation_map: Default::default(),
-        }
-    }
-
-    fn assign_memory(
-        &mut self,
-        ctx: &QueueSubmissionContext,
-        pass: &Pass,
-        resource_id: ResourceId,
-    ) {
-        let resource = ctx.resources.get(resource_id).unwrap();
-
-        if !resource.owned
-            || resource.allocation_info.is_some()
-            || self.allocation_map.get(resource_id).is_some()
-        {
-            return;
-        }
-
-        let mut aliased = false;
-
-        for &alias_candidate_id in ctx.temporaries.iter() {
-            let alias_candidate = ctx.resources.get(alias_candidate_id).unwrap();
-
-            if !alias_candidate.owned {
-                continue;
-            }
-
-            // skip if the resource has user handles pointing to it that may live beyond the current batch
-            if alias_candidate.user_ref_count > 0 {
-                continue;
-            }
-
-            let mut alloc_state =
-                if let Some(alloc_state) = self.allocation_map.get_mut(alias_candidate_id) {
-                    // skip if the resource is already dead, and its memory was already reused
-                    if alloc_state.dead_and_recycled {
-                        continue;
-                    }
-                    alloc_state
-                } else {
-                    // skip is not allocated yet
-                    continue;
-                };
-
-            // if we want to use the resource, the resource must be dead (no more uses in subsequent tasks),
-            // and there must be an execution dependency chain between the current task and all tasks that last accessed the resource
-            let mut live = false;
-
-            // Consider the resource to be live if:
-            // 1. the reader is in a previous batch, there's no way to know if the
-            // current task has an execution dependency on it, so exclude this resource.
-            // 2. the reader is in a future serial
-            // 3. there's no execution dependency chain from the reader to the current task.
-            live |= alias_candidate.tracking.readers.iter().any(|&read_serial| {
-                read_serial != 0
-                    && (read_serial <= ctx.base_serial
-                        || read_serial >= pass.snn.serial()
-                        || ctx.reachability.is_reachable(
-                            (read_serial - ctx.base_serial - 1) as usize,
-                            pass.batch_index,
-                        ))
-            });
-
-            let write_serial = alias_candidate.tracking.writer.serial();
-            live = live
-                || (write_serial != 0
-                    && (write_serial <= ctx.base_serial
-                        || write_serial >= pass.snn.serial()
-                        || ctx.reachability.is_reachable(
-                            (write_serial - ctx.base_serial - 1) as usize,
-                            pass.batch_index,
-                        )));
-
-            if live {
-                continue;
-            }
-
-            // the resource is dead, try to reuse
-            let dead_alloc = &mut self.allocations[alloc_state.index];
-
-            if !dead_alloc.try_adjust(&resource.allocation_requirements) {
-                continue;
-            }
-
-            // the two resources may alias; the requirements have been adjusted
-            // update the allocation map
-            let index = alloc_state.index;
-            alloc_state.dead_and_recycled = true;
-
-            self.allocation_map.insert(
-                resource_id,
-                ResourceAllocationState {
-                    index,
-                    dead_and_recycled: false,
-                },
-            );
-
-            aliased = true;
-            break;
-        }
-
-        if !aliased {
-            // new allocation
-            let index = self.allocations.len();
-            self.allocations.push(resource.allocation_requirements);
-            self.allocation_map.insert(
-                resource_id,
-                ResourceAllocationState {
-                    index,
-                    dead_and_recycled: false,
-                },
-            );
-        }
-    }
-}
-
-fn build_queue_submissions(
-    base_serial: u64,
-    resources: &ResourceMap,
-    temporaries: &[ResourceId],
-    passes: &[Pass],
-) -> Vec<QueueSubmission> {
-    let ctx = QueueSubmissionContext {
-        base_serial,
-        resources,
-        temporaries,
-        passes,
-        reachability: compute_reachability(passes),
-    };
-    let mut alloc_builder = ResourceAllocationBuilder::new();
-    let mut submission_builder = SubmissionBuilder::new();
-
-    for p in passes {
-        for access in p.accesses.iter() {
-            alloc_builder.assign_memory(&ctx, p, access.id);
-        }
-    }
-
-    unimplemented!()
-}
-
 type ResourceMap = SlotMap<ResourceId, Resource>;
 
 struct InFlightBatch {
     resources: TemporarySet,
     signalled_serials: [u64; MAX_QUEUES],
     consumed_semaphores: Vec<vk::Semaphore>,
+    transient_allocations: Vec<vk_mem::Allocation>,
 }
 
 pub struct Context {
     device: Device,
     completed_serials: [u64; MAX_QUEUES],
     next_serial: u64,
-    timelines: [UniqueHandle<vk::Semaphore>; MAX_QUEUES],
+    timelines: [vk::Semaphore; MAX_QUEUES],
+    last_signalled_timeline_values: [u64; MAX_QUEUES],
     resources: ResourceMap,
     in_flight: VecDeque<InFlightBatch>,
     available_semaphores: Vec<vk::Semaphore>,
-    vk_khr_swapchain: ash::extensions::khr::Swapchain
+    vk_khr_swapchain: ash::extensions::khr::Swapchain,
 }
 
 impl Context {
     pub fn new(device: Device) -> Context {
-        let mut timelines: [UniqueHandle<vk::Semaphore>; MAX_QUEUES] = Default::default();
+        let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
 
         let mut timeline_create_info = vk::SemaphoreTypeCreateInfo {
             semaphore_type: vk::SemaphoreType::TIMELINE,
@@ -916,26 +850,43 @@ impl Context {
 
         for i in timelines.iter_mut() {
             *i = unsafe {
-                UniqueHandle::new(
-                    device
-                        .device
-                        .create_semaphore(&semaphore_create_info, None)
-                        .expect("failed to create semaphore"),
-                )
+                device
+                    .device
+                    .create_semaphore(&semaphore_create_info, None)
+                    .expect("failed to create semaphore")
             };
         }
 
-        let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device.device);
+        let vk_khr_swapchain =
+            ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device.device);
 
         Context {
             device,
             completed_serials: [0; MAX_QUEUES],
             next_serial: 0,
             timelines,
+            last_signalled_timeline_values: Default::default(),
             resources: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             available_semaphores: vec![],
-            vk_khr_swapchain
+            vk_khr_swapchain,
+        }
+    }
+
+    /// Creates a binary semaphore (or return a previously used semaphore that is unsignalled).
+    fn create_semaphore(&mut self) -> vk::Semaphore {
+        if let Some(semaphore) = self.available_semaphores.pop() {
+            return semaphore;
+        }
+
+        unsafe {
+            let create_info = vk::SemaphoreCreateInfo {
+                ..Default::default()
+            };
+            self.device
+                .device
+                .create_semaphore(&create_info, None)
+                .expect("failed to create semaphore")
         }
     }
 
@@ -960,158 +911,410 @@ impl Context {
         self.next_serial
     }
 
-    // steps:
-    // 1. build submissions and allocate memory for resources
-    // 2. fill command buffers
-    // 3. submit
-    // 4. record the batch, prepare for the next one
-
     fn enqueue_passes(
         &mut self,
-        //temporary_set: TemporarySet,
         base_serial: u64,
         temporaries: Vec<ResourceId>,
         passes: Vec<Pass>,
     ) {
-        let reachability = compute_reachability(&passes);
-        let submissions =
-            build_queue_submissions(base_serial, &self.resources, &temporaries, &passes);
+        self.allocate_transient_memory(base_serial, &temporaries, &passes);
+        self.submit_passes(&passes);
     }
 
-    unsafe fn do_submit(&mut self, submissions: &[QueueSubmission]) {
+    fn allocate_transient_memory(
+        &mut self,
+        base_serial: u64,
+        temporaries: &[ResourceId],
+        passes: &[Pass],
+    ) -> Vec<vk_mem::Allocation> {
+        #[derive(Copy, Clone, Debug)]
+        struct AllocIndex {
+            index: usize,
+            dead_and_recycled: bool,
+        }
+
+        let reachability = compute_reachability(passes);
+        // alloc index -> alloc requirements
+        let mut requirements: Vec<AllocationRequirements> = Vec::new();
+        // resource id -> allocation mapping (index+state)
+        let mut alloc_map: SecondaryMap<ResourceId, AllocIndex> = SecondaryMap::new();
+
+        for pass in passes {
+            // --- assign memory for all resources accessed in this task
+            for access in pass.accesses.iter() {
+                let resource_id = access.id;
+                let resource = self.resources.get(resource_id).unwrap();
+                if resource.allocation.is_some() || alloc_map.get(resource_id).is_some() {
+                    continue;
+                }
+
+                let mut aliased = false;
+
+                for &alias_candidate_id in temporaries.iter() {
+                    let alias_candidate = self.resources.get(alias_candidate_id).unwrap();
+
+                    if alias_candidate.allocation.is_some() {
+                        continue;
+                    }
+
+                    // skip if the resource has user handles pointing to it that may live beyond the current batch
+                    if alias_candidate.user_ref_count > 0 {
+                        continue;
+                    }
+
+                    let mut alloc_state =
+                        if let Some(alloc_state) = alloc_map.get_mut(alias_candidate_id) {
+                            // skip if the resource is already dead, and its memory was already reused
+                            if alloc_state.dead_and_recycled {
+                                continue;
+                            }
+                            alloc_state
+                        } else {
+                            // skip if not allocated yet
+                            continue;
+                        };
+
+                    // if we want to use the resource, the resource must be dead (no more uses in subsequent tasks),
+                    // and there must be an execution dependency chain between the current task and all tasks that last accessed the resource
+                    let mut live = false;
+
+                    // Consider the resource to be live if:
+                    // 1. the reader is in a previous batch, there's no way to know if the
+                    // current task has an execution dependency on it, so exclude this resource.
+                    // 2. the reader is in a future serial
+                    // 3. there's no execution dependency chain from the reader to the current task.
+                    live |= alias_candidate.tracking.readers.iter().any(|&read_serial| {
+                        read_serial != 0
+                            && (read_serial <= base_serial
+                                || read_serial >= pass.snn.serial()
+                                || reachability.is_reachable(
+                                    (read_serial - base_serial - 1) as usize,
+                                    pass.batch_index,
+                                ))
+                    });
+
+                    let write_serial = alias_candidate.tracking.writer.serial();
+                    live = live
+                        || (write_serial != 0
+                            && (write_serial <= base_serial
+                                || write_serial >= pass.snn.serial()
+                                || reachability.is_reachable(
+                                    (write_serial - base_serial - 1) as usize,
+                                    pass.batch_index,
+                                )));
+
+                    if live {
+                        continue;
+                    }
+
+                    // the resource is dead, try to reuse
+                    let dead_alloc = &mut requirements[alloc_state.index];
+
+                    if !dead_alloc.try_adjust(&resource.allocation_requirements) {
+                        continue;
+                    }
+
+                    // the two resources may alias; the requirements have been adjusted
+                    // update the allocation map
+                    let index = alloc_state.index;
+                    alloc_state.dead_and_recycled = true;
+
+                    alloc_map.insert(
+                        resource_id,
+                        AllocIndex {
+                            index,
+                            dead_and_recycled: false,
+                        },
+                    );
+
+                    aliased = true;
+                    break;
+                }
+
+                if !aliased {
+                    // new allocation
+                    let index = requirements.len();
+                    requirements.push(resource.allocation_requirements);
+                    alloc_map.insert(
+                        resource_id,
+                        AllocIndex {
+                            index,
+                            dead_and_recycled: false,
+                        },
+                    );
+                }
+            }
+        }
+
+        // --- print some debug info
+        println!("Memory blocks:");
+        for (i, req) in requirements.iter().enumerate() {
+            println!(" block #{}: {:?}", i, req);
+        }
+        println!("Memory block assignments:");
+        for &tmp in temporaries {
+            if let Some(alloc_state) = alloc_map.get(tmp) {
+                println!(
+                    "{} => {:?}",
+                    self.resources.get(tmp).unwrap().name,
+                    alloc_state
+                );
+            } else {
+                println!("{} => N/A", self.resources.get(tmp).unwrap().name);
+            }
+        }
+
+        // now allocate device memory
+        let mut allocations = Vec::with_capacity(requirements.len());
+        let mut allocation_infos = Vec::with_capacity(requirements.len());
+
+        for alloc_req in requirements.iter() {
+            let allocation_create_info = vk_mem::AllocationCreateInfo {
+                ..Default::default()
+            };
+            let (allocation, allocation_info) = self
+                .device
+                .allocator
+                .allocate_memory(&alloc_req.mem_req, &allocation_create_info)
+                .expect("failed to allocate device memory");
+            allocations.push(allocation);
+            allocation_infos.push(allocation_info);
+        }
+
+        // and assign them to the resources
+        for &tmp in temporaries {
+            if let Some(alloc_index) = alloc_map.get(tmp) {
+                let resource = self.resources.get_mut(tmp).unwrap();
+                let alloc_info = &allocation_infos[alloc_index.index];
+                match &resource.kind {
+                    ResourceKind::Image(img) => unsafe {
+                        self.device.device.bind_image_memory(
+                            img.handle.get_inner(),
+                            alloc_info.get_device_memory(),
+                            alloc_info.get_offset() as u64,
+                        );
+                    },
+                    ResourceKind::Buffer(buf) => unsafe {
+                        self.device.device.bind_buffer_memory(
+                            buf.handle.get_inner(),
+                            alloc_info.get_device_memory(),
+                            alloc_info.get_offset() as u64,
+                        );
+                    },
+                }
+            }
+        }
+
+        allocations
+    }
+
+    fn submit_batch(&mut self, q: usize, sb: &SubmissionBatch) {
         let mut signal_semaphores = Vec::new();
         let mut signal_semaphore_values = Vec::new();
         let mut wait_semaphores = Vec::new();
         let mut wait_semaphore_values = Vec::new();
         let mut wait_semaphore_dst_stages = Vec::new();
-        let mut used_semaphores = Vec::new();
-        let mut last_signalled_timeline_values = [0u64; MAX_QUEUES];
 
-        for s in submissions.iter() {
-            signal_semaphores.clear();
-            signal_semaphore_values.clear();
-            wait_semaphores.clear();
-            wait_semaphore_values.clear();
-            wait_semaphore_dst_stages.clear();
+        // setup timeline signal
+        signal_semaphores.push(self.timelines[q]);
+        signal_semaphore_values.push(sb.signal_snn.serial());
+        self.last_signalled_timeline_values[q] = sb.signal_snn.serial();
 
-            let q = s.signal_snn.queue() as usize;
-            signal_semaphores.push(self.timelines[q].get_inner());
-            signal_semaphore_values.push(s.signal_snn.serial());
-            last_signalled_timeline_values[q] = s.signal_snn.serial();
-
-            for (i, &w) in s.wait_serials.iter().enumerate() {
-                if w != 0 {
-                    wait_semaphores.push(self.timelines[i].get_inner());
-                    wait_semaphore_values.push(w);
-                    wait_semaphore_dst_stages.push(s.wait_dst_stages[i]);
-                }
+        // setup timeline waits
+        for (i, &w) in sb.wait_serials.iter().enumerate() {
+            if w != 0 {
+                wait_semaphores.push(self.timelines[i]);
+                wait_semaphore_values.push(w);
+                wait_semaphore_dst_stages.push(sb.wait_dst_stages[i]);
             }
+        }
 
-            for &b in s.wait_binary_semaphores.iter() {
-                wait_semaphores.push(b);
-                wait_semaphore_values.push(0);
-                wait_semaphore_dst_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE); // TODO
-                used_semaphores.push(b);
-                // TODO reclaim semaphore
-            }
+        // setup binary semaphore waits
+        for &b in sb.wait_binary_semaphores.iter() {
+            wait_semaphores.push(b);
+            wait_semaphore_values.push(0);
+            wait_semaphore_dst_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE); // TODO
+                                                                                 // after the submission, the semaphore will be in an unsignalled state,
+                                                                                 // ready to be reused
+            self.available_semaphores.push(b);
+        }
 
-            let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
-                wait_semaphore_value_count: wait_semaphore_values.len() as u32,
-                p_wait_semaphore_values: wait_semaphore_values.as_ptr(),
-                signal_semaphore_value_count: signal_semaphore_values.len() as u32,
-                p_signal_semaphore_values: signal_semaphore_values.as_ptr(),
-                ..Default::default()
-            };
+        let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
+            wait_semaphore_value_count: wait_semaphore_values.len() as u32,
+            p_wait_semaphore_values: wait_semaphore_values.as_ptr(),
+            signal_semaphore_value_count: signal_semaphore_values.len() as u32,
+            p_signal_semaphore_values: signal_semaphore_values.as_ptr(),
+            ..Default::default()
+        };
 
-            let submit_info = vk::SubmitInfo {
-                p_next: &mut timeline_submit_info as *mut _ as *mut c_void,
-                wait_semaphore_count: wait_semaphores.len() as u32,
-                p_wait_semaphores: wait_semaphores.as_ptr(),
-                p_wait_dst_stage_mask: wait_semaphore_dst_stages.as_ptr(),
-                command_buffer_count: 1,
-                p_command_buffers: &s.command_buffer,
-                signal_semaphore_count: signal_semaphores.len() as u32,
-                p_signal_semaphores: signal_semaphores.as_ptr(),
-                ..Default::default()
-            };
+        let submit_info = vk::SubmitInfo {
+            p_next: &mut timeline_submit_info as *mut _ as *mut c_void,
+            wait_semaphore_count: wait_semaphores.len() as u32,
+            p_wait_semaphores: wait_semaphores.as_ptr(),
+            p_wait_dst_stage_mask: wait_semaphore_dst_stages.as_ptr(),
+            command_buffer_count: sb.command_buffers.len() as u32,
+            p_command_buffers: sb.command_buffers.as_ptr(),
+            signal_semaphore_count: signal_semaphores.len() as u32,
+            p_signal_semaphores: signal_semaphores.as_ptr(),
+            ..Default::default()
+        };
 
-            let queue: vk::Queue = self.device.queues_info.queues[q];
+        let queue = self.device.queues_info.queues[q];
+        unsafe {
             self.device
                 .device
                 .queue_submit(queue, &[submit_info], vk::Fence::null())
                 .expect("queue submission failed");
+        }
+    }
 
-            if let Some(render_finished_semaphore) = s.render_finished_semaphore {
-                let present_info = vk::PresentInfoKHR {
-                    wait_semaphore_count: 1,
-                    p_wait_semaphores: &render_finished_semaphore,
-                    swapchain_count: s.swapchains.len() as u32,
-                    p_swapchains: s.swapchains.as_ptr(),
-                    p_image_indices: s.swapchain_image_indices.as_ptr(),
-                    p_results: ptr::null_mut(),
-                    ..Default::default()
-                };
+    fn submit_passes(&mut self, passes: &[Pass]) {
+        // current submission batches per queue
+        let mut submission_batches: [SubmissionBatch; MAX_QUEUES] = Default::default();
 
-                self.vk_khr_swapchain
-                    .queue_present(queue, &present_info)
-                    .expect("present failed");
-                used_semaphores.push(render_finished_semaphore);
+        for p in passes.iter() {
+            let q = p.snn.queue() as usize;
+            if p.wait_before {
+                // the pass needs a semaphore wait, so it needs a separate batch
+                // close the batches on all queues that the pass waits on
+                for i in 0..MAX_QUEUES {
+                    if !submission_batches[i].is_empty() && (i == q || p.wait_serials[i] != 0) {
+                        self.submit_batch(i, &submission_batches[i]);
+                        submission_batches[i].reset();
+                    }
+                }
+            }
+
+            let sb: &mut SubmissionBatch = &mut submission_batches[q];
+            if p.wait_before {
+                sb.wait_serials = p.wait_serials;
+                sb.wait_dst_stages = p.wait_dst_stages;
+                sb.wait_binary_semaphores = p.wait_binary_semaphores.clone();
+            }
+
+            match p.kind {
+                PassKind::Present {
+                    swapchain,
+                    image_index,
+                } => {
+                    // present operation:
+                    // modify the current batch to signal a semaphore and close it
+                    let render_finished_semaphore = self.create_semaphore();
+                    // FIXME if the swapchain image is last modified by another queue,
+                    // then this batch contains no commands, only one timeline wait
+                    // and one binary semaphore signal.
+                    // This could be optimized by signalling a binary semaphore on the pass
+                    // that modifies the swapchain image, but at the cost of code complexity
+                    // and maintainability.
+                    // Eventually, the presentation engine might support timeline semaphores
+                    // directly, which will make this entire problem vanish.
+                    sb.signal_binary_semaphores.push(render_finished_semaphore);
+                    self.submit_batch(q, sb);
+                    sb.reset();
+                    // build present info that waits on the batch that was just submitted
+                    let present_info = vk::PresentInfoKHR {
+                        wait_semaphore_count: 1,
+                        p_wait_semaphores: &render_finished_semaphore,
+                        swapchain_count: 1,
+                        p_swapchains: &swapchain,
+                        p_image_indices: &image_index,
+                        p_results: ptr::null_mut(),
+                        ..Default::default()
+                    };
+                    unsafe {
+                        // TODO safety
+                        let queue = self.device.queues_info.queues[q];
+                        self.vk_khr_swapchain
+                            .queue_present(queue, &present_info)
+                            .expect("present failed");
+                    }
+                    // we signalled and waited on the semaphore, it can be reused
+                    self.available_semaphores.push(render_finished_semaphore);
+                }
+                _ => {
+                    // update signalled serial for the batch (pass serials are guaranteed to be increasing)
+                    sb.signal_snn = p.snn;
+                    // TODO create command buffer here
+                }
+            }
+
+            if p.signal_after {
+                // the pass needs a semaphore signal: this terminates the batch on the queue
+                self.submit_batch(q, sb);
+                sb.reset();
+            }
+        }
+
+        // close unfinished batches
+        for sb in submission_batches.iter() {
+            if !sb.is_empty() {
+                self.submit_batch(sb.signal_snn.queue() as usize, sb)
             }
         }
     }
 
+    ///
     pub fn create_image_resource(
         &mut self,
         name: &str,
-        image_type: vk::ImageType,
-        usage: vk::ImageUsageFlags,
-        format: vk::Format,
-        extent: vk::Extent3D,
-        mem_required_flags: vk::MemoryPropertyFlags,
-        mem_preferred_flags: vk::MemoryPropertyFlags,
-        properties: &ImageProperties,
+        resource_create_info: &ResourceCreateInfo,
+        image_resource_create_info: &ImageResourceCreateInfo,
     ) -> ResourceId {
         let create_info = vk::ImageCreateInfo {
-            image_type,
-            format,
-            extent,
-            mip_levels: properties.mip_levels,
-            array_layers: properties.array_layers,
-            samples: get_vk_sample_count(properties.samples),
-            tiling: properties.tiling,
-            usage,
+            image_type: image_resource_create_info.image_type,
+            format: image_resource_create_info.format,
+            extent: image_resource_create_info.extent,
+            mip_levels: image_resource_create_info.mip_levels,
+            array_layers: image_resource_create_info.array_layers,
+            samples: get_vk_sample_count(image_resource_create_info.samples),
+            tiling: image_resource_create_info.tiling,
+            usage: image_resource_create_info.usage,
             sharing_mode: vk::SharingMode::CONCURRENT,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
             ..Default::default()
         };
-
         let handle = unsafe {
             self.device
                 .device
                 .create_image(&create_info, None)
                 .expect("failed to create image")
         };
-
         let mem_req = unsafe { self.device.device.get_image_memory_requirements(handle) };
-
+        let allocation = if resource_create_info.transient {
+            None
+        } else {
+            let allocation_create_info = vk_mem::AllocationCreateInfo {
+                ..Default::default()
+            };
+            let (alloc, alloc_info) = self
+                .device
+                .allocator
+                .allocate_memory(&mem_req, &allocation_create_info)
+                .expect("failed to allocate device memory");
+            unsafe {
+                self.device.device.bind_image_memory(
+                    handle,
+                    alloc_info.get_device_memory(),
+                    alloc_info.get_offset() as u64,
+                );
+            }
+            Some(alloc)
+        };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
-            //user_ref_count: (),
             user_ref_count: 0,
-            owned: false,
             allocation_requirements: AllocationRequirements {
                 mem_req,
-                required_flags: mem_required_flags,
-                preferred_flags: mem_preferred_flags,
+                required_flags: resource_create_info.mem_required_flags,
+                preferred_flags: resource_create_info.mem_preferred_flags,
             },
-            allocation: vk_mem::Allocation::null(),
-            allocation_info: None,
+            allocation,
             tracking: Default::default(),
             tmp_index: None,
             kind: ResourceKind::Image(ImageResource {
                 handle: UniqueHandle::new(handle),
-                format,
+                format: image_resource_create_info.format,
             }),
         });
         id
@@ -1120,42 +1323,55 @@ impl Context {
     pub fn create_buffer_resource(
         &mut self,
         name: &str,
-        usage: vk::BufferUsageFlags,
-        byte_size: u64,
-        mem_required_flags: vk::MemoryPropertyFlags,
-        mem_preferred_flags: vk::MemoryPropertyFlags,
+        resource_create_info: &ResourceCreateInfo,
+        buffer_resource_create_info: &BufferResourceCreateInfo,
     ) -> ResourceId {
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
-            size: byte_size,
-            usage,
+            size: buffer_resource_create_info.byte_size,
+            usage: buffer_resource_create_info.usage,
             sharing_mode: vk::SharingMode::CONCURRENT,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
             ..Default::default()
         };
-
         let handle = unsafe {
             self.device
                 .device
                 .create_buffer(&create_info, None)
                 .expect("failed to create buffer")
         };
-
         let mem_req = unsafe { self.device.device.get_buffer_memory_requirements(handle) };
-
+        let allocation = if resource_create_info.transient {
+            None
+        } else {
+            let allocation_create_info = vk_mem::AllocationCreateInfo {
+                ..Default::default()
+            };
+            let (alloc, alloc_info) = self
+                .device
+                .allocator
+                .allocate_memory(&mem_req, &allocation_create_info)
+                .expect("failed to allocate device memory");
+            unsafe {
+                self.device.device.bind_buffer_memory(
+                    handle,
+                    alloc_info.get_device_memory(),
+                    alloc_info.get_offset() as u64,
+                );
+            }
+            Some(alloc)
+        };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
             //user_ref_count: (),
             user_ref_count: 1,
-            owned: false,
-            allocation_requirements : AllocationRequirements {
+            allocation_requirements: AllocationRequirements {
                 mem_req,
-                required_flags: mem_required_flags,
-                preferred_flags: mem_preferred_flags
+                required_flags: resource_create_info.mem_required_flags,
+                preferred_flags: resource_create_info.mem_preferred_flags,
             },
-            allocation: vk_mem::Allocation::null(),
-            allocation_info: None,
+            allocation,
             tracking: Default::default(),
             tmp_index: None,
             kind: ResourceKind::Buffer(BufferResource {

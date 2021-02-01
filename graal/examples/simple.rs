@@ -1,4 +1,4 @@
-use graal::vk;
+use graal::{vk, ResourceCreateInfo};
 use raw_window_handle::HasRawWindowHandle;
 use winit::{
     event::{Event, WindowEvent},
@@ -9,24 +9,27 @@ use winit::{
 fn create_test_image(context: &mut graal::Context, name: &str) -> graal::ResourceId {
     context.create_image_resource(
         name,
-        graal::vk::ImageType::TYPE_2D,
-        graal::vk::ImageUsageFlags::COLOR_ATTACHMENT
-            | graal::vk::ImageUsageFlags::SAMPLED
-            | graal::vk::ImageUsageFlags::TRANSFER_DST,
-        graal::vk::Format::R8G8B8A8_SRGB,
-        graal::vk::Extent3D {
-            width: 1280,
-            height: 720,
-            depth: 1,
+        &graal::ResourceCreateInfo {
+            transient: true,
+            mem_required_flags: graal::vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            mem_preferred_flags: graal::vk::MemoryPropertyFlags::DEVICE_LOCAL
         },
-        graal::vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        graal::vk::MemoryPropertyFlags::DEVICE_LOCAL,
-        &graal::ImageProperties {
+        &graal::ImageResourceCreateInfo {
+            image_type: graal::vk::ImageType::TYPE_2D,
+            usage: graal::vk::ImageUsageFlags::COLOR_ATTACHMENT
+                | graal::vk::ImageUsageFlags::SAMPLED
+                | graal::vk::ImageUsageFlags::TRANSFER_DST,
+            format: graal::vk::Format::R8G8B8A8_SRGB,
+            extent: graal::vk::Extent3D {
+                width: 1280,
+                height: 720,
+                depth: 1,
+            },
             mip_levels: 1,
             array_layers: 1,
             samples: 1,
-            ..Default::default()
-        },
+            tiling: graal::vk::ImageTiling::OPTIMAL,
+        }
     )
 }
 
