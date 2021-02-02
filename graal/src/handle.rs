@@ -1,6 +1,7 @@
 use ash::vk::Handle;
-use std::mem;
+use std::{mem, fmt};
 use std::ops::Deref;
+use std::fmt::Formatter;
 
 /// A wrapper around a vulkan handle with unique semantics.
 #[repr(transparent)]
@@ -11,6 +12,12 @@ impl<T: Handle + Copy> Drop for UniqueHandle<T> {
         if self.0.as_raw() != 0 {
             panic!("non-null UniqueHandle was dropped")
         }
+    }
+}
+
+impl <T: Handle + Copy + fmt::Debug> fmt::Debug for UniqueHandle<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -37,6 +44,11 @@ impl<T: Handle + Copy> UniqueHandle<T> {
 
     /// Releases the handle.
     pub fn into_inner(mut self) -> T {
+        self.take()
+    }
+
+    /// Releases the handle.
+    pub fn take(&mut self) -> T {
         mem::replace(&mut self.0, T::from_raw(0))
     }
 

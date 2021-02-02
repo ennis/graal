@@ -3,7 +3,7 @@ use crate::handle::{UniqueHandle, UniqueHandleVec};
 use crate::pass::{Pass, PassKind, ResourceAccess, SubmissionNumber};
 use crate::MAX_QUEUES;
 use crate::VULKAN_INSTANCE;
-use ash::version::DeviceV1_0;
+use ash::version::{DeviceV1_0, DeviceV1_2};
 use ash::vk;
 use core::ptr;
 use fixedbitset::FixedBitSet;
@@ -158,16 +158,19 @@ new_key_type! {
     pub struct ResourceId;
 }
 
+#[derive(Debug)]
 struct ImageResource {
     handle: UniqueHandle<vk::Image>,
     format: vk::Format,
 }
 
+#[derive(Debug)]
 struct BufferResource {
     handle: UniqueHandle<vk::Buffer>,
 }
 
 /// Represents a resource access in a pass.
+#[derive(Debug)]
 pub(crate) struct ResourceAccessDetails {
     layout: vk::ImageLayout,
     access_mask: vk::AccessFlags,
@@ -175,11 +178,13 @@ pub(crate) struct ResourceAccessDetails {
     output_stage: vk::PipelineStageFlags,
 }
 
+#[derive(Debug)]
 enum ResourceKind {
     Buffer(BufferResource),
     Image(ImageResource),
 }
 
+#[derive(Debug)]
 struct ResourceTrackingInfo {
     readers: [u64; MAX_QUEUES],
     writer: SubmissionNumber,
@@ -218,6 +223,15 @@ impl Default for ResourceTrackingInfo {
     }
 }
 
+// two possible states:
+// Transient:
+// - allocation.is_some()
+// Non-transient:
+// - allocation.is_none()
+//
+// Problem: prevent a transient resource from being used more than once
+
+#[derive(Debug)]
 struct Resource {
     name: String,
     user_ref_count: usize,
@@ -228,12 +242,14 @@ struct Resource {
     kind: ResourceKind,
 }
 
-unsafe fn bind_resource_memory(
-    device: &ash::Device,
-    resource: &Resource,
-    device_memory: vk::DeviceMemory,
-    offset: vk::DeviceSize,
-) {
+impl Resource {
+    fn is_transient(&self) -> bool {
+        self.allocation.is_none()
+    }
+
+    fn is_transient_in_flight(&self) -> bool {
+        self.is_transient() && (self.tracking.has_writer() || self.tracking.has_readers())
+    }
 }
 
 /// Adds an execution dependency between a source and destination pass, identified by their submission numbers.
@@ -269,21 +285,6 @@ fn add_execution_dependency(
 }
 
 type TemporarySet = std::collections::BTreeSet<ResourceId>;
-
-fn register_temporary<'a>(
-    resources: &'a mut ResourceMap,
-    temporaries: &mut Vec<ResourceId>,
-    temporary_set: &mut TemporarySet,
-    id: ResourceId,
-) -> &'a mut Resource {
-    if temporary_set.insert(id) {
-        //let index = temporaries.len();
-        temporaries.push(id);
-    }
-
-    let resource = resources.get_mut(id).unwrap();
-    resource
-}
 
 ///
 fn disjoint_index_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
@@ -412,6 +413,26 @@ impl<'ctx> Batch<'ctx> {
         }
     }
 
+    fn register_temporary<'a>(
+        resources: &'a mut ResourceMap,
+        temporaries: &mut Vec<ResourceId>,
+        temporary_set: &mut TemporarySet,
+        id: ResourceId,
+    ) -> &'a mut Resource {
+        let resource = resources.get_mut(id).unwrap();
+
+        if temporary_set.insert(id) {
+            // this is the first time the resource has been used in the batch
+            if resource.is_transient_in_flight() {
+                panic!("transient resource was already used in a previous batch")
+            }
+
+            temporaries.push(id);
+        }
+
+        resource
+    }
+
     ///
     fn add_resource_dependency(
         &mut self,
@@ -419,7 +440,7 @@ impl<'ctx> Batch<'ctx> {
         id: ResourceId,
         access: &ResourceAccessDetails,
     ) {
-        let resource = register_temporary(
+        let resource = Self::register_temporary(
             &mut self.context.resources,
             &mut self.temporaries,
             &mut self.temporary_set,
@@ -807,15 +828,10 @@ struct QueueSubmissionContext<'a> {
     reachability: Reachability,
 }
 
-/*struct DeviceMemoryAllocationInfo {
-    allocation: vk_mem::Allocation,
-    allocation_info: vk_mem::AllocationInfo,
-}*/
-
 type ResourceMap = SlotMap<ResourceId, Resource>;
 
 struct InFlightBatch {
-    resources: TemporarySet,
+    resources: Vec<ResourceId>,
     signalled_serials: [u64; MAX_QUEUES],
     consumed_semaphores: Vec<vk::Semaphore>,
     transient_allocations: Vec<vk_mem::Allocation>,
@@ -823,10 +839,10 @@ struct InFlightBatch {
 
 pub struct Context {
     device: Device,
-    completed_serials: [u64; MAX_QUEUES],
     next_serial: u64,
+    completed_serials: [u64; MAX_QUEUES],
+    last_submitted_serials: [u64; MAX_QUEUES],
     timelines: [vk::Semaphore; MAX_QUEUES],
-    last_signalled_timeline_values: [u64; MAX_QUEUES],
     resources: ResourceMap,
     in_flight: VecDeque<InFlightBatch>,
     available_semaphores: Vec<vk::Semaphore>,
@@ -865,7 +881,7 @@ impl Context {
             completed_serials: [0; MAX_QUEUES],
             next_serial: 0,
             timelines,
-            last_signalled_timeline_values: Default::default(),
+            last_submitted_serials: Default::default(),
             resources: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             available_semaphores: vec![],
@@ -911,14 +927,105 @@ impl Context {
         self.next_serial
     }
 
+    fn destroy_resource(device: &Device, resource: &mut Resource) {
+        match &mut resource.kind {
+            ResourceKind::Buffer(buf) => {
+                unsafe {
+                    // TODO safety
+                    device.device.destroy_buffer(buf.handle.take(), None);
+                }
+            }
+            ResourceKind::Image(img) => {
+                unsafe {
+                    // TODO safety
+                    device.device.destroy_image(img.handle.take(), None)
+                }
+            }
+        }
+    }
+
+    fn cleanup_resources(&mut self) {
+        // time to cleanup resources
+        // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
+        // and resources that have reader or writer passes that have not yet completed
+        let completed_serials = self.completed_serials;
+        let device = &self.device;
+
+        self.resources.retain(|id, r| {
+            // refcount != 0 OR any reader not completed OR writer not completed
+            let keep = r.user_ref_count != 0
+                || r.tracking.readers.iter().zip(completed_serials.iter()).any(|(&a,&b)| a > b)
+                || r.tracking.writer.serial() > completed_serials[r.tracking.writer.queue() as usize];
+            if !keep {
+                Self::destroy_resource(device, r);
+            }
+            keep
+        })
+    }
+
+    fn wait_for_batches_in_flight(&mut self) {
+        // pacing
+        while self.in_flight.len() >= 2 {
+            // two batches in flight already, must wait for the oldest one
+            let b = self.in_flight.pop_front().unwrap();
+            let wait_info = vk::SemaphoreWaitInfo {
+                s_type: Default::default(),
+                semaphore_count: self.timelines.len() as u32,
+                p_semaphores: self.timelines.as_ptr(),
+                p_values: b.signalled_serials.as_ptr(),
+                ..Default::default()
+            };
+            unsafe {
+                self.device
+                    .device
+                    .wait_semaphores(&wait_info, 10_000_000_000)
+                    .expect("error waiting for batch");
+            }
+            // free transient allocations
+            for alloc in b.transient_allocations.iter() {
+                self.device.allocator.free_memory(alloc);
+            }
+
+            // update completed serials
+            // we just waited on those serials, so we know they are completed
+            self.completed_serials = b.signalled_serials;
+
+            // given the new completed serials, free resources that have expired
+            self.cleanup_resources();
+
+            // TODO recycle the resources owned by the batch
+        }
+    }
+
+    fn dump_state(&self) {
+        println!("Number of batches in flight: {}", self.in_flight.len());
+        println!("Resources:");
+        for (id, r) in self.resources.iter() {
+            println!("- {:?}: {:?}", id, r);
+        }
+        println!("Available semaphores:");
+        for s in self.available_semaphores.iter() {
+            println!("- {:?}", s);
+        }
+        println!("VMA stats: {:#?}", self.device.allocator.calculate_stats());
+    }
+
     fn enqueue_passes(
         &mut self,
         base_serial: u64,
         temporaries: Vec<ResourceId>,
         passes: Vec<Pass>,
     ) {
-        self.allocate_transient_memory(base_serial, &temporaries, &passes);
+        self.wait_for_batches_in_flight();
+        let transient_allocations = self.allocate_transient_memory(base_serial, &temporaries, &passes);
         self.submit_passes(&passes);
+        self.in_flight.push_back(InFlightBatch {
+            resources: temporaries,
+            signalled_serials: self.last_submitted_serials,
+            consumed_semaphores: vec![],
+            transient_allocations
+        });
+        self.dump_state();
     }
 
     fn allocate_transient_memory(
@@ -951,6 +1058,10 @@ impl Context {
                 let mut aliased = false;
 
                 for &alias_candidate_id in temporaries.iter() {
+                    if alias_candidate_id == resource_id {
+                        continue;
+                    }
+
                     let alias_candidate = self.resources.get(alias_candidate_id).unwrap();
 
                     if alias_candidate.allocation.is_some() {
@@ -1118,7 +1229,7 @@ impl Context {
         // setup timeline signal
         signal_semaphores.push(self.timelines[q]);
         signal_semaphore_values.push(sb.signal_snn.serial());
-        self.last_signalled_timeline_values[q] = sb.signal_snn.serial();
+        self.last_submitted_serials[q] = sb.signal_snn.serial();
 
         // setup timeline waits
         for (i, &w) in sb.wait_serials.iter().enumerate() {
@@ -1133,9 +1244,10 @@ impl Context {
         for &b in sb.wait_binary_semaphores.iter() {
             wait_semaphores.push(b);
             wait_semaphore_values.push(0);
-            wait_semaphore_dst_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE); // TODO
-                                                                                 // after the submission, the semaphore will be in an unsignalled state,
-                                                                                 // ready to be reused
+            // TODO
+            wait_semaphore_dst_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE);
+            // after the submission, the semaphore will be in an unsignalled state,
+            // ready to be reused
             self.available_semaphores.push(b);
         }
 
@@ -1383,5 +1495,11 @@ impl Context {
 
     pub fn start_batch(&mut self) -> Batch {
         Batch::new(self)
+    }
+}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        // TODO
     }
 }

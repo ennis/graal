@@ -6,7 +6,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-fn create_test_image(context: &mut graal::Context, name: &str) -> graal::ResourceId {
+fn create_transient_image(context: &mut graal::Context, name: &str) -> graal::ResourceId {
     context.create_image_resource(
         name,
         &graal::ResourceCreateInfo {
@@ -131,19 +131,6 @@ fn main() {
     let device = graal::Device::new(surface);
     let mut context = graal::Context::new(device);
 
-    let img_a = create_test_image(&mut context, "A");
-    let img_b = create_test_image(&mut context, "B");
-    let img_c = create_test_image(&mut context, "C");
-    let img_d1 = create_test_image(&mut context, "D1");
-    let img_d2 = create_test_image(&mut context, "D2");
-    let img_e = create_test_image(&mut context, "E");
-    let img_f = create_test_image(&mut context, "F");
-    let img_g = create_test_image(&mut context, "G");
-    let img_h = create_test_image(&mut context, "H");
-    let img_i = create_test_image(&mut context, "I");
-    let img_j = create_test_image(&mut context, "J");
-    let img_k = create_test_image(&mut context, "K");
-
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
         match event {
@@ -158,6 +145,25 @@ fn main() {
                 window.request_redraw();
             }
             Event::RedrawRequested(_) => {
+                let img_a = create_transient_image(&mut context, "A");
+                let img_b = create_transient_image(&mut context, "B");
+                let img_c = create_transient_image(&mut context, "C");
+                let img_d1 = create_transient_image(&mut context, "D1");
+                let img_d2 = create_transient_image(&mut context, "D2");
+                let img_e = create_transient_image(&mut context, "E");
+                let img_f = create_transient_image(&mut context, "F");
+                let img_g = create_transient_image(&mut context, "G");
+                let img_h = create_transient_image(&mut context, "H");
+                let img_i = create_transient_image(&mut context, "I");
+                let img_j = create_transient_image(&mut context, "J");
+                let img_k = create_transient_image(&mut context, "K");
+
+                // each resource has a ref count
+                // - incremented when it's in use by a batch
+                // - incremented by the user
+                // non-transient resources are deleted once refcount is zero
+                // transient resources are deleted once the batch is finished, regardless of refcounts
+
                 let mut batch = context.start_batch();
 
                 test_pass(&mut batch, "P0", &[color_attachment_output(img_a)]);
