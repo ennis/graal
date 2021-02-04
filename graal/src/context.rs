@@ -820,21 +820,50 @@ impl<'ctx, 'batch> PassBuilder<'ctx, 'batch> {
     }
 }
 
-struct QueueSubmissionContext<'a> {
-    base_serial: u64,
-    resources: &'a ResourceMap,
-    temporaries: &'a [ResourceId],
-    passes: &'a [Pass],
-    reachability: Reachability,
+struct CommandPoolWrapper {
+    queue_family: u32,
+    command_pool: vk::CommandPool,
+    free: Vec<vk::CommandBuffer>,
+    used: Vec<vk::CommandBuffer>,
+}
+
+impl CommandPoolWrapper {
+    fn allocate_command_buffer(&mut self, device: &ash::Device) -> vk::CommandBuffer {
+        let cb = self.free.pop().unwrap_or_else(|| unsafe {
+            let allocate_info = vk::CommandBufferAllocateInfo {
+                command_pool: self.command_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let buffers = device
+                .allocate_command_buffers(&allocate_info)
+                .expect("failed to allocate command buffers");
+            buffers[0]
+        });
+        self.used.push(cb);
+        cb
+    }
+
+    fn reset(&mut self, device: &ash::Device) {
+        unsafe {
+            device.reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty());
+        }
+        self.free.append(&mut self.used)
+    }
 }
 
 type ResourceMap = SlotMap<ResourceId, Resource>;
+
+// one command pool per submission thread and queue family
+// a bunch of available command buffers, grouped by queue family
 
 struct InFlightBatch {
     resources: Vec<ResourceId>,
     signalled_serials: [u64; MAX_QUEUES],
     consumed_semaphores: Vec<vk::Semaphore>,
     transient_allocations: Vec<vk_mem::Allocation>,
+    command_pools: Vec<CommandPoolWrapper>,
 }
 
 pub struct Context {
@@ -846,6 +875,7 @@ pub struct Context {
     resources: ResourceMap,
     in_flight: VecDeque<InFlightBatch>,
     available_semaphores: Vec<vk::Semaphore>,
+    available_command_pools: Vec<CommandPoolWrapper>,
     vk_khr_swapchain: ash::extensions::khr::Swapchain,
 }
 
@@ -885,7 +915,38 @@ impl Context {
             resources: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             available_semaphores: vec![],
+            available_command_pools: vec![],
             vk_khr_swapchain,
+        }
+    }
+
+    fn create_command_pool(&mut self, queue_index: u8) -> CommandPoolWrapper {
+        let queue_family = self.device.queues_info.families[queue_index as usize];
+        if let Some(pos) = self
+            .available_command_pools
+            .iter()
+            .position(|cmd_pool| cmd_pool.queue_family == queue_family)
+        {
+            self.available_command_pools.swap_remove(pos)
+        } else {
+            let create_info = vk::CommandPoolCreateInfo {
+                flags: vk::CommandPoolCreateFlags::TRANSIENT,
+                queue_family_index: queue_family,
+                ..Default::default()
+            };
+
+            let command_pool = unsafe {
+                self.device
+                    .device
+                    .create_command_pool(&create_info, None)
+                    .expect("failed to create a command pool")
+            };
+            CommandPoolWrapper {
+                queue_family,
+                command_pool,
+                free: vec![],
+                used: vec![],
+            }
         }
     }
 
@@ -954,8 +1015,13 @@ impl Context {
         self.resources.retain(|id, r| {
             // refcount != 0 OR any reader not completed OR writer not completed
             let keep = r.user_ref_count != 0
-                || r.tracking.readers.iter().zip(completed_serials.iter()).any(|(&a,&b)| a > b)
-                || r.tracking.writer.serial() > completed_serials[r.tracking.writer.queue() as usize];
+                || r.tracking
+                    .readers
+                    .iter()
+                    .zip(completed_serials.iter())
+                    .any(|(&a, &b)| a > b)
+                || r.tracking.writer.serial()
+                    > completed_serials[r.tracking.writer.queue() as usize];
             if !keep {
                 Self::destroy_resource(device, r);
             }
@@ -967,9 +1033,8 @@ impl Context {
         // pacing
         while self.in_flight.len() >= 2 {
             // two batches in flight already, must wait for the oldest one
-            let b = self.in_flight.pop_front().unwrap();
+            let mut b = self.in_flight.pop_front().unwrap();
             let wait_info = vk::SemaphoreWaitInfo {
-                s_type: Default::default(),
                 semaphore_count: self.timelines.len() as u32,
                 p_semaphores: self.timelines.as_ptr(),
                 p_values: b.signalled_serials.as_ptr(),
@@ -990,6 +1055,12 @@ impl Context {
             // we just waited on those serials, so we know they are completed
             self.completed_serials = b.signalled_serials;
 
+            // recycle command pools
+            for cb_pool in b.command_pools.iter_mut() {
+                cb_pool.reset(&self.device.device)
+            }
+            self.available_command_pools.append(&mut b.command_pools);
+
             // given the new completed serials, free resources that have expired
             self.cleanup_resources();
 
@@ -1007,7 +1078,29 @@ impl Context {
         for s in self.available_semaphores.iter() {
             println!("- {:?}", s);
         }
-        println!("VMA stats: {:#?}", self.device.allocator.calculate_stats());
+        println!("Available command pools:");
+        for cmd_pool in self.available_command_pools.iter() {
+            println!(
+                "- VkCommandPool {:?}: queue family #{}, {} used, {} free",
+                cmd_pool.command_pool,
+                cmd_pool.queue_family,
+                cmd_pool.used.len(),
+                cmd_pool.free.len()
+            );
+        }
+        println!("VMA stats:");
+        if let Ok(stats) = self.device.allocator.calculate_stats() {
+            println!(
+                "- number of allocations: {} in {} device memory blocks",
+                stats.total.allocationCount, stats.total.blockCount
+            );
+            println!(
+                "- memory usage: {} kB ({} kB used + {} kB unused)",
+                (stats.total.usedBytes + stats.total.unusedBytes) / 1000,
+                stats.total.usedBytes / 1000,
+                stats.total.unusedBytes / 1000
+            );
+        }
     }
 
     fn enqueue_passes(
@@ -1017,13 +1110,15 @@ impl Context {
         passes: Vec<Pass>,
     ) {
         self.wait_for_batches_in_flight();
-        let transient_allocations = self.allocate_transient_memory(base_serial, &temporaries, &passes);
-        self.submit_passes(&passes);
+        let transient_allocations =
+            self.allocate_transient_memory(base_serial, &temporaries, &passes);
+        let command_pools = self.submit_passes(&passes);
         self.in_flight.push_back(InFlightBatch {
             resources: temporaries,
             signalled_serials: self.last_submitted_serials,
             consumed_semaphores: vec![],
-            transient_allocations
+            transient_allocations,
+            command_pools,
         });
         self.dump_state();
     }
@@ -1057,7 +1152,7 @@ impl Context {
 
                 let mut aliased = false;
 
-                for &alias_candidate_id in temporaries.iter() {
+                'alias: for &alias_candidate_id in temporaries.iter() {
                     if alias_candidate_id == resource_id {
                         continue;
                     }
@@ -1087,34 +1182,34 @@ impl Context {
 
                     // if we want to use the resource, the resource must be dead (no more uses in subsequent tasks),
                     // and there must be an execution dependency chain between the current task and all tasks that last accessed the resource
-                    let mut live = false;
 
-                    // Consider the resource to be live if:
-                    // 1. the reader is in a previous batch, there's no way to know if the
-                    // current task has an execution dependency on it, so exclude this resource.
-                    // 2. the reader is in a future serial
-                    // 3. there's no execution dependency chain from the reader to the current task.
-                    live |= alias_candidate.tracking.readers.iter().any(|&read_serial| {
-                        read_serial != 0
+                    for &read_serial in alias_candidate.tracking.readers.iter() {
+                        // Consider the resource to be live if:
+                        // 1. the reader is in a previous batch (we don't have info about execution dependencies between passes in different batches)
+                        // 2. the reader comes after this pass
+                        // 3. there's no execution dependency chain from the reader to the current task.
+
+                        if read_serial != 0
                             && (read_serial <= base_serial
                                 || read_serial >= pass.snn.serial()
-                                || reachability.is_reachable(
+                                || !reachability.is_reachable(
                                     (read_serial - base_serial - 1) as usize,
                                     pass.batch_index,
                                 ))
-                    });
+                        {
+                            continue 'alias;
+                        }
+                    }
 
                     let write_serial = alias_candidate.tracking.writer.serial();
-                    live = live
-                        || (write_serial != 0
-                            && (write_serial <= base_serial
-                                || write_serial >= pass.snn.serial()
-                                || reachability.is_reachable(
-                                    (write_serial - base_serial - 1) as usize,
-                                    pass.batch_index,
-                                )));
-
-                    if live {
+                    if write_serial != 0
+                        && (write_serial <= base_serial
+                            || write_serial >= pass.snn.serial()
+                            || !reachability.is_reachable(
+                                (write_serial - base_serial - 1) as usize,
+                                pass.batch_index,
+                            ))
+                    {
                         continue;
                     }
 
@@ -1226,6 +1321,11 @@ impl Context {
         let mut wait_semaphore_values = Vec::new();
         let mut wait_semaphore_dst_stages = Vec::new();
 
+        // end command buffers
+        for &cb in sb.command_buffers.iter() {
+            unsafe { self.device.device.end_command_buffer(cb).unwrap() }
+        }
+
         // setup timeline signal
         signal_semaphores.push(self.timelines[q]);
         signal_semaphore_values.push(sb.signal_snn.serial());
@@ -1280,9 +1380,12 @@ impl Context {
         }
     }
 
-    fn submit_passes(&mut self, passes: &[Pass]) {
+    fn submit_passes(&mut self, passes: &[Pass]) -> Vec<CommandPoolWrapper> {
         // current submission batches per queue
         let mut submission_batches: [SubmissionBatch; MAX_QUEUES] = Default::default();
+        // one command pool per queue (might not be necessary if the queues belong to the same family,
+        // but they usually don't)
+        let mut command_pools: [Option<CommandPoolWrapper>; MAX_QUEUES] = Default::default();
 
         for p in passes.iter() {
             let q = p.snn.queue() as usize;
@@ -1346,7 +1449,29 @@ impl Context {
                 _ => {
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
                     sb.signal_snn = p.snn;
-                    // TODO create command buffer here
+
+                    // ensure that a command pool has been allocated for the queue
+                    let command_pool: &mut CommandPoolWrapper = command_pools[q]
+                        .get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
+
+                    // append to the last command buffer of the batch, otherwise create another one
+                    let cb = sb.command_buffers.last().cloned().unwrap_or_else(|| {
+                        let cb = command_pool.allocate_command_buffer(&self.device.device);
+                        let begin_info = vk::CommandBufferBeginInfo {
+                            ..Default::default()
+                        };
+                        unsafe {
+                            // TODO safety
+                            self.device
+                                .device
+                                .begin_command_buffer(cb, &begin_info)
+                                .unwrap();
+                        }
+                        cb
+                    });
+
+                    // cb is a command buffer in the recording state
+                    // TODO write commands
                 }
             }
 
@@ -1363,6 +1488,12 @@ impl Context {
                 self.submit_batch(sb.signal_snn.queue() as usize, sb)
             }
         }
+
+        //
+        command_pools
+            .iter_mut()
+            .filter_map(|cmd_pool| cmd_pool.take())
+            .collect()
     }
 
     ///
