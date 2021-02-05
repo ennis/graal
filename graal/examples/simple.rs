@@ -5,6 +5,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+use std::mem::swap;
 
 fn create_transient_image(context: &mut graal::Context, name: &str) -> graal::ResourceId {
     context.create_image_resource(
@@ -130,6 +131,9 @@ fn main() {
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
     let device = graal::Device::new(surface);
     let mut context = graal::Context::new(device);
+    let swapchain = unsafe {
+        context.create_swapchain(surface, window.inner_size().into())
+    };
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -164,6 +168,9 @@ fn main() {
                 // non-transient resources are deleted once refcount is zero
                 // transient resources are deleted once the batch is finished, regardless of refcounts
 
+                let swapchain_image = unsafe {
+                    context.acquire_next_image(swapchain)
+                };
                 let mut batch = context.start_batch();
 
                 test_pass(&mut batch, "P0", &[color_attachment_output(img_a)]);
@@ -226,6 +233,10 @@ fn main() {
                     "P10",
                     &[compute_read(img_j), compute_write(img_k)],
                 );
+
+                test_pass(&mut batch,
+                        "P11",
+                            &[color_attachment_output(swapchain_image)]);
 
                 batch.finish();
             }

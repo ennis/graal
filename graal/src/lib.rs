@@ -4,6 +4,7 @@ pub(crate) mod handle;
 pub(crate) mod instance;
 pub(crate) mod pass;
 pub mod surface;
+pub mod swapchain;
 
 pub(crate) use crate::device::MAX_QUEUES;
 pub(crate) use crate::instance::VULKAN_ENTRY;

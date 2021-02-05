@@ -2,6 +2,7 @@ use crate::device::Device;
 use crate::handle::{UniqueHandle, UniqueHandleVec};
 use crate::pass::{Pass, PassKind, ResourceAccess, SubmissionNumber};
 use crate::MAX_QUEUES;
+use crate::VULKAN_ENTRY;
 use crate::VULKAN_INSTANCE;
 use ash::version::{DeviceV1_0, DeviceV1_2};
 use ash::vk;
@@ -156,17 +157,18 @@ impl AllocationRequirements {
 
 new_key_type! {
     pub struct ResourceId;
+    pub struct SwapchainId;
 }
 
 #[derive(Debug)]
 struct ImageResource {
-    handle: UniqueHandle<vk::Image>,
+    handle: vk::Image,
     format: vk::Format,
 }
 
 #[derive(Debug)]
 struct BufferResource {
-    handle: UniqueHandle<vk::Buffer>,
+    handle: vk::Buffer,
 }
 
 /// Represents a resource access in a pass.
@@ -223,33 +225,31 @@ impl Default for ResourceTrackingInfo {
     }
 }
 
-// two possible states:
-// Transient:
-// - allocation.is_some()
-// Non-transient:
-// - allocation.is_none()
-//
-// Problem: prevent a transient resource from being used more than once
+/// Describes the kind of memory that is bound to a resource.
+#[derive(Debug)]
+enum ResourceMemory {
+    /// The resource may share a block of memory allocation with other resources.
+    Aliased(AllocationRequirements),
+    /// The resource has a block of memory allocated exclusively to it.
+    Exclusive(vk_mem::Allocation),
+    /// The memory for the resource is managed externally (e.g. swapchain images)
+    External,
+}
 
 #[derive(Debug)]
 struct Resource {
+    /// Name, for debugging purposes
     name: String,
+    /// User reference count, for uses by clients outside outside of `Context`.
     user_ref_count: usize,
-    allocation_requirements: AllocationRequirements,
-    allocation: Option<vk_mem::Allocation>,
+    /// Usage trackers.
     tracking: ResourceTrackingInfo,
-    tmp_index: Option<usize>,
+    /// The memory bound to the resource.
+    memory: ResourceMemory,
+    /// Whether the the context should delete the image once it's not in use.
+    should_delete: bool,
+    /// Details specific to the kind of resource (buffer or image).
     kind: ResourceKind,
-}
-
-impl Resource {
-    fn is_transient(&self) -> bool {
-        self.allocation.is_none()
-    }
-
-    fn is_transient_in_flight(&self) -> bool {
-        self.is_transient() && (self.tracking.has_writer() || self.tracking.has_readers())
-    }
 }
 
 /// Adds an execution dependency between a source and destination pass, identified by their submission numbers.
@@ -378,6 +378,13 @@ impl<'ctx> Batch<'ctx> {
         self.build_next_pass(name, queue_index, PassKind::Transfer)
     }
 
+    pub fn present(&mut self, name: &str, swapchain: SwapchainId, image_index: u32) {
+        let queue_index = self.context.device.queues_info.indices.present;
+        let swapchain = self.context.swapchains.get(swapchain).unwrap().handle;
+        let pass_builder = self.build_next_pass(name, queue_index, PassKind::Present { swapchain, image_index });
+        pass_builder.add_image_usage(swapchain)
+    }
+
     fn build_next_pass<'a>(
         &'a mut self,
         name: &str,
@@ -423,8 +430,13 @@ impl<'ctx> Batch<'ctx> {
 
         if temporary_set.insert(id) {
             // this is the first time the resource has been used in the batch
-            if resource.is_transient_in_flight() {
-                panic!("transient resource was already used in a previous batch")
+            match resource.memory {
+                ResourceMemory::Aliased(_) => {
+                    if resource.tracking.has_writer() || resource.tracking.has_readers() {
+                        panic!("transient resource was already used in a previous batch")
+                    }
+                }
+                _ => {}
             }
 
             temporaries.push(id);
@@ -555,7 +567,7 @@ impl<'ctx> Batch<'ctx> {
                         new_layout: access.layout,
                         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        image: img.handle.get_inner(),
+                        image: img.handle,
                         subresource_range,
                         ..Default::default()
                     })
@@ -566,7 +578,7 @@ impl<'ctx> Batch<'ctx> {
                         dst_access_mask,
                         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                        buffer: buf.handle.get_inner(),
+                        buffer: buf.handle,
                         offset: 0,
                         size: vk::WHOLE_SIZE,
                         ..Default::default()
@@ -853,10 +865,79 @@ impl CommandPoolWrapper {
     }
 }
 
-type ResourceMap = SlotMap<ResourceId, Resource>;
+#[derive(Debug)]
+struct Swapchain {
+    handle: vk::SwapchainKHR,
+    images: Vec<vk::Image>,
+    resource_ids: Vec<ResourceId>,
+    format: vk::Format,
+}
 
-// one command pool per submission thread and queue family
-// a bunch of available command buffers, grouped by queue family
+impl Swapchain {
+    pub fn new() -> Swapchain {
+        Swapchain {
+            handle: Default::default(),
+            images: vec![],
+            format: vk::Format::UNDEFINED,
+        }
+    }
+}
+
+impl Default for Swapchain {
+    fn default() -> Self {
+        Swapchain::new()
+    }
+}
+
+type ResourceMap = SlotMap<ResourceId, Resource>;
+type SwapchainMap = SlotMap<SwapchainId, Swapchain>;
+
+fn get_preferred_swapchain_surface_format(
+    surface_formats: &[vk::SurfaceFormatKHR],
+) -> vk::SurfaceFormatKHR {
+    surface_formats
+        .iter()
+        .find_map(|&fmt| {
+            if fmt.format == vk::Format::B8G8R8A8_SRGB
+                && fmt.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+            {
+                Some(fmt)
+            } else {
+                None
+            }
+        })
+        .expect("no suitable surface format available")
+}
+
+fn get_preferred_present_mode(
+    available_present_modes: &[vk::PresentModeKHR],
+) -> vk::PresentModeKHR {
+    if available_present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
+fn get_preferred_swap_extent(
+    framebuffer_size: (u32, u32),
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+) -> vk::Extent2D {
+    if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        vk::Extent2D {
+            width: framebuffer_size.0.clamp(
+                capabilities.min_image_extent.width,
+                capabilities.max_image_extent.width,
+            ),
+            height: framebuffer_size.1.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    }
+}
 
 struct InFlightBatch {
     resources: Vec<ResourceId>,
@@ -873,12 +954,21 @@ pub struct Context {
     last_submitted_serials: [u64; MAX_QUEUES],
     timelines: [vk::Semaphore; MAX_QUEUES],
     resources: ResourceMap,
+    swapchains: SwapchainMap,
     in_flight: VecDeque<InFlightBatch>,
     available_semaphores: Vec<vk::Semaphore>,
     available_command_pools: Vec<CommandPoolWrapper>,
     vk_khr_swapchain: ash::extensions::khr::Swapchain,
+    vk_khr_surface: ash::extensions::khr::Surface,
 }
 
+// Swapchains!
+// - they need a window to be built
+// - they own images
+// The swapchain can return a different resource on acquire
+// Deleting a swapchain?
+// - need to wait for all batches using a swapchain to be finished
+//      - need to track the swapchain
 impl Context {
     pub fn new(device: Device) -> Context {
         let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
@@ -905,6 +995,7 @@ impl Context {
 
         let vk_khr_swapchain =
             ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device.device);
+        let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
 
         Context {
             device,
@@ -913,10 +1004,12 @@ impl Context {
             timelines,
             last_submitted_serials: Default::default(),
             resources: SlotMap::with_key(),
+            swapchains: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             available_semaphores: vec![],
             available_command_pools: vec![],
             vk_khr_swapchain,
+            vk_khr_surface,
         }
     }
 
@@ -972,7 +1065,7 @@ impl Context {
             .iter()
             .find_map(|(id, r)| match &r.kind {
                 ResourceKind::Image(img) => {
-                    if img.handle.get_inner() == handle {
+                    if img.handle == handle {
                         Some(id)
                     } else {
                         None
@@ -989,19 +1082,34 @@ impl Context {
     }
 
     fn destroy_resource(device: &Device, resource: &mut Resource) {
-        match &mut resource.kind {
-            ResourceKind::Buffer(buf) => {
-                unsafe {
-                    // TODO safety
-                    device.device.destroy_buffer(buf.handle.take(), None);
+        // destroy the object, if we're responsible for it
+        if resource.should_delete {
+            match &mut resource.kind {
+                ResourceKind::Buffer(buf) => {
+                    unsafe {
+                        // TODO safety
+                        device
+                            .device
+                            .destroy_buffer(mem::take(&mut buf.handle), None);
+                    }
+                }
+                ResourceKind::Image(img) => {
+                    unsafe {
+                        // TODO safety
+                        device
+                            .device
+                            .destroy_image(mem::take(&mut img.handle), None)
+                    }
                 }
             }
-            ResourceKind::Image(img) => {
-                unsafe {
-                    // TODO safety
-                    device.device.destroy_image(img.handle.take(), None)
-                }
+        }
+
+        // deallocate its memory, if it was allocated for this object exclusively
+        match resource.memory {
+            ResourceMemory::Exclusive(allocation) => {
+                device.allocator.free_memory(&allocation).unwrap()
             }
+            _ => {}
         }
     }
 
@@ -1046,10 +1154,6 @@ impl Context {
                     .wait_semaphores(&wait_info, 10_000_000_000)
                     .expect("error waiting for batch");
             }
-            // free transient allocations
-            for alloc in b.transient_allocations.iter() {
-                self.device.allocator.free_memory(alloc);
-            }
 
             // update completed serials
             // we just waited on those serials, so we know they are completed
@@ -1064,7 +1168,10 @@ impl Context {
             // given the new completed serials, free resources that have expired
             self.cleanup_resources();
 
-            // TODO recycle the resources owned by the batch
+            // free transient allocations
+            for alloc in b.transient_allocations.iter() {
+                self.device.allocator.free_memory(alloc);
+            }
         }
     }
 
@@ -1146,9 +1253,17 @@ impl Context {
             for access in pass.accesses.iter() {
                 let resource_id = access.id;
                 let resource = self.resources.get(resource_id).unwrap();
-                if resource.allocation.is_some() || alloc_map.get(resource_id).is_some() {
+
+                // already allocated
+                if alloc_map.get(resource_id).is_some() {
                     continue;
                 }
+
+                let alloc_req = match &resource.memory {
+                    ResourceMemory::Aliased(req) => *req,
+                    // not a transient, nothing to allocate
+                    _ => continue,
+                };
 
                 let mut aliased = false;
 
@@ -1159,9 +1274,10 @@ impl Context {
 
                     let alias_candidate = self.resources.get(alias_candidate_id).unwrap();
 
-                    if alias_candidate.allocation.is_some() {
-                        continue;
-                    }
+                    let alias_alloc_req = match &alias_candidate.memory {
+                        ResourceMemory::Aliased(req) => req,
+                        _ => continue,
+                    };
 
                     // skip if the resource has user handles pointing to it that may live beyond the current batch
                     if alias_candidate.user_ref_count > 0 {
@@ -1216,7 +1332,7 @@ impl Context {
                     // the resource is dead, try to reuse
                     let dead_alloc = &mut requirements[alloc_state.index];
 
-                    if !dead_alloc.try_adjust(&resource.allocation_requirements) {
+                    if !dead_alloc.try_adjust(&alloc_req) {
                         continue;
                     }
 
@@ -1240,7 +1356,7 @@ impl Context {
                 if !aliased {
                     // new allocation
                     let index = requirements.len();
-                    requirements.push(resource.allocation_requirements);
+                    requirements.push(alloc_req);
                     alloc_map.insert(
                         resource_id,
                         AllocIndex {
@@ -1295,14 +1411,14 @@ impl Context {
                 match &resource.kind {
                     ResourceKind::Image(img) => unsafe {
                         self.device.device.bind_image_memory(
-                            img.handle.get_inner(),
+                            img.handle,
                             alloc_info.get_device_memory(),
                             alloc_info.get_offset() as u64,
                         );
                     },
                     ResourceKind::Buffer(buf) => unsafe {
                         self.device.device.bind_buffer_memory(
-                            buf.handle.get_inner(),
+                            buf.handle,
                             alloc_info.get_device_memory(),
                             alloc_info.get_offset() as u64,
                         );
@@ -1525,7 +1641,11 @@ impl Context {
         };
         let mem_req = unsafe { self.device.device.get_image_memory_requirements(handle) };
         let allocation = if resource_create_info.transient {
-            None
+            ResourceMemory::Aliased(AllocationRequirements {
+                mem_req,
+                required_flags: resource_create_info.mem_required_flags,
+                preferred_flags: resource_create_info.mem_preferred_flags,
+            })
         } else {
             let allocation_create_info = vk_mem::AllocationCreateInfo {
                 ..Default::default()
@@ -1542,21 +1662,16 @@ impl Context {
                     alloc_info.get_offset() as u64,
                 );
             }
-            Some(alloc)
+            ResourceMemory::Exclusive(alloc)
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
             user_ref_count: 0,
-            allocation_requirements: AllocationRequirements {
-                mem_req,
-                required_flags: resource_create_info.mem_required_flags,
-                preferred_flags: resource_create_info.mem_preferred_flags,
-            },
-            allocation,
+            memory: allocation,
             tracking: Default::default(),
-            tmp_index: None,
+            should_delete: true,
             kind: ResourceKind::Image(ImageResource {
-                handle: UniqueHandle::new(handle),
+                handle,
                 format: image_resource_create_info.format,
             }),
         });
@@ -1586,7 +1701,11 @@ impl Context {
         };
         let mem_req = unsafe { self.device.device.get_buffer_memory_requirements(handle) };
         let allocation = if resource_create_info.transient {
-            None
+            ResourceMemory::Aliased(AllocationRequirements {
+                mem_req,
+                required_flags: resource_create_info.mem_required_flags,
+                preferred_flags: resource_create_info.mem_preferred_flags,
+            })
         } else {
             let allocation_create_info = vk_mem::AllocationCreateInfo {
                 ..Default::default()
@@ -1603,26 +1722,131 @@ impl Context {
                     alloc_info.get_offset() as u64,
                 );
             }
-            Some(alloc)
+            ResourceMemory::Exclusive(alloc)
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
-            //user_ref_count: (),
             user_ref_count: 1,
-            allocation_requirements: AllocationRequirements {
-                mem_req,
-                required_flags: resource_create_info.mem_required_flags,
-                preferred_flags: resource_create_info.mem_preferred_flags,
-            },
-            allocation,
+            memory: allocation,
             tracking: Default::default(),
-            tmp_index: None,
-            kind: ResourceKind::Buffer(BufferResource {
-                handle: UniqueHandle::new(handle),
-            }),
+            should_delete: true,
+            kind: ResourceKind::Buffer(BufferResource { handle }),
         });
         id
     }
+
+    pub unsafe fn create_swapchain(
+        &mut self,
+        surface: vk::SurfaceKHR,
+        initial_size: (u32, u32),
+    ) -> SwapchainId {
+        let id = self.swapchains.insert(Swapchain::new());
+        self.resize_swapchain(id, surface, initial_size);
+        id
+    }
+
+    pub unsafe fn resize_swapchain(
+        &mut self,
+        swapchain_id: SwapchainId,
+        surface: vk::SurfaceKHR,
+        size: (u32, u32),
+    ) {
+        let swapchain = self.swapchains.get_mut(swapchain_id).unwrap();
+        let phy = self.device.physical_device;
+        let capabilities = self
+            .vk_khr_surface
+            .get_physical_device_surface_capabilities(phy, surface)
+            .unwrap();
+        let formats = self
+            .vk_khr_surface
+            .get_physical_device_surface_formats(phy, surface)
+            .unwrap();
+        let present_modes = self
+            .vk_khr_surface
+            .get_physical_device_surface_present_modes(phy, surface)
+            .unwrap();
+
+        let image_format = get_preferred_swapchain_surface_format(&formats);
+        let present_mode = get_preferred_present_mode(&present_modes);
+        let image_extent = get_preferred_swap_extent(size, &capabilities);
+        let image_count = if capabilities.max_image_count > 0
+            && capabilities.min_image_count + 1 > capabilities.max_image_count
+        {
+            capabilities.max_image_count
+        } else {
+            capabilities.min_image_count + 1
+        };
+
+        let present_queue_index = self.device.queues_info.indices.present;
+        let present_queue_family = self.device.queues_info.families[present_queue_index as usize];
+        let queue_family_indices = [present_queue_family];
+
+        let create_info = vk::SwapchainCreateInfoKHR {
+            flags: Default::default(),
+            surface,
+            min_image_count: image_count,
+            image_format: image_format.format,
+            image_color_space: image_format.color_space,
+            image_extent,
+            image_array_layers: 1,
+            image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
+            image_sharing_mode: vk::SharingMode::EXCLUSIVE,
+            queue_family_index_count: 1,
+            p_queue_family_indices: queue_family_indices.as_ptr(),
+            pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
+            composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
+            present_mode,
+            clipped: vk::TRUE,
+            old_swapchain: swapchain.handle,
+            ..Default::default()
+        };
+
+        let new_swapchain_handle = self
+            .vk_khr_swapchain
+            .create_swapchain(&create_info, None)
+            .expect("failed to create swapchain");
+        if swapchain.handle != vk::SwapchainKHR::null() {
+            // FIXME what if the images are in use?
+            self.vk_khr_swapchain
+                .destroy_swapchain(swapchain.handle, None);
+        }
+
+        swapchain.handle = new_swapchain_handle;
+        swapchain.images = self
+            .vk_khr_swapchain
+            .get_swapchain_images(swapchain.handle)
+            .unwrap();
+        swapchain.format = image_format.format;
+    }
+
+    pub unsafe fn acquire_next_image(&mut self, swapchain_id: SwapchainId) -> ResourceId {
+        let image_available = self.create_semaphore();
+        let swapchain = self.swapchains.get_mut(swapchain_id).unwrap();
+        let (image_index, _suboptimal) = self
+            .vk_khr_swapchain
+            .acquire_next_image(
+                swapchain.handle,
+                1_000_000_000,
+                image_available,
+                vk::Fence::null(),
+            )
+            .expect("AcquireNextImage failed");
+
+        let image_id = self.resources.insert(Resource {
+            name: format!("swapchain {:?} image #{}", swapchain.handle, image_index),
+            user_ref_count: 0,
+            tracking: Default::default(),
+            memory: ResourceMemory::External,
+            should_delete: false,
+            kind: ResourceKind::Image(ImageResource {
+                handle: swapchain.images[image_index as usize],
+                format: swapchain.format,
+            }),
+        });
+        image_id
+    }
+
+    pub fn destroy_swapchain(&mut self) {}
 
     pub fn start_batch(&mut self) -> Batch {
         Batch::new(self)
