@@ -194,7 +194,7 @@ struct ResourceTrackingInfo {
     availability_mask: vk::AccessFlags,
     visibility_mask: vk::AccessFlags,
     stages: vk::PipelineStageFlags,
-    wait_binary_semaphore: UniqueHandle<vk::Semaphore>,
+    wait_binary_semaphore: vk::Semaphore,
 }
 
 impl ResourceTrackingInfo {
@@ -220,7 +220,7 @@ impl Default for ResourceTrackingInfo {
             availability_mask: Default::default(),
             visibility_mask: Default::default(),
             stages: Default::default(),
-            wait_binary_semaphore: UniqueHandle::null(),
+            wait_binary_semaphore: Default::default(),
         }
     }
 }
@@ -378,11 +378,30 @@ impl<'ctx> Batch<'ctx> {
         self.build_next_pass(name, queue_index, PassKind::Transfer)
     }
 
-    pub fn present(&mut self, name: &str, swapchain: SwapchainId, image_index: u32) {
+    pub fn present(&mut self, name: &str, image: &SwapchainImage) {
         let queue_index = self.context.device.queues_info.indices.present;
-        let swapchain = self.context.swapchains.get(swapchain).unwrap().handle;
-        let pass_builder = self.build_next_pass(name, queue_index, PassKind::Present { swapchain, image_index });
-        pass_builder.add_image_usage(swapchain)
+        let swapchain = self
+            .context
+            .swapchains
+            .get(image.swapchain_id)
+            .unwrap()
+            .handle;
+        let mut pass_builder = self.build_next_pass(
+            name,
+            queue_index,
+            PassKind::Present {
+                swapchain,
+                image_index: image.image_index,
+            },
+        );
+        pass_builder.add_image_usage(
+            image.image_id,
+            vk::AccessFlags::MEMORY_READ,
+            vk::PipelineStageFlags::ALL_COMMANDS,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            vk::ImageLayout::PRESENT_SRC_KHR,
+        );
+        pass_builder.finish()
     }
 
     fn build_next_pass<'a>(
@@ -469,8 +488,8 @@ impl<'ctx> Batch<'ctx> {
 
         // handle external semaphore dependency
         let semaphore = mem::take(&mut resource.tracking.wait_binary_semaphore);
-        if !semaphore.is_null() {
-            pass.wait_binary_semaphores.push(semaphore.into_inner());
+        if semaphore != vk::Semaphore::null() {
+            pass.wait_binary_semaphores.push(semaphore);
             pass.wait_before = true;
         }
 
@@ -722,6 +741,7 @@ impl SubmissionBatch {
         self.signal_snn = Default::default();
         self.wait_binary_semaphores.clear();
         self.signal_binary_semaphores.clear();
+        self.command_buffers.clear();
     }
 }
 
@@ -869,7 +889,6 @@ impl CommandPoolWrapper {
 struct Swapchain {
     handle: vk::SwapchainKHR,
     images: Vec<vk::Image>,
-    resource_ids: Vec<ResourceId>,
     format: vk::Format,
 }
 
@@ -887,6 +906,13 @@ impl Default for Swapchain {
     fn default() -> Self {
         Swapchain::new()
     }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct SwapchainImage {
+    pub swapchain_id: SwapchainId,
+    pub image_id: ResourceId,
+    pub image_index: u32,
 }
 
 type ResourceMap = SlotMap<ResourceId, Resource>;
@@ -1447,6 +1473,12 @@ impl Context {
         signal_semaphore_values.push(sb.signal_snn.serial());
         self.last_submitted_serials[q] = sb.signal_snn.serial();
 
+        // binary semaphore signals
+        for &s in sb.signal_binary_semaphores.iter() {
+            signal_semaphores.push(s);
+            signal_semaphore_values.push(0);
+        }
+
         // setup timeline waits
         for (i, &w) in sb.wait_serials.iter().enumerate() {
             if w != 0 {
@@ -1457,14 +1489,14 @@ impl Context {
         }
 
         // setup binary semaphore waits
-        for &b in sb.wait_binary_semaphores.iter() {
-            wait_semaphores.push(b);
+        for &s in sb.wait_binary_semaphores.iter() {
+            wait_semaphores.push(s);
             wait_semaphore_values.push(0);
             // TODO
             wait_semaphore_dst_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE);
             // after the submission, the semaphore will be in an unsignalled state,
             // ready to be reused
-            self.available_semaphores.push(b);
+            self.available_semaphores.push(s);
         }
 
         let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
@@ -1523,6 +1555,58 @@ impl Context {
                 sb.wait_binary_semaphores = p.wait_binary_semaphores.clone();
             }
 
+            // ensure that a command pool has been allocated for the queue
+            let command_pool: &mut CommandPoolWrapper =
+                command_pools[q].get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
+            // append to the last command buffer of the batch, otherwise create another one
+
+            if sb.command_buffers.is_empty() {
+                let cb = command_pool.allocate_command_buffer(&self.device.device);
+                let begin_info = vk::CommandBufferBeginInfo {
+                    ..Default::default()
+                };
+                unsafe {
+                    // TODO safety
+                    self.device
+                        .device
+                        .begin_command_buffer(cb, &begin_info)
+                        .unwrap();
+                }
+                sb.command_buffers.push(cb);
+            };
+
+            let cb = sb.command_buffers.last().unwrap().clone();
+
+            // emit barriers if needed
+            if p.src_stage_mask != vk::PipelineStageFlags::TOP_OF_PIPE
+                || p.input_stage_mask != vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                || !p.buffer_memory_barriers.is_empty()
+                || !p.image_memory_barriers.is_empty()
+            {
+                let src_stage_mask = if p.src_stage_mask.is_empty() {
+                    vk::PipelineStageFlags::TOP_OF_PIPE
+                } else {
+                    p.src_stage_mask
+                };
+                let dst_stage_mask = if p.input_stage_mask.is_empty() {
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                } else {
+                    p.input_stage_mask
+                };
+                unsafe {
+                    // TODO safety
+                    self.device.device.cmd_pipeline_barrier(
+                        cb,
+                        src_stage_mask,
+                        dst_stage_mask,
+                        Default::default(),
+                        &[],
+                        &p.buffer_memory_barriers,
+                        &p.image_memory_barriers,
+                    )
+                }
+            }
+
             match p.kind {
                 PassKind::Present {
                     swapchain,
@@ -1563,31 +1647,11 @@ impl Context {
                     self.available_semaphores.push(render_finished_semaphore);
                 }
                 _ => {
-                    // update signalled serial for the batch (pass serials are guaranteed to be increasing)
-                    sb.signal_snn = p.snn;
-
-                    // ensure that a command pool has been allocated for the queue
-                    let command_pool: &mut CommandPoolWrapper = command_pools[q]
-                        .get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
-
-                    // append to the last command buffer of the batch, otherwise create another one
-                    let cb = sb.command_buffers.last().cloned().unwrap_or_else(|| {
-                        let cb = command_pool.allocate_command_buffer(&self.device.device);
-                        let begin_info = vk::CommandBufferBeginInfo {
-                            ..Default::default()
-                        };
-                        unsafe {
-                            // TODO safety
-                            self.device
-                                .device
-                                .begin_command_buffer(cb, &begin_info)
-                                .unwrap();
-                        }
-                        cb
-                    });
-
                     // cb is a command buffer in the recording state
                     // TODO write commands
+
+                    // update signalled serial for the batch (pass serials are guaranteed to be increasing)
+                    sb.signal_snn = p.snn;
                 }
             }
 
@@ -1819,7 +1883,7 @@ impl Context {
         swapchain.format = image_format.format;
     }
 
-    pub unsafe fn acquire_next_image(&mut self, swapchain_id: SwapchainId) -> ResourceId {
+    pub unsafe fn acquire_next_image(&mut self, swapchain_id: SwapchainId) -> SwapchainImage {
         let image_available = self.create_semaphore();
         let swapchain = self.swapchains.get_mut(swapchain_id).unwrap();
         let (image_index, _suboptimal) = self
@@ -1835,7 +1899,10 @@ impl Context {
         let image_id = self.resources.insert(Resource {
             name: format!("swapchain {:?} image #{}", swapchain.handle, image_index),
             user_ref_count: 0,
-            tracking: Default::default(),
+            tracking: ResourceTrackingInfo {
+                wait_binary_semaphore: image_available,
+                ..Default::default()
+            },
             memory: ResourceMemory::External,
             should_delete: false,
             kind: ResourceKind::Image(ImageResource {
@@ -1843,7 +1910,12 @@ impl Context {
                 format: swapchain.format,
             }),
         });
-        image_id
+
+        SwapchainImage {
+            swapchain_id,
+            image_id,
+            image_index,
+        }
     }
 
     pub fn destroy_swapchain(&mut self) {}

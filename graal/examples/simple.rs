@@ -236,7 +236,9 @@ fn main() {
 
                 test_pass(&mut batch,
                         "P11",
-                            &[color_attachment_output(swapchain_image)]);
+                            &[color_attachment_output(swapchain_image.image_id)]);
+
+                batch.present("P12", &swapchain_image);
 
                 batch.finish();
             }
