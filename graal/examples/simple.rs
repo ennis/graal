@@ -1,20 +1,149 @@
-use graal::{vk, ResourceCreateInfo};
+use ash::version::DeviceV1_0;
+use ash::vk::BufferCreateInfo;
+use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemoryInfo};
 use raw_window_handle::HasRawWindowHandle;
+use std::mem::swap;
+use std::path::Path;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-use std::mem::swap;
+
+fn load_image(
+    batch: &mut graal::Batch,
+    path: &Path,
+    usage: graal::vk::ImageUsageFlags,
+    mipmaps: bool,
+) -> (graal::ResourceId, u32, u32) {
+    use openimageio::{ImageInput, TypeDesc};
+
+    let mut image_input = ImageInput::open(path).expect("could not open image file");
+    let spec = image_input.spec();
+
+    let nchannels = spec.num_channels();
+    let format_typedesc = spec.format();
+    let width = spec.width();
+    let height = spec.height();
+
+    if nchannels > 4 {
+        panic!("unsupported number of channels: {}", nchannels);
+    }
+
+    let (vk_format, bpp) = match (format_typedesc, nchannels) {
+        (TypeDesc::U8, 1) => (vk::Format::R8_UNORM, 1usize),
+        (TypeDesc::U8, 2) => (vk::Format::R8G8_UNORM, 2usize),
+        (TypeDesc::U8, 3) => (vk::Format::R8G8B8A8_UNORM, 4usize), // RGB8 not very well supported
+        (TypeDesc::U8, 4) => (vk::Format::R8G8B8A8_UNORM, 4usize),
+        (TypeDesc::U16, 1) => (vk::Format::R16_UNORM, 2usize),
+        (TypeDesc::U16, 2) => (vk::Format::R16G16_UNORM, 4usize),
+        (TypeDesc::U16, 3) => (vk::Format::R16G16B16A16_UNORM, 8usize),
+        (TypeDesc::U16, 4) => (vk::Format::R16G16B16A16_UNORM, 8usize),
+        (TypeDesc::U32, 1) => (vk::Format::R32_UINT, 4usize),
+        (TypeDesc::U32, 2) => (vk::Format::R32G32_UINT, 8usize),
+        (TypeDesc::U32, 3) => (vk::Format::R32G32B32A32_UINT, 16usize),
+        (TypeDesc::U32, 4) => (vk::Format::R32G32B32A32_UINT, 16usize),
+        (TypeDesc::HALF, 1) => (vk::Format::R16_SFLOAT, 2usize),
+        (TypeDesc::HALF, 2) => (vk::Format::R16G16_SFLOAT, 4usize),
+        (TypeDesc::HALF, 3) => (vk::Format::R16G16B16A16_SFLOAT, 8usize),
+        (TypeDesc::HALF, 4) => (vk::Format::R16G16B16A16_SFLOAT, 8usize),
+        (TypeDesc::FLOAT, 1) => (vk::Format::R32_SFLOAT, 4usize),
+        (TypeDesc::FLOAT, 2) => (vk::Format::R32G32_SFLOAT, 8usize),
+        (TypeDesc::FLOAT, 3) => (vk::Format::R32G32B32A32_SFLOAT, 16usize),
+        (TypeDesc::FLOAT, 4) => (vk::Format::R32G32B32A32_SFLOAT, 16usize),
+        _ => panic!("unsupported image format"),
+    };
+
+    let mip_levels = graal::get_mip_level_count(width, height);
+
+    // create the texture
+    let image_id = batch.context().create_image_resource(
+        path.to_str().unwrap(),
+        &ResourceMemoryInfo::DEVICE_LOCAL,
+        &ImageResourceCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            usage: usage | vk::ImageUsageFlags::TRANSFER_DST,
+            format: vk_format,
+            extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+            mip_levels,
+            array_layers: 1,
+            samples: 1,
+            tiling: Default::default(),
+            transient: false,
+        },
+    );
+
+    let byte_size = width as u64 * height as u64 * bpp as u64;
+
+    // create a staging buffer
+    let (staging_buffer_id, mapped_ptr) = batch.context().create_buffer_resource(
+        "staging",
+        &ResourceMemoryInfo::HOST_VISIBLE_COHERENT,
+        &BufferResourceCreateInfo {
+            usage: vk::BufferUsageFlags::TRANSFER_SRC,
+            byte_size,
+            transient: true,
+            map_on_create: true,
+        },
+    );
+
+    // read image data
+    unsafe {
+        image_input
+            .read_unchecked(0, 0, 0..nchannels, format_typedesc, mapped_ptr, bpp)
+            .expect("failed to read image");
+    }
+
+    // build the upload pass
+    let mut pass = batch.build_render_pass("image upload");
+    pass.add_image_usage(
+        image_id,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
+    pass.set_commands(move |context, command_buffer| unsafe {
+        let device = context.device();
+
+        let regions = &[vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: width,
+            buffer_image_height: height,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        }];
+
+        device.cmd_copy_buffer_to_image(
+            command_buffer,
+            context.buffer_handle(staging_buffer_id),
+            context.image_handle(image_id),
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            regions,
+        );
+    });
+    pass.finish();
+    (image_id, width, height)
+}
 
 fn create_transient_image(context: &mut graal::Context, name: &str) -> graal::ResourceId {
     context.create_image_resource(
         name,
-        &graal::ResourceCreateInfo {
-            transient: true,
-            mem_required_flags: graal::vk::MemoryPropertyFlags::DEVICE_LOCAL,
-            mem_preferred_flags: graal::vk::MemoryPropertyFlags::DEVICE_LOCAL
-        },
+        &graal::ResourceMemoryInfo::DEVICE_LOCAL,
         &graal::ImageResourceCreateInfo {
             image_type: graal::vk::ImageType::TYPE_2D,
             usage: graal::vk::ImageUsageFlags::COLOR_ATTACHMENT
@@ -30,7 +159,8 @@ fn create_transient_image(context: &mut graal::Context, name: &str) -> graal::Re
             array_layers: 1,
             samples: 1,
             tiling: graal::vk::ImageTiling::OPTIMAL,
-        }
+            transient: true,
+        },
     )
 }
 
@@ -131,23 +261,37 @@ fn main() {
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
     let device = graal::Device::new(surface);
     let mut context = graal::Context::new(device);
-    let swapchain = unsafe {
-        context.create_swapchain(surface, window.inner_size().into())
-    };
+    let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
+
+    let mut init_batch = context.start_batch();
+    let (file_image_id, file_image_width, file_image_height) = load_image(
+        &mut init_batch,
+        "../data/El4KUGDU0AAW64U.jpg".as_ref(),
+        vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
+        false,
+    );
+    init_batch.finish();
+
+    let mut swapchain_size = window.inner_size().into();
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
         match event {
-            Event::WindowEvent {
-                event: WindowEvent::CloseRequested,
-                ..
-            } => {
-                println!("The close button was pressed; stopping");
-                *control_flow = ControlFlow::Exit
-            }
+            Event::WindowEvent { window_id, event } => match event {
+                WindowEvent::CloseRequested => {
+                    println!("The close button was pressed; stopping");
+                    *control_flow = ControlFlow::Exit
+                }
+                WindowEvent::Resized(size) => unsafe {
+                    swapchain_size = size.into();
+                    context.resize_swapchain(swapchain, surface, swapchain_size);
+                },
+                _ => {}
+            },
             Event::MainEventsCleared => {
                 window.request_redraw();
             }
+
             Event::RedrawRequested(_) => {
                 let img_a = create_transient_image(&mut context, "A");
                 let img_b = create_transient_image(&mut context, "B");
@@ -168,9 +312,7 @@ fn main() {
                 // non-transient resources are deleted once refcount is zero
                 // transient resources are deleted once the batch is finished, regardless of refcounts
 
-                let swapchain_image = unsafe {
-                    context.acquire_next_image(swapchain)
-                };
+                let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
                 let mut batch = context.start_batch();
 
                 test_pass(&mut batch, "P0", &[color_attachment_output(img_a)]);
@@ -234,9 +376,79 @@ fn main() {
                     &[compute_read(img_j), compute_write(img_k)],
                 );
 
-                test_pass(&mut batch,
-                        "P11",
-                            &[color_attachment_output(swapchain_image.image_id)]);
+                test_pass(
+                    &mut batch,
+                    "P11",
+                    &[color_attachment_output(swapchain_image.image_id)],
+                );
+
+                // blit pass
+                let mut blit_pass = batch.build_render_pass("blit to screen");
+                blit_pass.add_image_usage(
+                    file_image_id,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::empty(),
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                );
+                blit_pass.add_image_usage(
+                    swapchain_image.image_id,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
+
+                let blit_w = file_image_width.min(swapchain_size.0);
+                let blit_h = file_image_height.min(swapchain_size.1);
+                blit_pass.set_commands(|context, command_buffer| {
+                    let dst_image_handle = context.image_handle(swapchain_image.image_id);
+                    let src_image_handle = context.image_handle(file_image_id);
+
+                    let regions = &[vk::ImageBlit {
+                        src_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        src_offsets: [
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: blit_w as i32,
+                                y: blit_h as i32,
+                                z: 1,
+                            },
+                        ],
+                        dst_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        dst_offsets: [
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: blit_w as i32,
+                                y: blit_h as i32,
+                                z: 1,
+                            },
+                        ],
+                    }];
+
+                    unsafe {
+                        context.device().cmd_blit_image(
+                            command_buffer,
+                            src_image_handle,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            dst_image_handle,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            regions,
+                            vk::Filter::NEAREST,
+                        );
+                    }
+                });
+                blit_pass.finish();
 
                 batch.present("P12", &swapchain_image);
 

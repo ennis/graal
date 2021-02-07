@@ -9,19 +9,30 @@ use std::rc::Rc;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
+/// Defines the queue indices for each usage (graphics, compute, transfer, present).
 #[derive(Copy, Clone, Default)]
 pub(crate) struct QueueIndices {
+    /// The queue that should be used for graphics operations. It is also guaranteed to support compute and transfer operations.
     pub graphics: u8,
+    /// The queue that should be used for asynchronous compute operations.
     pub compute: u8,
+    /// The queue that should be used for asynchronous transfer operations.
     pub transfer: u8,
+    /// The queue that should be used for presentation.
+    // TODO remove? this is always equal to graphics
     pub present: u8,
 }
 
+/// Information about the queues of a device.
 #[derive(Copy, Clone, Default)]
 pub(crate) struct QueuesInfo {
+    /// Number of created queues.
     pub queue_count: usize,
+    /// Queue indices by usage.
     pub indices: QueueIndices,
+    /// The queue family index of each queue. The first `queue_count` entries are valid, the rest is unspecified.
     pub families: [u32; MAX_QUEUES],
+    /// The queue handle of each queue. The first `queue_count` entries are valid, the rest is unspecified.
     pub queues: [vk::Queue; MAX_QUEUES],
 }
 
@@ -225,8 +236,14 @@ impl Device {
             let compute_queue = device.get_device_queue(compute_queue_family, 0);
             let transfer_queue = device.get_device_queue(transfer_queue_family, 0);
 
+            // queues are accessed by index. there are three different indices
+            // - graphics
+            // - compute
+            // - transfer
+            // (present is always == graphics)
+            // Some of those indices may be equal. E.g. the graphics and compute queues might be the
+            // same, and graphics == compute.
             let graphics_queue_index: u8 = 0u8;
-            let present_queue_index: u8 = graphics_queue_index;
             let compute_queue_index: u8 = if compute_queue == graphics_queue {
                 0
             } else {
@@ -249,14 +266,22 @@ impl Device {
             queues_info.families[graphics_queue_index as usize] = graphics_queue_family;
             queues_info.families[compute_queue_index as usize] = compute_queue_family;
             queues_info.families[transfer_queue_index as usize] = transfer_queue_family;
-            queues_info.families[present_queue_index as usize] = graphics_queue_family;
 
             queues_info.indices = QueueIndices {
                 graphics: graphics_queue_index,
                 compute: compute_queue_index,
-                present: present_queue_index,
+                present: graphics_queue_index,
                 transfer: transfer_queue_index,
             };
+
+            queues_info.queue_count = *[
+                graphics_queue_index,
+                compute_queue_index,
+                transfer_queue_index,
+            ]
+            .iter()
+            .max().unwrap() as usize
+                + 1;
 
             let allocator_create_info = vk_mem::AllocatorCreateInfo {
                 physical_device: phy.phy,

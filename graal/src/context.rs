@@ -6,16 +6,20 @@ use crate::VULKAN_ENTRY;
 use crate::VULKAN_INSTANCE;
 use ash::version::{DeviceV1_0, DeviceV1_2};
 use ash::vk;
+use bitflags::bitflags;
 use core::ptr;
 use fixedbitset::FixedBitSet;
 use slotmap::{new_key_type, Key, SecondaryMap, SlotMap};
+use std::alloc::Layout;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::mem;
 use std::mem::swap;
-use std::ops::Sub;
+use std::ops::{Range, Sub};
 use std::os::raw::c_void;
 use std::rc::Rc;
+use vk_mem::error::ErrorKind::Memory;
+use vk_mem::{AllocationCreateInfo, Allocator, MemoryUsage};
 
 fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     match count {
@@ -30,32 +34,221 @@ fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     }
 }
 
-#[derive(Copy, Clone, Debug, Default)]
-pub struct ResourceCreateInfo {
-    pub transient: bool,
-    pub mem_required_flags: vk::MemoryPropertyFlags,
-    pub mem_preferred_flags: vk::MemoryPropertyFlags,
+// staging buffers:
+// - last use serial
+// -
+
+pub unsafe fn place_aligned(layout: &Layout, ptr: &mut *mut u8, space: &mut usize) -> *mut u8 {
+    let ptr_usize = *ptr as usize;
+
+    let mut off = ptr_usize & (layout.align() - 1);
+    if off > 0 {
+        off = layout.align() - off;
+    }
+    if ptr_usize + off + layout.size() > *space {
+        ptr::null_mut()
+    } else {
+        *space -= off + layout.size();
+        *ptr = ptr.add(off);
+        *ptr
+    }
 }
 
+struct UploadChunk {
+    allocation: vk_mem::Allocation,
+    buffer: vk::Buffer,
+    base: *mut u8,
+    ptr: *mut u8,
+    space: usize,
+}
+
+impl UploadChunk {
+    pub fn new(
+        device: &Device,
+        memory_usage: vk_mem::MemoryUsage,
+        buffer_usage: vk::BufferUsageFlags,
+        size: usize,
+    ) -> UploadChunk {
+        let alloc_info = vk_mem::AllocationCreateInfo {
+            flags: vk_mem::AllocationCreateFlags::MAPPED,
+            usage: memory_usage,
+            ..Default::default()
+        };
+
+        let buffer_create_info = vk::BufferCreateInfo {
+            flags: Default::default(),
+            size: size as u64,
+            usage: buffer_usage,
+            sharing_mode: vk::SharingMode::CONCURRENT,
+            queue_family_index_count: device.queues_info.queue_count as u32,
+            p_queue_family_indices: device.queues_info.families.as_ptr(),
+            ..Default::default()
+        };
+
+        let (buffer, allocation, alloc_info) = device
+            .allocator
+            .create_buffer(&buffer_create_info, &alloc_info)
+            .expect("failed to allocate buffer");
+        UploadChunk {
+            allocation,
+            buffer,
+            base: alloc_info.get_mapped_data(),
+            ptr: alloc_info.get_mapped_data(),
+            space: size,
+        }
+    }
+
+    pub unsafe fn allocate(
+        &mut self,
+        layout: &Layout,
+    ) -> Option<(*mut u8, vk::Buffer, vk::DeviceSize)> {
+        let ptr = place_aligned(layout, &mut self.ptr, &mut self.space);
+        if !ptr.is_null() {
+            Some((ptr, self.buffer, ptr.offset_from(self.base) as u64))
+        } else {
+            None
+        }
+    }
+}
+
+/// A pool of CPU-visible memory used for staging resources or uploading dynamic data.
+struct UploadPool {
+    usage: vk_mem::MemoryUsage,
+    chunk_size: usize,
+    chunks: Vec<UploadChunk>,
+    dedicated: Vec<vk_mem::Allocation>,
+}
+
+// for data like uniforms or vertex stuff
+// - suballocate the same buffer
+// for staging textures and meshes
+// -
+// - allocate separate buffers, standard resources
+
+/*impl UploadPool {
+    /// Creates a new upload pool.
+    pub fn new(
+        memory_usage: vk_mem::MemoryUsage,
+        buffer_usage: vk::BufferUsageFlags,
+    ) -> UploadPool {
+    }
+
+    pub fn get_upload_space(
+        &mut self,
+        layout: &Layout,
+        batch_index: u64,
+    ) -> (*mut u8, vk::Buffer, vk::DeviceSize) {
+        // look for a buffer with enough free space
+    }
+}*/
+
+/// Information about the memory to be allocated for a resource.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ResourceMemoryInfo {
+    /// Required memory property flags. Panics if those cannot be honored (no memory type with those properties).
+    pub required_flags: vk::MemoryPropertyFlags,
+    /// Preferred memory property flags. The allocator will honor those flags if a memory type with those properties exist, otherwise it will fallback to the required flags.
+    pub preferred_flags: vk::MemoryPropertyFlags,
+}
+
+impl ResourceMemoryInfo {
+    pub const fn new() -> ResourceMemoryInfo {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::empty(),
+            preferred_flags: vk::MemoryPropertyFlags::empty(),
+        }
+    }
+
+    /// Requires that the resource be allocated in DEVICE_LOCAL memory.
+    pub const fn device_local(self) -> Self {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::from_raw(
+                self.required_flags.as_raw() | vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw(),
+            ),
+            ..self
+        }
+    }
+
+    /// Requires that the resource be allocated in HOST_VISIBLE memory.
+    pub const fn host_visible(self) -> Self {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::from_raw(
+                self.required_flags.as_raw() | vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw(),
+            ),
+            ..self
+        }
+    }
+
+    /// Requires that the resource be allocated in HOST_COHERENT memory.
+    pub const fn host_coherent(self) -> Self {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::from_raw(
+                self.required_flags.as_raw() | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+            ),
+            ..self
+        }
+    }
+
+    /// Device-local resource memory. Shorthand for `ResourceMemoryInfo::new().device_local()`.
+    pub const DEVICE_LOCAL: ResourceMemoryInfo = ResourceMemoryInfo::new().device_local();
+
+    /// Host-visible resource memory (upload buffers). Shorthand for `ResourceMemoryInfo::new().host_visible()`.
+    pub const HOST_VISIBLE: ResourceMemoryInfo = ResourceMemoryInfo::new().host_visible();
+
+    /// Host-visible and coherent resource memory (upload buffers without need for flushes).
+    /// Shorthand for `ResourceMemoryInfo::new().host_visible().host_coherent()`.
+    pub const HOST_VISIBLE_COHERENT: ResourceMemoryInfo =
+        ResourceMemoryInfo::new().host_visible().host_coherent();
+
+    /// Staging buffers (host-visible, preferably coherent)
+    pub const STAGING: ResourceMemoryInfo =
+        ResourceMemoryInfo::new().host_visible().host_coherent();
+}
+
+/// Parameters of a newly created image resource.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ImageResourceCreateInfo {
+    /// Image type.
     pub image_type: vk::ImageType,
+    /// Usage flags.
     pub usage: vk::ImageUsageFlags,
+    /// Format of the image.
     pub format: vk::Format,
+    /// Size of the image.
     pub extent: vk::Extent3D,
+    /// Number of mipmap levels. Note that the mipmaps contents must still be generated manually.
     pub mip_levels: u32,
+    /// Number of array layers.
     pub array_layers: u32,
+    /// Number of samples.
     pub samples: u32,
+    /// Tiling.
     pub tiling: vk::ImageTiling,
+    /// Whether the resource should live only for the duration of the batch it's used in.
+    /// When the batch that uses the resource completes, the resource is automatically deleted.
+    /// The resource can only be used in one batch.
+    pub transient: bool,
 }
 
+/// Parameters of a newly created buffer resource.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct BufferResourceCreateInfo {
+    /// Usage flags.
     pub usage: vk::BufferUsageFlags,
+    /// Size of the buffer in bytes.
     pub byte_size: u64,
+    /// Whether the resource should live only for the duration of the batch it's used in.
+    /// When the batch that uses the resource completes, the resource is automatically deleted.
+    /// The resource can only be used in one batch.
+    pub transient: bool,
+    /// Whether the memory for the resource should be mapped for host access immediately.
+    /// If this flag is set, `create_buffer_resource` will also return a pointer to the mapped buffer.
+    /// This flag is ignored for resources that can't be mapped.
+    pub map_on_create: bool,
 }
 
-fn get_mip_level_count(width: u32, height: u32) -> u32 {
+/// Computes the number of mip levels for a 2D image of the given size.
+pub fn get_mip_level_count(width: u32, height: u32) -> u32 {
     (width.max(height) as f32).log2().floor() as u32
 }
 
@@ -188,6 +381,7 @@ enum ResourceKind {
 
 #[derive(Debug)]
 struct ResourceTrackingInfo {
+    owner_queue_family: u32,
     readers: [u64; MAX_QUEUES],
     writer: SubmissionNumber,
     layout: vk::ImageLayout,
@@ -214,6 +408,7 @@ impl ResourceTrackingInfo {
 impl Default for ResourceTrackingInfo {
     fn default() -> Self {
         ResourceTrackingInfo {
+            owner_queue_family: vk::QUEUE_FAMILY_IGNORED,
             readers: [0; 4],
             writer: Default::default(),
             layout: Default::default(),
@@ -250,6 +445,22 @@ struct Resource {
     should_delete: bool,
     /// Details specific to the kind of resource (buffer or image).
     kind: ResourceKind,
+}
+
+impl Resource {
+    fn image(&self) -> &ImageResource {
+        match &self.kind {
+            ResourceKind::Image(r) => r,
+            _ => panic!("expected an image resource")
+        }
+    }
+
+    fn buffer(&self) -> &BufferResource {
+        match &self.kind {
+            ResourceKind::Buffer(r) => r,
+            _ => panic!("expected a buffer resource")
+        }
+    }
 }
 
 /// Adds an execution dependency between a source and destination pass, identified by their submission numbers.
@@ -323,19 +534,19 @@ fn compute_reachability(passes: &[Pass]) -> Reachability {
     Reachability { m }
 }
 
-pub struct Batch<'ctx> {
+pub struct Batch<'a> {
     base_serial: u64,
-    context: &'ctx mut Context,
+    context: &'a mut Context,
     /// Map temporary index -> resource
     temporaries: Vec<ResourceId>,
     /// Set of all resources referenced in the batch
     temporary_set: TemporarySet,
     /// List of passes
-    passes: Vec<Pass>,
+    passes: Vec<Pass<'a>>,
 }
 
-impl<'ctx> Batch<'ctx> {
-    fn new(context: &'ctx mut Context) -> Batch<'ctx> {
+impl<'a> Batch<'a> {
+    fn new(context: &'a mut Context) -> Batch<'a> {
         Batch {
             base_serial: context.next_serial,
             context,
@@ -345,37 +556,41 @@ impl<'ctx> Batch<'ctx> {
         }
     }
 
-    pub fn build_render_pass<'a>(&'a mut self, name: &str) -> PassBuilder<'ctx, 'a> {
-        let queues_info = self.context.device.queues_info;
-        self.build_next_pass(name, queues_info.indices.graphics, PassKind::Render)
+    pub fn context(&mut self) -> &mut Context {
+        self.context
     }
 
-    pub fn build_compute_pass<'a>(
-        &'a mut self,
+    pub fn build_render_pass<'b>(&'b mut self, name: &str) -> PassBuilder<'a, 'b> {
+        let queues_info = self.context.device.queues_info;
+        self.build_pass(name, queues_info.indices.graphics, PassKind::Render)
+    }
+
+    pub fn build_compute_pass<'b>(
+        &'b mut self,
         name: &str,
         async_compute: bool,
-    ) -> PassBuilder<'ctx, 'a> {
+    ) -> PassBuilder<'a, 'b> {
         let queues_info = self.context.device.queues_info;
         let queue_index = if async_compute {
             queues_info.indices.compute
         } else {
             queues_info.indices.graphics
         };
-        self.build_next_pass(name, queue_index, PassKind::Compute)
+        self.build_pass(name, queue_index, PassKind::Compute)
     }
 
-    pub fn build_transfer_pass<'a>(
-        &'a mut self,
+    pub fn build_transfer_pass<'b>(
+        &'b mut self,
         name: &str,
         async_transfer: bool,
-    ) -> PassBuilder<'ctx, 'a> {
+    ) -> PassBuilder<'a, 'b> {
         let queues_info = self.context.device.queues_info;
         let queue_index = if async_transfer {
             queues_info.indices.transfer
         } else {
             queues_info.indices.graphics
         };
-        self.build_next_pass(name, queue_index, PassKind::Transfer)
+        self.build_pass(name, queue_index, PassKind::Transfer)
     }
 
     pub fn present(&mut self, name: &str, image: &SwapchainImage) {
@@ -386,7 +601,7 @@ impl<'ctx> Batch<'ctx> {
             .get(image.swapchain_id)
             .unwrap()
             .handle;
-        let mut pass_builder = self.build_next_pass(
+        let mut pass_builder = self.build_pass(
             name,
             queue_index,
             PassKind::Present {
@@ -404,12 +619,12 @@ impl<'ctx> Batch<'ctx> {
         pass_builder.finish()
     }
 
-    fn build_next_pass<'a>(
-        &'a mut self,
+    fn build_pass<'b>(
+        &'b mut self,
         name: &str,
         queue_index: u8,
         kind: PassKind,
-    ) -> PassBuilder<'ctx, 'a> {
+    ) -> PassBuilder<'a, 'b> {
         let serial = self.context.get_next_serial();
         let batch_index = self.passes.len();
         let snn = SubmissionNumber::new(queue_index, serial);
@@ -421,16 +636,16 @@ impl<'ctx> Batch<'ctx> {
     }
 
     /// Called by `PassBuilder::finish`.
-    fn finish_pass(&mut self, pass: Pass) {
+    fn finish_pass(&mut self, pass: Pass<'a>) {
         self.passes.push(pass)
     }
 
     /// Helper to find the pass given a submission number.
-    fn get_pass_mut(
+    fn get_pass_mut<'pass,'b>(
         start_serial: u64,
-        passes: &mut [Pass],
+        passes: &'pass mut [Pass<'b>],
         snn: SubmissionNumber,
-    ) -> Option<&mut Pass> {
+    ) -> Option<&'pass mut Pass<'b>> {
         if snn.serial() <= start_serial {
             None
         } else {
@@ -439,12 +654,12 @@ impl<'ctx> Batch<'ctx> {
         }
     }
 
-    fn register_temporary<'a>(
-        resources: &'a mut ResourceMap,
+    fn register_temporary<'b>(
+        resources: &'b mut ResourceMap,
         temporaries: &mut Vec<ResourceId>,
         temporary_set: &mut TemporarySet,
         id: ResourceId,
-    ) -> &'a mut Resource {
+    ) -> &'b mut Resource {
         let resource = resources.get_mut(id).unwrap();
 
         if temporary_set.insert(id) {
@@ -648,7 +863,7 @@ impl<'ctx> Batch<'ctx> {
             println!("    input memory barriers:");
             for imb in p.image_memory_barriers.iter() {
                 let id = self.context.image_resource_by_handle(imb.image);
-                print!("        Image handle={:?} ", imb.image);
+                print!("        image handle={:?} ", imb.image);
                 if !id.is_null() {
                     print!(
                         "(id={:?}, name={})",
@@ -751,82 +966,14 @@ impl Default for SubmissionBatch {
     }
 }
 
-/*struct SubmissionBatchBuilder {
-    open_batches: [Option<usize>; MAX_QUEUES],
-    batches: Vec<SubmissionBatch>,
+/// Builder object for passes.
+pub struct PassBuilder<'a, 'batch> {
+    batch: &'batch mut Batch<'a>,
+    pass: Pass<'a>,
 }
 
-impl SubmissionBatchBuilder {
-    fn new() -> SubmissionBatchBuilder {
-        SubmissionBatchBuilder {
-            open_batches: [None; MAX_QUEUES],
-            batches: Vec::new(),
-        }
-    }
-
-    fn get_open_batch(&mut self, queue: u8) -> &mut SubmissionBatch {
-        let q = queue as usize;
-        if let Some(i) = self.open_batches[q] {
-            &mut self.batches[i]
-        } else {
-            let i = self.batches.len();
-            self.open_batches[q] = Some(i);
-            self.batches.push(SubmissionBatch::new());
-            self.batches.last_mut().unwrap()
-        }
-    }
-
-    fn add_pass(&mut self, pass: &Pass) {
-        let submission = self.get_open_batch(pass.snn.queue());
-        submission.signal_snn = SubmissionNumber::new(
-            pass.snn.queue(),
-            submission.signal_snn.serial().max(pass.snn.serial()),
-        );
-    }
-
-    fn start_batch(
-        &mut self,
-        queue: u8,
-        wait_serials: [u64; MAX_QUEUES],
-        wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
-        wait_binary_semaphores: &[vk::Semaphore],
-    ) {
-        for iq in 0..MAX_QUEUES {
-            if wait_serials[iq] != 0 || iq == queue {
-                self.end_batch(iq as u8);
-            }
-        }
-        let batch = self.get_open_batch(queue);
-        batch.wait_serials = wait_serials;
-        batch.wait_dst_stages = wait_dst_stages;
-        batch.wait_binary_semaphores = wait_binary_semaphores.into();
-    }
-
-    fn end_batch(&mut self, queue: u8) {
-        self.open_batches[queue as usize] = None;
-    }
-
-    fn end_batch_and_present(
-        &mut self,
-        queue: u8,
-        swapchains: &[vk::SwapchainKHR],
-        swapchain_image_indices: &[u32],
-        render_finished_semaphores: &[vk::Semaphore],
-    ) {
-        let b = self.get_open_batch(queue);
-        b.swapchains = swapchains;
-        b.swapchain_image_indices = swapchain_image_indices;
-        b.render_finished_semaphore = Some(render_finished_semaphore);
-        self.end_batch(queue);
-    }
-}*/
-
-pub struct PassBuilder<'ctx, 'batch> {
-    batch: &'batch mut Batch<'ctx>,
-    pass: Pass,
-}
-
-impl<'ctx, 'batch> PassBuilder<'ctx, 'batch> {
+impl<'a, 'batch> PassBuilder<'a, 'batch> {
+    /// Registers an image access made by this pass.
     pub fn add_image_usage(
         &mut self,
         image: ResourceId,
@@ -847,6 +994,13 @@ impl<'ctx, 'batch> PassBuilder<'ctx, 'batch> {
         )
     }
 
+    /// Sets the command handler for this pass.
+    /// The handler will be called when building the command buffer, on batch submission.
+    pub fn set_commands(&mut self, commands: impl FnOnce(&Context, vk::CommandBuffer) + 'a) {
+        self.pass.commands = Some(Box::new(commands));
+    }
+
+    /// Finishes the recording of this pass.
     pub fn finish(mut self) {
         self.batch.finish_pass(self.pass)
     }
@@ -988,14 +1142,10 @@ pub struct Context {
     vk_khr_surface: ash::extensions::khr::Surface,
 }
 
-// Swapchains!
-// - they need a window to be built
-// - they own images
-// The swapchain can return a different resource on acquire
-// Deleting a swapchain?
-// - need to wait for all batches using a swapchain to be finished
-//      - need to track the swapchain
+
 impl Context {
+
+    /// Creates a new context.
     pub fn new(device: Device) -> Context {
         let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
 
@@ -1037,6 +1187,23 @@ impl Context {
             vk_khr_swapchain,
             vk_khr_surface,
         }
+    }
+
+    /// Returns the `ash::Device` associated with this context.
+    pub fn device(&self) -> &ash::Device {
+        &self.device.device
+    }
+
+    /// Returns the handle of the corresponding image resource.
+    /// Panics if `id` does not refer to an image resource.
+    pub fn image_handle(&self, id: ResourceId) -> vk::Image {
+        self.resources.get(id).unwrap().image().handle
+    }
+
+    /// Returns the handle of the corresponding buffer resource.
+    /// Panics if `id` does not refer to a buffer resource.
+    pub fn buffer_handle(&self, id: ResourceId) -> vk::Buffer {
+        self.resources.get(id).unwrap().buffer().handle
     }
 
     fn create_command_pool(&mut self, queue_index: u8) -> CommandPoolWrapper {
@@ -1240,12 +1407,12 @@ impl Context {
         &mut self,
         base_serial: u64,
         temporaries: Vec<ResourceId>,
-        passes: Vec<Pass>,
+        mut passes: Vec<Pass>,
     ) {
         self.wait_for_batches_in_flight();
         let transient_allocations =
             self.allocate_transient_memory(base_serial, &temporaries, &passes);
-        let command_pools = self.submit_passes(&passes);
+        let command_pools = self.submit_passes(&mut passes);
         self.in_flight.push_back(InFlightBatch {
             resources: temporaries,
             signalled_serials: self.last_submitted_serials,
@@ -1528,14 +1695,14 @@ impl Context {
         }
     }
 
-    fn submit_passes(&mut self, passes: &[Pass]) -> Vec<CommandPoolWrapper> {
+    fn submit_passes(&mut self, passes: &mut [Pass]) -> Vec<CommandPoolWrapper> {
         // current submission batches per queue
         let mut submission_batches: [SubmissionBatch; MAX_QUEUES] = Default::default();
         // one command pool per queue (might not be necessary if the queues belong to the same family,
         // but they usually don't)
         let mut command_pools: [Option<CommandPoolWrapper>; MAX_QUEUES] = Default::default();
 
-        for p in passes.iter() {
+        for p in passes.iter_mut() {
             let q = p.snn.queue() as usize;
             if p.wait_before {
                 // the pass needs a semaphore wait, so it needs a separate batch
@@ -1649,6 +1816,9 @@ impl Context {
                 _ => {
                     // cb is a command buffer in the recording state
                     // TODO write commands
+                    if let Some(handler) = p.commands.take() {
+                        handler(self, cb);
+                    }
 
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
                     sb.signal_snn = p.snn;
@@ -1676,25 +1846,31 @@ impl Context {
             .collect()
     }
 
+    /// Creates a new image resource.
     ///
     pub fn create_image_resource(
         &mut self,
         name: &str,
-        resource_create_info: &ResourceCreateInfo,
-        image_resource_create_info: &ImageResourceCreateInfo,
+        memory_info: &ResourceMemoryInfo,
+        image_info: &ImageResourceCreateInfo,
     ) -> ResourceId {
+        // for now all resources are CONCURRENT, because that's the only way they can
+        // be read across multiple queues.
+        // Maybe exclusive ownership will be needed at some point, but then we should prevent
+        // them from being used across multiple queues. I know that there's the possibility of doing
+        // a "queue ownership transfer", but that shit is incomprehensible.
         let create_info = vk::ImageCreateInfo {
-            image_type: image_resource_create_info.image_type,
-            format: image_resource_create_info.format,
-            extent: image_resource_create_info.extent,
-            mip_levels: image_resource_create_info.mip_levels,
-            array_layers: image_resource_create_info.array_layers,
-            samples: get_vk_sample_count(image_resource_create_info.samples),
-            tiling: image_resource_create_info.tiling,
-            usage: image_resource_create_info.usage,
+            image_type: image_info.image_type,
+            format: image_info.format,
+            extent: image_info.extent,
+            mip_levels: image_info.mip_levels,
+            array_layers: image_info.array_layers,
+            samples: get_vk_sample_count(image_info.samples),
+            tiling: image_info.tiling,
+            usage: image_info.usage,
             sharing_mode: vk::SharingMode::CONCURRENT,
-            queue_family_index_count: 0,
-            p_queue_family_indices: ptr::null(),
+            queue_family_index_count: self.device.queues_info.queue_count as u32,
+            p_queue_family_indices: self.device.queues_info.families.as_ptr(),
             ..Default::default()
         };
         let handle = unsafe {
@@ -1704,14 +1880,16 @@ impl Context {
                 .expect("failed to create image")
         };
         let mem_req = unsafe { self.device.device.get_image_memory_requirements(handle) };
-        let allocation = if resource_create_info.transient {
+        let memory = if image_info.transient {
             ResourceMemory::Aliased(AllocationRequirements {
                 mem_req,
-                required_flags: resource_create_info.mem_required_flags,
-                preferred_flags: resource_create_info.mem_preferred_flags,
+                required_flags: memory_info.required_flags,
+                preferred_flags: memory_info.preferred_flags,
             })
         } else {
             let allocation_create_info = vk_mem::AllocationCreateInfo {
+                preferred_flags: memory_info.preferred_flags,
+                required_flags: memory_info.required_flags,
                 ..Default::default()
             };
             let (alloc, alloc_info) = self
@@ -1731,12 +1909,12 @@ impl Context {
         let id = self.resources.insert(Resource {
             name: name.to_string(),
             user_ref_count: 0,
-            memory: allocation,
+            memory,
             tracking: Default::default(),
             should_delete: true,
             kind: ResourceKind::Image(ImageResource {
                 handle,
-                format: image_resource_create_info.format,
+                format: image_info.format,
             }),
         });
         id
@@ -1745,16 +1923,20 @@ impl Context {
     pub fn create_buffer_resource(
         &mut self,
         name: &str,
-        resource_create_info: &ResourceCreateInfo,
-        buffer_resource_create_info: &BufferResourceCreateInfo,
-    ) -> ResourceId {
+        memory_info: &ResourceMemoryInfo,
+        buffer_info: &BufferResourceCreateInfo,
+    ) -> (ResourceId, *mut u8) {
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
-            size: buffer_resource_create_info.byte_size,
-            usage: buffer_resource_create_info.usage,
-            sharing_mode: vk::SharingMode::CONCURRENT,
-            queue_family_index_count: 0,
-            p_queue_family_indices: ptr::null(),
+            size: buffer_info.byte_size,
+            usage: buffer_info.usage,
+            sharing_mode: if self.device.queues_info.queue_count == 1 {
+                vk::SharingMode::EXCLUSIVE
+            } else {
+                vk::SharingMode::CONCURRENT
+            },
+            queue_family_index_count: self.device.queues_info.queue_count as u32,
+            p_queue_family_indices: self.device.queues_info.families.as_ptr(),
             ..Default::default()
         };
         let handle = unsafe {
@@ -1764,14 +1946,24 @@ impl Context {
                 .expect("failed to create buffer")
         };
         let mem_req = unsafe { self.device.device.get_buffer_memory_requirements(handle) };
-        let allocation = if resource_create_info.transient {
-            ResourceMemory::Aliased(AllocationRequirements {
+        let (memory, mapped_ptr) = if buffer_info.transient && !buffer_info.map_on_create {
+            // We can delay allocation only if the user requests a transient resource and
+            // if the resource does not need to be mapped immediately.
+            let memory = ResourceMemory::Aliased(AllocationRequirements {
                 mem_req,
-                required_flags: resource_create_info.mem_required_flags,
-                preferred_flags: resource_create_info.mem_preferred_flags,
-            })
+                required_flags: memory_info.required_flags,
+                preferred_flags: memory_info.preferred_flags,
+            });
+            (memory, ptr::null_mut())
         } else {
             let allocation_create_info = vk_mem::AllocationCreateInfo {
+                flags: if buffer_info.map_on_create {
+                    vk_mem::AllocationCreateFlags::MAPPED
+                } else {
+                    vk_mem::AllocationCreateFlags::NONE
+                },
+                preferred_flags: memory_info.preferred_flags,
+                required_flags: memory_info.required_flags,
                 ..Default::default()
             };
             let (alloc, alloc_info) = self
@@ -1786,17 +1978,25 @@ impl Context {
                     alloc_info.get_offset() as u64,
                 );
             }
-            ResourceMemory::Exclusive(alloc)
+            let memory = ResourceMemory::Exclusive(alloc);
+            let mapped_ptr = if buffer_info.map_on_create {
+                let ptr = alloc_info.get_mapped_data();
+                assert!(!ptr.is_null(), "failed to map buffer");
+                ptr
+            } else {
+                ptr::null_mut()
+            };
+            (memory, mapped_ptr)
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
             user_ref_count: 1,
-            memory: allocation,
+            memory,
             tracking: Default::default(),
             should_delete: true,
             kind: ResourceKind::Buffer(BufferResource { handle }),
         });
-        id
+        (id, mapped_ptr)
     }
 
     pub unsafe fn create_swapchain(
@@ -1855,8 +2055,8 @@ impl Context {
             image_array_layers: 1,
             image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
             image_sharing_mode: vk::SharingMode::EXCLUSIVE,
-            queue_family_index_count: 1,
-            p_queue_family_indices: queue_family_indices.as_ptr(),
+            queue_family_index_count: 0,
+            p_queue_family_indices: ptr::null(),
             pre_transform: vk::SurfaceTransformFlagsKHR::IDENTITY,
             composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
             present_mode,

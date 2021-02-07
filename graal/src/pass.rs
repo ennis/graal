@@ -1,5 +1,5 @@
 use crate::handle::UniqueHandleVec;
-use crate::MAX_QUEUES;
+use crate::{MAX_QUEUES, Context};
 use ash::vk;
 use crate::context::ResourceId;
 use std::fmt;
@@ -51,7 +51,7 @@ pub(crate) enum PassKind {
     },
 }
 
-pub(crate) struct Pass {
+pub(crate) struct Pass<'a> {
     pub(crate) name: String,
     /// Submission number of the pass.
     pub(crate) snn: SubmissionNumber,
@@ -82,9 +82,10 @@ pub(crate) struct Pass {
     pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
     pub(crate) wait_binary_semaphores: Vec<vk::Semaphore>,
     pub(crate) kind: PassKind,
+    pub(crate) commands: Option<Box<dyn FnOnce(&Context, vk::CommandBuffer) + 'a>>,
 }
 
-impl Pass {
+impl<'a> Pass<'a> {
     pub(crate) fn is_present(&self) -> bool {
         match self.kind{
             PassKind::Present {..} => true,
@@ -92,15 +93,15 @@ impl Pass {
         }
     }
 
-    pub(crate) fn new_render_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass {
+    pub(crate) fn new_render_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass<'a> {
         Self::new(name, batch_index, snn, PassKind::Render {})
     }
 
-    pub(crate) fn new_compute_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass {
+    pub(crate) fn new_compute_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass<'a> {
         Self::new(name, batch_index, snn, PassKind::Compute {})
     }
 
-    pub(crate) fn new_transfer_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass {
+    pub(crate) fn new_transfer_pass(name: &str, batch_index: usize, snn: SubmissionNumber) -> Pass<'a> {
         Self::new(name, batch_index, snn, PassKind::Transfer {})
     }
 
@@ -110,7 +111,7 @@ impl Pass {
         snn: SubmissionNumber,
         swapchain: vk::SwapchainKHR,
         image_index: u32,
-    ) -> Pass {
+    ) -> Pass<'a> {
         Self::new(
             name,
             batch_index,
@@ -122,7 +123,7 @@ impl Pass {
         )
     }
 
-    pub(crate) fn new(name: &str, batch_index: usize, snn: SubmissionNumber, kind: PassKind) -> Pass {
+    pub(crate) fn new(name: &str, batch_index: usize, snn: SubmissionNumber, kind: PassKind) -> Pass<'a> {
         Pass {
             name: name.to_string(),
             snn,
@@ -140,7 +141,8 @@ impl Pass {
             wait_dst_stages: [Default::default(); MAX_QUEUES],
             wait_binary_semaphores: Vec::new(),
             kind,
-            batch_index
+            batch_index,
+            commands: None
         }
     }
 }
