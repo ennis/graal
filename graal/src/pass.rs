@@ -1,9 +1,7 @@
-use crate::handle::UniqueHandleVec;
 use crate::{MAX_QUEUES, Context};
 use ash::vk;
 use crate::context::ResourceId;
 use std::fmt;
-use std::fmt::Formatter;
 
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Default)]
 #[repr(transparent)]

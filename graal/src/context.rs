@@ -1,25 +1,22 @@
 use crate::device::Device;
-use crate::handle::{UniqueHandle, UniqueHandleVec};
 use crate::pass::{Pass, PassKind, ResourceAccess, SubmissionNumber};
+use crate::vk::Handle;
 use crate::MAX_QUEUES;
 use crate::VULKAN_ENTRY;
 use crate::VULKAN_INSTANCE;
 use ash::version::{DeviceV1_0, DeviceV1_2};
 use ash::vk;
 use bitflags::bitflags;
-use core::ptr;
+use std::ptr;
 use fixedbitset::FixedBitSet;
 use slotmap::{new_key_type, Key, SecondaryMap, SlotMap};
 use std::alloc::Layout;
 use std::cell::RefCell;
 use std::collections::VecDeque;
+use std::ffi::CString;
 use std::mem;
 use std::mem::swap;
-use std::ops::{Range, Sub};
 use std::os::raw::c_void;
-use std::rc::Rc;
-use vk_mem::error::ErrorKind::Memory;
-use vk_mem::{AllocationCreateInfo, Allocator, MemoryUsage};
 
 fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     match count {
@@ -451,14 +448,14 @@ impl Resource {
     fn image(&self) -> &ImageResource {
         match &self.kind {
             ResourceKind::Image(r) => r,
-            _ => panic!("expected an image resource")
+            _ => panic!("expected an image resource"),
         }
     }
 
     fn buffer(&self) -> &BufferResource {
         match &self.kind {
             ResourceKind::Buffer(r) => r,
-            _ => panic!("expected a buffer resource")
+            _ => panic!("expected a buffer resource"),
         }
     }
 }
@@ -641,7 +638,7 @@ impl<'a> Batch<'a> {
     }
 
     /// Helper to find the pass given a submission number.
-    fn get_pass_mut<'pass,'b>(
+    fn get_pass_mut<'pass, 'b>(
         start_serial: u64,
         passes: &'pass mut [Pass<'b>],
         snn: SubmissionNumber,
@@ -736,8 +733,6 @@ impl<'a> Batch<'a> {
                 }
             }
             // update the resource writer
-            resource.tracking.clear_readers();
-            resource.tracking.writer = pass.snn;
             pass.output_stage_mask = access.output_stage;
         } else {
             if resource.tracking.has_writer() {
@@ -754,22 +749,29 @@ impl<'a> Batch<'a> {
                     access.input_stage,
                 );
             }
-            let q = pass.snn.queue() as usize;
-            // update the resource readers
-            resource.tracking.readers[q] = resource.tracking.readers[q].max(pass.snn.serial());
         }
 
         // --- memory barriers
 
+        // Q: do we need a memory barrier?
+        // A: we need a memory barrier if
+        //      - if the operation needs to see all previous writes to the resource:
+        //          - if the resource visibility mask doesn't contain the requested access type
+        //      - if a layout transition is necessary
+        //
+        // Note: if the pass overwrites the resource entirely, then the operation technically doesn't need to
+        // see the last version of the resource.
+
         // are all writes to the resource visible to the requested access type?
-        let writes_visible = resource
-            .tracking
-            .visibility_mask
-            .contains(vk::AccessFlags::MEMORY_READ)
-            || resource
+        let writes_visible =
+                // resource was last written in a previous batch, so all writes are made visible
+                // by the semaphore wait inserted by the execution dependency
+            resource.tracking.writer.serial() < self.base_serial ||
+                // resource visible to all MEMORY_READ, or to the requested mask
+            resource
                 .tracking
                 .visibility_mask
-                .contains(access.access_mask);
+                .contains(vk::AccessFlags::MEMORY_READ | access.access_mask);
         // is the layout of the resource different? do we need a transition?
         let layout_transition = resource.tracking.layout != access.layout;
         // is there a possible write-after-write hazard, that requires a memory dependency?
@@ -777,9 +779,16 @@ impl<'a> Batch<'a> {
             is_write && is_write_access(resource.tracking.availability_mask);
 
         if !writes_visible || layout_transition || write_after_write_hazard {
+            // if the last writer of the serial is in another batch, all writes are made available (FIXME and visible?) because of the semaphore
+            // wait inserted by the execution dependency. Otherwise, we need to consider the available writes on the resource.
+            let src_access_mask = if resource.tracking.writer.serial() < self.base_serial {
+                vk::AccessFlags::empty()
+            } else {
+                resource.tracking.availability_mask
+            };
             // no need to make memory visible if we're only writing to the resource
             let dst_access_mask = if !is_read_access(access.access_mask) {
-                Default::default()
+                vk::AccessFlags::empty()
             } else {
                 access.access_mask
             };
@@ -795,7 +804,7 @@ impl<'a> Batch<'a> {
                     };
 
                     pass.image_memory_barriers.push(vk::ImageMemoryBarrier {
-                        src_access_mask: resource.tracking.availability_mask,
+                        src_access_mask,
                         dst_access_mask,
                         old_layout: resource.tracking.layout,
                         new_layout: access.layout,
@@ -808,7 +817,7 @@ impl<'a> Batch<'a> {
                 }
                 ResourceKind::Buffer(buf) => {
                     pass.buffer_memory_barriers.push(vk::BufferMemoryBarrier {
-                        src_access_mask: resource.tracking.availability_mask,
+                        src_access_mask,
                         dst_access_mask,
                         src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                         dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
@@ -819,8 +828,9 @@ impl<'a> Batch<'a> {
                     })
                 }
             }
-            resource.tracking.availability_mask = Default::default();
-            // update the access types that can now see the resource
+            // all previous writes to the resource have been made available by the barrier ...
+            resource.tracking.availability_mask = vk::AccessFlags::empty();
+            // ... but not *made visible* to all access types: update the access types that can now see the resource
             resource.tracking.visibility_mask |= access.access_mask;
             resource.tracking.layout = access.layout;
         }
@@ -828,6 +838,18 @@ impl<'a> Batch<'a> {
         // all previous writes are flushed
         if is_write_access(access.access_mask) {
             resource.tracking.availability_mask |= access.access_mask;
+        }
+
+        // update output stage
+        // FIXME doubt
+        if is_write {
+            resource.tracking.stages = access.output_stage;
+            resource.tracking.clear_readers();
+            resource.tracking.writer = pass.snn;
+        } else {
+            // update the resource readers
+            let q = pass.snn.queue() as usize;
+            resource.tracking.readers[q] = resource.tracking.readers[q].max(pass.snn.serial());
         }
 
         pass.accesses.push(ResourceAccess {
@@ -994,6 +1016,25 @@ impl<'a, 'batch> PassBuilder<'a, 'batch> {
         )
     }
 
+    pub fn add_buffer_usage(
+        &mut self,
+        buffer: ResourceId,
+        access_mask: vk::AccessFlags,
+        input_stage: vk::PipelineStageFlags,
+        output_stage: vk::PipelineStageFlags
+    ) {
+        self.batch.add_resource_dependency(
+            &mut self.pass,
+            buffer,
+            &ResourceAccessDetails {
+                layout: vk::ImageLayout::UNDEFINED,
+                access_mask,
+                input_stage,
+                output_stage,
+            },
+        )
+    }
+
     /// Sets the command handler for this pass.
     /// The handler will be called when building the command buffer, on batch submission.
     pub fn set_commands(&mut self, commands: impl FnOnce(&Context, vk::CommandBuffer) + 'a) {
@@ -1140,11 +1181,10 @@ pub struct Context {
     available_command_pools: Vec<CommandPoolWrapper>,
     vk_khr_swapchain: ash::extensions::khr::Swapchain,
     vk_khr_surface: ash::extensions::khr::Surface,
+    vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
 }
 
-
 impl Context {
-
     /// Creates a new context.
     pub fn new(device: Device) -> Context {
         let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
@@ -1172,6 +1212,8 @@ impl Context {
         let vk_khr_swapchain =
             ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device.device);
         let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
+        let vk_ext_debug_utils =
+            ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
 
         Context {
             device,
@@ -1186,6 +1228,7 @@ impl Context {
             available_command_pools: vec![],
             vk_khr_swapchain,
             vk_khr_surface,
+            vk_ext_debug_utils,
         }
     }
 
@@ -1204,6 +1247,32 @@ impl Context {
     /// Panics if `id` does not refer to a buffer resource.
     pub fn buffer_handle(&self, id: ResourceId) -> vk::Buffer {
         self.resources.get(id).unwrap().buffer().handle
+    }
+
+    fn set_debug_object_name(
+        &self,
+        object_type: vk::ObjectType,
+        object_handle: u64,
+        name: &str,
+        transient: bool,
+    ) {
+        unsafe {
+            let name = if transient {
+                format!("{}.{}", name, self.next_serial)
+            } else {
+                name.to_string()
+            };
+            let object_name = CString::new(name.as_str()).unwrap();
+            self.vk_ext_debug_utils.debug_utils_set_object_name(
+                self.device.device.handle(),
+                &vk::DebugUtilsObjectNameInfoEXT {
+                    object_type,
+                    object_handle,
+                    p_object_name: object_name.as_ptr(),
+                    ..Default::default()
+                },
+            );
+        }
     }
 
     fn create_command_pool(&mut self, queue_index: u8) -> CommandPoolWrapper {
@@ -1313,7 +1382,7 @@ impl Context {
         let completed_serials = self.completed_serials;
         let device = &self.device;
 
-        self.resources.retain(|id, r| {
+        self.resources.retain(|_id, r| {
             // refcount != 0 OR any reader not completed OR writer not completed
             let keep = r.user_ref_count != 0
                 || r.tracking
@@ -1744,6 +1813,19 @@ impl Context {
 
             let cb = sb.command_buffers.last().unwrap().clone();
 
+            // cb is a command buffer in the recording state
+            let marker_name = CString::new(p.name.as_str()).unwrap();
+            unsafe {
+                self.vk_ext_debug_utils.cmd_begin_debug_utils_label(
+                    cb,
+                    &vk::DebugUtilsLabelEXT {
+                        p_label_name: marker_name.as_ptr(),
+                        color: [0.0; 4],
+                        ..Default::default()
+                    },
+                );
+            }
+
             // emit barriers if needed
             if p.src_stage_mask != vk::PipelineStageFlags::TOP_OF_PIPE
                 || p.input_stage_mask != vk::PipelineStageFlags::BOTTOM_OF_PIPE
@@ -1814,8 +1896,6 @@ impl Context {
                     self.available_semaphores.push(render_finished_semaphore);
                 }
                 _ => {
-                    // cb is a command buffer in the recording state
-                    // TODO write commands
                     if let Some(handler) = p.commands.take() {
                         handler(self, cb);
                     }
@@ -1823,6 +1903,10 @@ impl Context {
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
                     sb.signal_snn = p.snn;
                 }
+            }
+
+            unsafe {
+                self.vk_ext_debug_utils.cmd_end_debug_utils_label(cb);
             }
 
             if p.signal_after {
@@ -1908,7 +1992,7 @@ impl Context {
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
-            user_ref_count: 0,
+            user_ref_count: 0,  // start at 1 if not transient?
             memory,
             tracking: Default::default(),
             should_delete: true,
@@ -1917,6 +2001,12 @@ impl Context {
                 format: image_info.format,
             }),
         });
+        self.set_debug_object_name(
+            vk::ObjectType::IMAGE,
+            handle.as_raw(),
+            name,
+            image_info.transient,
+        );
         id
     }
 
@@ -1990,12 +2080,18 @@ impl Context {
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
-            user_ref_count: 1,
+            user_ref_count: 0,
             memory,
             tracking: Default::default(),
             should_delete: true,
             kind: ResourceKind::Buffer(BufferResource { handle }),
         });
+        self.set_debug_object_name(
+            vk::ObjectType::BUFFER,
+            handle.as_raw(),
+            name,
+            buffer_info.transient,
+        );
         (id, mapped_ptr)
     }
 
@@ -2105,6 +2201,7 @@ impl Context {
             },
             memory: ResourceMemory::External,
             should_delete: false,
+            //transient: false,
             kind: ResourceKind::Image(ImageResource {
                 handle: swapchain.images[image_index as usize],
                 format: swapchain.format,

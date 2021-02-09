@@ -1,3 +1,5 @@
+#![feature(new_uninit)]
+
 mod context;
 pub mod device;
 pub(crate) mod handle;
@@ -5,6 +7,7 @@ pub(crate) mod instance;
 pub(crate) mod pass;
 pub mod surface;
 pub mod swapchain;
+pub mod pipeline;
 
 pub(crate) use crate::device::MAX_QUEUES;
 pub(crate) use crate::instance::VULKAN_ENTRY;

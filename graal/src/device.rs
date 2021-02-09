@@ -1,11 +1,9 @@
-use crate::handle::UniqueHandleVec;
 use crate::VULKAN_SURFACE_KHR;
 use ash::version::{DeviceV1_0, InstanceV1_0};
 use ash::vk;
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_void};
 use std::ptr;
-use std::rc::Rc;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 

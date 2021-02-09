@@ -1,7 +1,6 @@
 use ash::vk::Handle;
 use std::{mem, fmt};
 use std::ops::Deref;
-use std::fmt::Formatter;
 
 /// A wrapper around a vulkan handle with unique semantics.
 #[repr(transparent)]

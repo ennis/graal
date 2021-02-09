@@ -4,6 +4,7 @@ use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemor
 use raw_window_handle::HasRawWindowHandle;
 use std::mem::swap;
 use std::path::Path;
+use std::{mem, ptr};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -164,6 +165,109 @@ fn create_transient_image(context: &mut graal::Context, name: &str) -> graal::Re
     )
 }
 
+struct MeshData {
+    vertex_data: graal::ResourceId,
+    vertex_count: usize,
+}
+
+fn load_mesh(batch: &mut graal::Batch, obj_file_path: &Path) -> MeshData {
+    let obj = obj::Obj::load(obj_file_path).expect("failed to load obj file");
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct Vertex {
+        pos: [f32; 3],
+        norm: [f32; 3],
+        tex: [f32; 2],
+    }
+
+    let mut vertices = Vec::new();
+
+    let g = obj.data.objects.first().unwrap().groups.first().unwrap();
+    for f in g.polys.iter() {
+        if f.0.len() != 3 {
+            continue;
+        }
+        for &obj::IndexTuple(pi, ti, ni) in f.0.iter() {
+            vertices.push(Vertex {
+                pos: obj.data.position[pi],
+                norm: ni.map(|ni| obj.data.normal[ni]).unwrap_or_default(),
+                tex: ti.map(|ti| obj.data.texture[ti]).unwrap_or_default(),
+            });
+        }
+    }
+
+    let byte_size = (vertices.len() * mem::size_of::<Vertex>()) as u64;
+
+    let (id, _) = batch.context().create_buffer_resource(
+        obj_file_path.to_str().unwrap(),
+        &graal::ResourceMemoryInfo::DEVICE_LOCAL,
+        &graal::BufferResourceCreateInfo {
+            usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            byte_size,
+            transient: false,
+            map_on_create: false,
+        },
+    );
+
+    // staging
+    let (staging_id, staging_ptr) = batch.context().create_buffer_resource(
+        "staging",
+        &graal::ResourceMemoryInfo::HOST_VISIBLE_COHERENT,
+        &graal::BufferResourceCreateInfo {
+            usage: vk::BufferUsageFlags::TRANSFER_SRC,
+            byte_size,
+            transient: true,
+            map_on_create: true,
+        },
+    );
+
+    unsafe {
+        ptr::copy(
+            vertices.as_ptr(),
+            staging_ptr as *mut Vertex,
+            vertices.len(),
+        );
+    }
+
+    // upload
+    let mut upload_pass = batch.build_transfer_pass("upload mesh", false);
+    upload_pass.add_buffer_usage(
+        staging_id,
+        vk::AccessFlags::TRANSFER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    upload_pass.add_buffer_usage(
+        id,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    upload_pass.set_commands(move |context, command_buffer| {
+        let src_buffer = context.buffer_handle(staging_id);
+        let dst_buffer = context.buffer_handle(id);
+        unsafe {
+            context.device().cmd_copy_buffer(
+                command_buffer,
+                src_buffer,
+                dst_buffer,
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: byte_size,
+                }],
+            );
+        }
+    });
+    upload_pass.finish();
+
+    MeshData {
+        vertex_data: id,
+        vertex_count: vertices.len(),
+    }
+}
+
 fn test_pass(
     batch: &mut graal::Batch,
     name: &str,
@@ -270,6 +374,7 @@ fn main() {
         vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
         false,
     );
+    let mesh = load_mesh(&mut init_batch, "../data/sphere.obj".as_ref());
     init_batch.finish();
 
     let mut swapchain_size = window.inner_size().into();
