@@ -18,7 +18,7 @@ fn compile_shader(
     out_dir: &Path,
 ) -> Result<()> {
 
-    let mut output_file_path = out_dir
+    let output_file_path = out_dir
         .to_owned()
         .with_file_name(format!("{}.spv",source_file_path.file_name().unwrap().to_str().unwrap()));
 

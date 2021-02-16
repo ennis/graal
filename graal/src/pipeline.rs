@@ -1,6 +1,5 @@
 use ash::vk;
 use std::sync::Arc;
-use std::ptr;
 
 // Goals: cheap to clone, cheap to modify
 // Partition in state groups, each group in Arc,

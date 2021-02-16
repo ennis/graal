@@ -1,8 +1,6 @@
 use ash::version::DeviceV1_0;
-use ash::vk::BufferCreateInfo;
 use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemoryInfo};
 use raw_window_handle::HasRawWindowHandle;
-use std::mem::swap;
 use std::path::Path;
 use std::{mem, ptr};
 use winit::{
@@ -19,7 +17,7 @@ fn load_image(
 ) -> (graal::ResourceId, u32, u32) {
     use openimageio::{ImageInput, TypeDesc};
 
-    let mut image_input = ImageInput::open(path).expect("could not open image file");
+    let image_input = ImageInput::open(path).expect("could not open image file");
     let spec = image_input.spec();
 
     let nchannels = spec.num_channels();
@@ -100,7 +98,7 @@ fn load_image(
     }
 
     // build the upload pass
-    let mut pass = batch.build_render_pass("image upload");
+    let mut pass = batch.build_graphics_pass("image upload");
     pass.add_image_usage(
         image_id,
         vk::AccessFlags::TRANSFER_WRITE,
@@ -279,7 +277,7 @@ fn test_pass(
         graal::vk::ImageLayout,
     )],
 ) {
-    let mut pass_builder = batch.build_render_pass(name);
+    let mut pass_builder = batch.build_graphics_pass(name);
     for &(img, access_mask, input_stage, output_stage, layout) in images {
         pass_builder.add_image_usage(img, access_mask, input_stage, output_stage, layout);
     }
@@ -389,7 +387,7 @@ fn main() {
                 }
                 WindowEvent::Resized(size) => unsafe {
                     swapchain_size = size.into();
-                    context.resize_swapchain(swapchain, surface, swapchain_size);
+                    context.resize_swapchain(swapchain, swapchain_size);
                 },
                 _ => {}
             },
@@ -488,7 +486,7 @@ fn main() {
                 );
 
                 // blit pass
-                let mut blit_pass = batch.build_render_pass("blit to screen");
+                let mut blit_pass = batch.build_graphics_pass("blit to screen");
                 blit_pass.add_image_usage(
                     file_image_id,
                     vk::AccessFlags::TRANSFER_READ,

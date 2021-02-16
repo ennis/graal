@@ -12,14 +12,7 @@ const VALIDATION_LAYERS: [*const c_char; 1] =
 lazy_static! {
     pub(crate) static ref VULKAN_ENTRY: ash::Entry = initialize_vulkan_entry();
     pub(crate) static ref VULKAN_INSTANCE: ash::Instance = create_vulkan_instance();
-    pub(crate) static ref VULKAN_SURFACE_KHR: ash::extensions::khr::Surface =
-        initialize_surface_khr();
 }
-
-fn initialize_surface_khr() -> ash::extensions::khr::Surface {
-    ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE)
-}
-
 
 fn initialize_vulkan_entry() -> ash::Entry {
     ash::Entry::new().expect("failed to initialize vulkan entry points")

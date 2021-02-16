@@ -1,4 +1,5 @@
-use crate::VULKAN_SURFACE_KHR;
+use crate::VULKAN_INSTANCE;
+use crate::VULKAN_ENTRY;
 use ash::version::{DeviceV1_0, InstanceV1_0};
 use ash::vk;
 use std::ffi::CStr;
@@ -44,6 +45,9 @@ pub struct Device {
     pub(crate) transfer_queue_family: u32,
     pub(crate) queues_info: QueuesInfo,
     pub(crate) allocator: vk_mem::Allocator,
+    pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
+    pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
+    pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
 }
 
 struct PhysicalDeviceAndProperties {
@@ -83,6 +87,7 @@ unsafe fn select_physical_device(instance: &ash::Instance) -> PhysicalDeviceAndP
 
 unsafe fn find_queue_family(
     phy: vk::PhysicalDevice,
+    vk_khr_surface: &ash::extensions::khr::Surface,
     queue_families: &[vk::QueueFamilyProperties],
     flags: vk::QueueFlags,
     present_surface: Option<vk::SurfaceKHR>,
@@ -96,7 +101,7 @@ unsafe fn find_queue_family(
             // if present_surface != nullptr, check that it also supports presentation
             // to the given surface
             if let Some(surface) = present_surface {
-                if !VULKAN_SURFACE_KHR
+                if !vk_khr_surface
                     .get_physical_device_surface_support(phy, index, surface)
                     .unwrap()
                 {
@@ -127,25 +132,30 @@ unsafe fn find_queue_family(
 impl Device {
     pub fn new(present_surface: vk::SurfaceKHR) -> Device {
         unsafe {
-            let instance = &*crate::VULKAN_INSTANCE;
+            let instance = &*VULKAN_INSTANCE;
+            let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, instance);
+
             let phy = select_physical_device(instance);
             let queue_family_properties =
                 instance.get_physical_device_queue_family_properties(phy.phy);
 
             let graphics_queue_family = find_queue_family(
                 phy.phy,
+                &vk_khr_surface,
                 &queue_family_properties,
                 vk::QueueFlags::GRAPHICS,
                 Some(present_surface),
             );
             let compute_queue_family = find_queue_family(
                 phy.phy,
+                &vk_khr_surface,
                 &queue_family_properties,
                 vk::QueueFlags::COMPUTE,
                 None,
             );
             let transfer_queue_family = find_queue_family(
                 phy.phy,
+                &vk_khr_surface,
                 &queue_family_properties,
                 vk::QueueFlags::TRANSFER,
                 None,
@@ -294,6 +304,12 @@ impl Device {
             let allocator = vk_mem::Allocator::new(&allocator_create_info)
                 .expect("failed to create VMA allocator");
 
+
+            let vk_khr_swapchain =
+                ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
+            let vk_ext_debug_utils =
+                ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
+
             Device {
                 device,
                 physical_device: phy.phy,
@@ -304,6 +320,9 @@ impl Device {
                 transfer_queue_family,
                 queues_info,
                 allocator,
+                vk_khr_swapchain,
+                vk_khr_surface,
+                vk_ext_debug_utils
             }
         }
     }
