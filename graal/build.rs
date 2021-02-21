@@ -19,8 +19,7 @@ fn compile_shader(
 ) -> Result<()> {
 
     let output_file_path = out_dir
-        .to_owned()
-        .with_file_name(format!("{}.spv",source_file_path.file_name().unwrap().to_str().unwrap()));
+        .join(format!("{}.spv",source_file_path.file_name().unwrap().to_str().unwrap()));
 
     let source_file_name = source_file_path.to_string_lossy();
 

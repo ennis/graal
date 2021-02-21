@@ -1,27 +1,149 @@
 use crate::pass::BatchSerialNumber;
+use crate::vk::{
+    BufferView, DescriptorBufferInfo, DescriptorImageInfo, DescriptorPoolSize, DescriptorType,
+    ShaderStageFlags,
+};
 use ash::version::DeviceV1_0;
 use ash::vk;
-use std::collections::HashMap;
-use crate::vk::DescriptorPoolSize;
+use graal_spirv as spirv;
+use slotmap::SlotMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ffi::CString;
+use std::ptr;
 
 const MAX_DESCRIPTOR_SET_LAYOUT_BINDING_DESCRIPTORS: usize = 16;
 const MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS: usize = 16;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct DescriptorSetLayoutBindingInfo {
     pub binding: u32,
     pub descriptor_type: vk::DescriptorType,
     pub descriptor_count: u32,
     pub stage_flags: vk::ShaderStageFlags,
-    pub immutable_samplers: [vk::Sampler; MAX_DESCRIPTOR_SET_LAYOUT_BINDING_DESCRIPTORS],
+    pub immutable_samplers: [vk::Sampler; 16],
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 pub struct DescriptorSetLayoutInfo {
     pub binding_count: u32,
     pub bindings: [DescriptorSetLayoutBindingInfo; MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS],
 }
 
+pub struct OutputAttachment {
+    // TODO
+}
+
+pub struct PushConstantLayout {
+    pub offset: usize,
+    pub size: usize,
+}
+
+pub trait VertexInputInterface {
+    const BINDINGS: &'static [vk::VertexInputBindingDescription];
+    const ATTRIBUTES: &'static [vk::VertexInputAttributeDescription];
+}
+
+pub trait DescriptorSetInterface {
+    const LAYOUT: &'static [DescriptorSetLayoutBindingInfo];
+
+    unsafe fn write_descriptors(&self, device: &ash::Device, set: vk::DescriptorSet);
+}
+
+pub trait PushConstantInterface {
+    const LAYOUT: &'static [PushConstantLayout];
+}
+
+pub trait FragmentOutputInterface {
+    const ATTACHMENTS: &'static [OutputAttachment];
+}
+
+///
+pub enum DescriptorWriteKind {
+    Image,
+    Buffer,
+    TexelBufferView,
+}
+
+/// A trait implemented by types that can produce one or more descriptors.
+pub trait DescriptorSource {
+    const KIND: DescriptorWriteKind;
+
+    /// Returns the number of descriptors in this binding.
+    fn descriptor_count(&self) -> u32 {
+        1
+    }
+
+    fn write_descriptors(
+        &self,
+        image_descriptors: &mut [vk::DescriptorImageInfo],
+        buffer_descriptors: &mut [vk::DescriptorBufferInfo],
+        texel_buffer_views: &mut [vk::BufferView],
+    );
+}
+
+/// Impl for descriptor arrays
+impl<'a, D: DescriptorSource> DescriptorSource for &'a [D] {
+    const KIND: DescriptorWriteKind = D::KIND;
+
+    fn descriptor_count(&self) -> u32 {
+        self.len() as u32
+    }
+
+    fn write_descriptors(
+        &self,
+        image_descriptors: &mut [DescriptorImageInfo],
+        buffer_descriptors: &mut [DescriptorBufferInfo],
+        texel_buffer_views: &mut [BufferView],
+    ) {
+        for d in self.iter() {
+            d.write_descriptors(image_descriptors, buffer_descriptors, texel_buffer_views);
+        }
+    }
+}
+
+impl DescriptorSource for vk::Sampler {
+    const KIND: DescriptorWriteKind = DescriptorWriteKind::Image;
+
+    fn write_descriptors(
+        &self,
+        image_descriptors: &mut [DescriptorImageInfo],
+        _buffer_descriptors: &mut [DescriptorBufferInfo],
+        _texel_buffer_views: &mut [BufferView],
+    ) {
+        image_descriptors[0] = vk::DescriptorImageInfo {
+            sampler: *self,
+            image_view: vk::ImageView::null(),
+            image_layout: vk::ImageLayout::UNDEFINED,
+        };
+    }
+}
+
+impl DescriptorSource for vk::DescriptorBufferInfo {
+    const KIND: DescriptorWriteKind = DescriptorWriteKind::Buffer;
+    fn write_descriptors(
+        &self,
+        _image_descriptors: &mut [DescriptorImageInfo],
+        buffer_descriptors: &mut [DescriptorBufferInfo],
+        _texel_buffer_views: &mut [BufferView],
+    ) {
+        buffer_descriptors[0] = *self;
+    }
+}
+
+impl DescriptorSource for vk::DescriptorImageInfo {
+    const KIND: DescriptorWriteKind = DescriptorWriteKind::Image;
+    fn write_descriptors(
+        &self,
+        image_descriptors: &mut [DescriptorImageInfo],
+        _buffer_descriptors: &mut [DescriptorBufferInfo],
+        _texel_buffer_views: &mut [BufferView],
+    ) {
+        image_descriptors[0] = *self;
+    }
+}
+
+
+//-----------------------------------------------------------------------------------------
 #[derive(Copy, Clone, Debug)]
 struct TrackedDescriptorSet {
     /// vulkan handle
@@ -34,7 +156,7 @@ const DESCRIPTOR_POOL_PER_TYPE_COUNT: u32 = 1024;
 const DESCRIPTOR_POOL_SET_COUNT: u32 = DESCRIPTOR_POOL_PER_TYPE_COUNT;
 
 #[derive(Debug)]
-struct DescriptorSetAllocator {
+pub struct DescriptorSetAllocator {
     layout_info: DescriptorSetLayoutInfo,
     layout_handle: vk::DescriptorSetLayout,
     pool_size_count: u32,
@@ -241,15 +363,231 @@ impl DescriptorSetAllocator {
             }
         };
 
-        self.used.push(TrackedDescriptorSet {
-            handle,
-            batch
-        });
+        self.used.push(TrackedDescriptorSet { handle, batch });
 
         handle
     }
+
+    // TODO "recycle" instead? it doesn't actually free memory
+    pub fn cleanup(&mut self, completed_batch: BatchSerialNumber) {
+        let mut i = 0;
+        while i < self.used.len() {
+            if self.used[i].batch <= completed_batch {
+                self.free.push(self.used.swap_remove(i).handle);
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
-struct DescriptorCache {
-    entries: HashMap<DescriptorSetLayoutInfo, DescriptorSetAllocator>,
+pub struct DescriptorSetLayoutCache {
+    entries: SlotMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
+    map: HashMap<DescriptorSetLayoutInfo, DescriptorSetLayoutId>,
+    // TODO type-map
+}
+
+impl DescriptorSetLayoutCache {
+    pub fn new() -> DescriptorSetLayoutCache {
+        DescriptorSetLayoutCache {
+            entries: Default::default(),
+            map: Default::default(),
+        }
+    }
+
+    pub fn create_descriptor_set_layout(
+        &mut self,
+        device: &ash::Device,
+        info: &DescriptorSetLayoutInfo,
+    ) -> (vk::DescriptorSetLayout, DescriptorSetLayoutId) {
+        let mut entries = &mut self.entries;
+        let id = *self
+            .map
+            .entry(*info)
+            .or_insert_with(|| entries.insert(DescriptorSetAllocator::new(device, info)));
+        (self.entries.get(id).unwrap().layout_handle, id)
+    }
+
+    pub fn layout_allocator(&mut self, id: DescriptorSetLayoutId) -> &mut DescriptorSetAllocator {
+        self.entries.get_mut(id).unwrap()
+    }
+}
+
+slotmap::new_key_type! {
+    pub struct PipelineLayoutId;
+    pub struct DescriptorSetLayoutId;
+}
+
+const MAX_DESCRIPTOR_SET_LAYOUTS: usize = 8;
+
+pub struct PipelineShaderStage<'a> {
+    pub stage: vk::ShaderStageFlags,
+    pub spirv: &'a [u32],
+}
+
+struct VertexInputVariable {
+    location: u32,
+}
+
+struct FragmentOutputVariable {
+    location: u32,
+}
+
+struct ShaderInterfaces {
+    vertex_input: BTreeMap<u32, VertexInputVariable>,
+    fragment_output: BTreeMap<u32, FragmentOutputVariable>,
+    resource: BTreeMap<u32, DescriptorSetLayoutInfo>,
+    // push_constant:
+}
+
+pub fn extract_descriptor_set_layouts_from_shader_stages(
+    stages: &[PipelineShaderStage],
+) -> BTreeMap<u32, DescriptorSetLayoutInfo> {
+    let mut bindings: BTreeMap<(u32, u32), DescriptorSetLayoutBindingInfo> = BTreeMap::new();
+    let arena = spirv::Arena::new();
+
+    for pipeline_stage in stages.iter() {
+        let module = spirv::Module::from_words(&arena, pipeline_stage.spirv).unwrap();
+
+        for v in module.variables {
+            if let Some(set) = v.descriptor_set {
+                if let Some(binding) = v.binding {
+                    use spirv::spv::StorageClass;
+                    use spirv::ImageType;
+                    use spirv::StructType;
+                    use spirv::TypeDesc::*;
+
+                    let (descriptor_type, unbounded_descriptor_array) =
+                        match (v.storage_class, v.ty) {
+                            // According to https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#interfaces-resources-descset
+                            // for SampledImages, the descriptor type could be either VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE or VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+
+                            // According to the spec, it's possible to have both a `texture` and a `sampler` in the same binding point:
+                            //
+                            //      A noteworthy example of using multiple statically-used shader variables sharing the same descriptor set and binding values
+                            //      is a descriptor of type VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER that has multiple corresponding shader variables in the UniformConstant storage class,
+                            //      where some could be OpTypeImage, some could be OpTypeSampler (Sampled=1), and some could be OpTypeSampledImage.
+                            //
+                            // We don't support it. Please don't do that.
+
+                            // --- unbounded texture descriptor arrays (descriptor indexing) ---
+                            (
+                                StorageClass::UniformConstant,
+                                &Pointer(&Array {
+                                    elem_ty: Image(_), ..
+                                }),
+                            ) => (vk::DescriptorType::SAMPLED_IMAGE, true),
+
+                            // --- standalone samplers ----
+                            (StorageClass::UniformConstant, &Pointer(&Sampler)) => {
+                                (vk::DescriptorType::SAMPLER, false)
+                            }
+
+                            // --- sampler1D,sampler2D ----
+                            (StorageClass::UniformConstant, &Pointer(&SampledImage(img))) => {
+                                (vk::DescriptorType::COMBINED_IMAGE_SAMPLER, false)
+                            }
+
+                            // --- textures, images, texel buffers ---
+                            (
+                                StorageClass::UniformConstant,
+                                &Pointer(&Image(ImageType { dim, sampled, .. })),
+                            ) => {
+                                match dim {
+                                    spirv::spv::Dim::DimBuffer => match sampled {
+                                        Some(false) => {
+                                            (vk::DescriptorType::STORAGE_TEXEL_BUFFER, false)
+                                        }
+                                        Some(true) => {
+                                            (vk::DescriptorType::UNIFORM_TEXEL_BUFFER, false)
+                                        }
+                                        None => (vk::DescriptorType::UNIFORM_TEXEL_BUFFER, false),
+                                    },
+                                    _ => match sampled {
+                                        // texture1D,texture2D...
+                                        Some(true) => (vk::DescriptorType::SAMPLED_IMAGE, false),
+                                        // image1D,image2D...
+                                        Some(false) => (vk::DescriptorType::STORAGE_IMAGE, false),
+                                        // we pick?
+                                        None => (vk::DescriptorType::SAMPLED_IMAGE, false),
+                                    },
+                                }
+                            }
+
+                            // --- uniform buffer ---
+                            (StorageClass::Uniform, &Pointer(&Struct(sty))) if sty.block => {
+                                // handle graal set conventions:
+                                // depending on the set, the uniform buffer may or may not be dynamic
+                                // sets 0-2 are static, sets > 2 are dynamic by convention
+                                if set < 3 {
+                                    (vk::DescriptorType::UNIFORM_BUFFER, false)
+                                } else {
+                                    (vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC, false)
+                                }
+                            }
+
+                            // --- storage buffer ---
+                            (
+                                StorageClass::Uniform,
+                                &Pointer(&Struct(StructType {
+                                    buffer_block: true, ..
+                                })),
+                            )
+                            | (
+                                StorageClass::StorageBuffer,
+                                &Pointer(&Struct(StructType { block: true, .. })),
+                            ) => {
+                                if set < 3 {
+                                    (vk::DescriptorType::STORAGE_BUFFER, false)
+                                } else {
+                                    (vk::DescriptorType::STORAGE_BUFFER_DYNAMIC, false)
+                                }
+                            }
+                            _ => continue,
+                        };
+
+                    let mut binding_info = bindings.entry((set, binding)).or_default();
+                    binding_info.binding = binding;
+                    binding_info.descriptor_type = descriptor_type;
+                    binding_info.descriptor_count = 1;
+                    binding_info.stage_flags |= pipeline_stage.stage;
+                    // TODO in-shader sampler declaration?
+                }
+            }
+        }
+    }
+
+    let mut set_layouts: BTreeMap<u32, DescriptorSetLayoutInfo> = BTreeMap::new();
+    // group by set
+    for (&(set, binding), binding_info) in bindings.iter() {
+        let set_layout_info = set_layouts.entry(set).or_default();
+        set_layout_info.bindings[binding as usize] = *binding_info;
+    }
+
+    set_layouts
+
+    // type-safe partial descriptor interfaces
+    // -> derive(DescriptorSetInterface)
+    // -> the struct contains a bunch of resources to turn into a descriptor set
+    //      -> TypedUniformBufferView
+    //      -> for dynamic uniforms: UniformBufferView (can't be typed, unfortunately)
+    // -> typed descriptor set
+    // -> the type contains the layout description (bunch of static DescriptorSetLayoutBindingInfos)
+
+    // "attach" interfaces to pipelines:
+    // - pipeline.verify_shader_interface<D: DescriptorSetInterface>(set) -> Result<(), ValidationError> {}
+
+    // how can we refer to a descriptor set allocator?
+    // - hash the layout info every time? too costly
+    // - borrow the allocator? borrow-lock
+    // - by ID, like the rest
+
+    // allocate a descriptor set:
+    // - get layout allocator, either by looking up the DescriptorSetInterface or from the shader
+    // - allocate the set
+    // - write stuff in the set (manually or with auto-generated stuff in the DescriptorSetInterface impl)
+
+    // dynamic uniforms?
+
+    //Vec::new()
 }

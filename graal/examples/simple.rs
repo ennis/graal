@@ -1,5 +1,5 @@
 use ash::version::DeviceV1_0;
-use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemoryInfo};
+use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemoryInfo, extract_descriptor_set_layouts_from_shader_stages};
 use raw_window_handle::HasRawWindowHandle;
 use std::path::Path;
 use std::{mem, ptr};
@@ -8,6 +8,205 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+use graal::PipelineShaderStage;
+use inline_spirv::include_spirv;
+
+/*static BACKGROUND_SHADER_VERT : &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/background.vert.spv"));
+static BACKGROUND_SHADER_FRAG : &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/background.frag.spv"));*/
+
+static BACKGROUND_SHADER_VERT : &[u32] = include_spirv!("../shaders/background.vert");
+static BACKGROUND_SHADER_FRAG : &[u32] = include_spirv!("../shaders/background.frag");
+
+
+fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal::DescriptorSetLayoutCache)
+{
+    let vert = unsafe {
+        device.create_shader_module(&vk::ShaderModuleCreateInfo {
+            flags: Default::default(),
+            code_size: BACKGROUND_SHADER_VERT.len(),
+            p_code: BACKGROUND_SHADER_VERT.as_ptr(),
+            .. Default::default()
+        }).expect("failed to create shader module")
+    };
+
+    let frag = unsafe {
+        device.create_shader_module(&vk::ShaderModuleCreateInfo {
+            flags: Default::default(),
+            code_size: BACKGROUND_SHADER_FRAG.len(),
+            p_code: BACKGROUND_SHADER_FRAG.as_ptr(),
+            .. Default::default()
+        }).expect("failed to create shader module")
+    };
+
+    let shader_stages = [
+        vk::PipelineShaderStageCreateInfo {
+            flags: Default::default(),
+            stage: s.stage,
+            module,
+            p_name: b"main\0".as_ptr() as *const i8,
+            p_specialization_info: ptr::null(),
+            .. Default::default()
+        },
+        vk::PipelineShaderStageCreateInfo {
+            flags: Default::default(),
+            stage: s.stage,
+            module,
+            p_name: b"main\0".as_ptr() as *const i8,
+            p_specialization_info: ptr::null(),
+            .. Default::default()
+        }
+    ];
+
+    let set_layout_infos = extract_descriptor_set_layouts_from_shader_stages(&[
+        PipelineShaderStage {
+            stage: vk::ShaderStageFlags::VERTEX,
+            spirv: BACKGROUND_SHADER_VERT,
+        },
+        PipelineShaderStage {
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            spirv: BACKGROUND_SHADER_FRAG,
+        }
+    ]);
+
+    let mut set_layouts = Vec::new();
+    let mut set_layout_ids = Vec::new();
+
+    for (&set, set_layout_info) in set_layout_infos.iter() {
+        let (layout_handle, layout_id) = descriptor_set_layout_cache.create_descriptor_set_layout(device, set_info);
+        set_layouts.push(layout_handle);
+        set_layout_ids.push(layout_id);
+    }
+
+    let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo {
+        flags: Default::default(),
+        set_layout_count: set_layouts.len() as u32,
+        p_set_layouts: set_layouts.as_ptr(),
+        push_constant_range_count: 0,
+        p_push_constant_ranges: ptr::null(),
+        .. Default::default()
+    };
+
+    let pipeline_layout = unsafe {
+        device.create_pipeline_layout(&pipeline_layout_create_info, None).unwrap()
+    };
+
+    // TODO
+    let vertex_input_state = vk::PipelineVertexInputStateCreateInfo {
+        flags: Default::default(),
+        vertex_binding_description_count: 0,
+        p_vertex_binding_descriptions: (),
+        vertex_attribute_description_count: 0,
+        p_vertex_attribute_descriptions: (),
+        .. Default::default()
+    };
+
+    // TODO
+    let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo {
+        flags: Default::default(),
+        topology: Default::default(),
+        primitive_restart_enable: 0,
+        .. Default::default()
+    };
+
+    // TODO
+    let tessellation_state = vk::PipelineTessellationStateCreateInfo {
+        flags: Default::default(),
+        patch_control_points: 0,
+        .. Default::default()
+    };
+
+    // TODO
+    let viewport_state = vk::PipelineViewportStateCreateInfo {
+        flags: Default::default(),
+        viewport_count: 0,
+        p_viewports: ptr::null(),
+        scissor_count: 0,
+        p_scissors: ptr::null(),
+        .. Default::default()
+    };
+
+    // TODO
+    let rasterization_state = vk::PipelineRasterizationStateCreateInfo {
+        flags: Default::default(),
+        depth_clamp_enable: 0,
+        rasterizer_discard_enable: 0,
+        polygon_mode: Default::default(),
+        cull_mode: Default::default(),
+        front_face: Default::default(),
+        depth_bias_enable: 0,
+        depth_bias_constant_factor: 0.0,
+        depth_bias_clamp: 0.0,
+        depth_bias_slope_factor: 0.0,
+        line_width: 0.0,
+        .. Default::default()
+    };
+
+    // TODO
+    let multisample_state = vk::PipelineMultisampleStateCreateInfo {
+        flags: Default::default(),
+        rasterization_samples: Default::default(),
+        sample_shading_enable: 0,
+        min_sample_shading: 0.0,
+        p_sample_mask: ptr::null(),
+        alpha_to_coverage_enable: 0,
+        alpha_to_one_enable: 0,
+        .. Default::default()
+    };
+
+    let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
+        flags: Default::default(),
+        depth_test_enable: 0,
+        depth_write_enable: 0,
+        depth_compare_op: Default::default(),
+        depth_bounds_test_enable: 0,
+        stencil_test_enable: 0,
+        front: Default::default(),
+        back: Default::default(),
+        min_depth_bounds: 0.0,
+        max_depth_bounds: 0.0,
+        .. Default::default()
+    };
+
+
+    let color_blend_state = vk::PipelineColorBlendStateCreateInfo {
+        flags: Default::default(),
+        logic_op_enable: 0,
+        logic_op: Default::default(),
+        attachment_count: 0,
+        p_attachments: (),
+        blend_constants: [],
+        .. Default::default()
+    };
+
+    let dynamic_state = vk::PipelineDynamicStateCreateInfo {
+        flags: Default::default(),
+        dynamic_state_count: 0,
+        p_dynamic_states: (),
+        .. Default::default()
+    };
+
+    let gpci = vk::GraphicsPipelineCreateInfo {
+        flags: Default::default(),
+        stage_count: stages.len() as u32,
+        p_stages: stage_create_infos.as_ptr(),
+        p_vertex_input_state: (),
+        p_input_assembly_state: (),
+        p_tessellation_state: (),
+        p_viewport_state: (),
+        p_rasterization_state: (),
+        p_multisample_state: (),
+        p_depth_stencil_state: (),
+        p_color_blend_state: (),
+        p_dynamic_state: (),
+        layout: Default::default(),
+        render_pass: Default::default(),
+        subpass: 0,
+        base_pipeline_handle: Default::default(),
+        base_pipeline_index: 0,
+        .. Default::default()
+    };
+
+}
 
 fn load_image(
     batch: &mut graal::Batch,
@@ -374,6 +573,17 @@ fn main() {
     );
     let mesh = load_mesh(&mut init_batch, "../data/sphere.obj".as_ref());
     init_batch.finish();
+
+    graal::extract_descriptor_set_layouts_from_shader_stages(&[
+        PipelineShaderStage {
+            stage: vk::ShaderStageFlags::VERTEX,
+            spirv: BACKGROUND_SHADER_VERT
+        },
+        PipelineShaderStage {
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            spirv: BACKGROUND_SHADER_FRAG
+        }
+    ]);
 
     let mut swapchain_size = window.inner_size().into();
 

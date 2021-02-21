@@ -6,7 +6,7 @@ use std::ops::{Index, IndexMut};
 use std::cmp::Ordering;
 
 /// A number that uniquely identifies a batch.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 #[repr(transparent)]
 pub struct BatchSerialNumber(pub u64);
 

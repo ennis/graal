@@ -14,7 +14,9 @@ raw-window-handle = "0.3.3"
 slotmap = "1.0.2"
 fixedbitset = "0.3.2"
 openimageio = { path = "../../openimageio-rs" }
+graal-spirv = { path = "../graal-spirv" }
 obj = "0.10.2"
+inline-spirv = "0.1.2"
 
 [dev-dependencies]
 winit = "0.24.0"
