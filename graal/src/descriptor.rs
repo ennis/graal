@@ -10,6 +10,7 @@ use slotmap::SlotMap;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
 use std::ptr;
+use crate::Device;
 
 const MAX_DESCRIPTOR_SET_LAYOUT_BINDING_DESCRIPTORS: usize = 16;
 const MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS: usize = 16;
@@ -29,6 +30,15 @@ pub struct DescriptorSetLayoutInfo {
     pub bindings: [DescriptorSetLayoutBindingInfo; MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS],
 }
 
+impl<'a> From<&'a [DescriptorSetLayoutBindingInfo]> for DescriptorSetLayoutInfo {
+    fn from(layout: &'a [DescriptorSetLayoutBindingInfo]) -> Self {
+        let mut info = DescriptorSetLayoutInfo::default();
+        info.binding_count = layout.len() as u32;
+        info.bindings[0..layout.len()].copy_from_slice(layout);
+        info
+    }
+}
+
 pub struct OutputAttachment {
     // TODO
 }
@@ -36,11 +46,6 @@ pub struct OutputAttachment {
 pub struct PushConstantLayout {
     pub offset: usize,
     pub size: usize,
-}
-
-pub trait VertexInputInterface {
-    const BINDINGS: &'static [vk::VertexInputBindingDescription];
-    const ATTRIBUTES: &'static [vk::VertexInputAttributeDescription];
 }
 
 pub trait DescriptorSetInterface {
@@ -142,7 +147,6 @@ impl DescriptorSource for vk::DescriptorImageInfo {
     }
 }
 
-
 //-----------------------------------------------------------------------------------------
 #[derive(Copy, Clone, Debug)]
 struct TrackedDescriptorSet {
@@ -157,7 +161,6 @@ const DESCRIPTOR_POOL_SET_COUNT: u32 = DESCRIPTOR_POOL_PER_TYPE_COUNT;
 
 #[derive(Debug)]
 pub struct DescriptorSetAllocator {
-    layout_info: DescriptorSetLayoutInfo,
     layout_handle: vk::DescriptorSetLayout,
     pool_size_count: u32,
     pool_sizes: [vk::DescriptorPoolSize; 16],
@@ -170,23 +173,21 @@ pub struct DescriptorSetAllocator {
 impl DescriptorSetAllocator {
     pub fn new(
         device: &ash::Device,
-        layout_info: &DescriptorSetLayoutInfo,
+        layout: &[DescriptorSetLayoutBindingInfo],
     ) -> DescriptorSetAllocator {
         let mut descriptor_set_layout_bindings: [vk::DescriptorSetLayoutBinding;
             MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS] = Default::default();
-        for i in 0..layout_info.binding_count as usize {
-            descriptor_set_layout_bindings[i].binding = layout_info.bindings[i].binding;
-            descriptor_set_layout_bindings[i].descriptor_type =
-                layout_info.bindings[i].descriptor_type;
-            descriptor_set_layout_bindings[i].descriptor_count =
-                layout_info.bindings[i].descriptor_count;
-            descriptor_set_layout_bindings[i].stage_flags = layout_info.bindings[i].stage_flags;
+        for i in 0..layout.len() {
+            descriptor_set_layout_bindings[i].binding = layout[i].binding;
+            descriptor_set_layout_bindings[i].descriptor_type = layout[i].descriptor_type;
+            descriptor_set_layout_bindings[i].descriptor_count = layout[i].descriptor_count;
+            descriptor_set_layout_bindings[i].stage_flags = layout[i].stage_flags;
             descriptor_set_layout_bindings[i].p_immutable_samplers =
-                layout_info.bindings[i].immutable_samplers.as_ptr();
+                layout[i].immutable_samplers.as_ptr();
         }
 
         let descriptor_set_layout_create_info = vk::DescriptorSetLayoutCreateInfo {
-            binding_count: layout_info.binding_count,
+            binding_count: layout.len() as u32,
             p_bindings: descriptor_set_layout_bindings.as_ptr(),
             ..Default::default()
         };
@@ -211,8 +212,7 @@ impl DescriptorSetAllocator {
         let mut input_attachment_desc_count = 0;
         let mut acceleration_structure_desc_count = 0;
 
-        for i in 0..layout_info.binding_count {
-            let b = &layout_info.bindings[i as usize];
+        for b in layout.iter() {
             match b.descriptor_type {
                 vk::DescriptorType::SAMPLER => sampler_desc_count += 1,
                 vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
@@ -313,7 +313,7 @@ impl DescriptorSetAllocator {
         }
 
         DescriptorSetAllocator {
-            layout_info: *layout_info,
+            //layout_info: *layout_info,
             layout_handle,
             pool_sizes,
             pool_size_count: pool_size_count as u32,
@@ -398,18 +398,26 @@ impl DescriptorSetLayoutCache {
     pub fn create_descriptor_set_layout(
         &mut self,
         device: &ash::Device,
-        info: &DescriptorSetLayoutInfo,
+        layout: &[DescriptorSetLayoutBindingInfo],
     ) -> (vk::DescriptorSetLayout, DescriptorSetLayoutId) {
         let mut entries = &mut self.entries;
         let id = *self
             .map
-            .entry(*info)
-            .or_insert_with(|| entries.insert(DescriptorSetAllocator::new(device, info)));
+            .entry(DescriptorSetLayoutInfo::from(layout))
+            .or_insert_with(|| entries.insert(DescriptorSetAllocator::new(device, layout)));
+
         (self.entries.get(id).unwrap().layout_handle, id)
     }
 
     pub fn layout_allocator(&mut self, id: DescriptorSetLayoutId) -> &mut DescriptorSetAllocator {
         self.entries.get_mut(id).unwrap()
+    }
+
+    pub fn create_descriptor_set_layout_from_interface<T: DescriptorSetInterface>(
+        &mut self,
+        device: &ash::Device,
+    ) -> (vk::DescriptorSetLayout, DescriptorSetLayoutId) {
+        self.create_descriptor_set_layout(device, T::LAYOUT)
     }
 }
 
@@ -453,9 +461,9 @@ pub fn extract_descriptor_set_layouts_from_shader_stages(
             if let Some(set) = v.descriptor_set {
                 if let Some(binding) = v.binding {
                     use spirv::spv::StorageClass;
-                    use spirv::ImageType;
-                    use spirv::StructType;
-                    use spirv::TypeDesc::*;
+                    use crate::typedesc::TypeDesc::*;
+                    use crate::typedesc::StructType;
+                    use crate::typedesc::ImageType;
 
                     let (descriptor_type, unbounded_descriptor_array) =
                         match (v.storage_class, v.ty) {

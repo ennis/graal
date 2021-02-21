@@ -13,8 +13,9 @@ extern crate proc_macro;
 extern crate quote;
 extern crate syn;
 
+use proc_macro2::{Span, TokenStream};
 use quote::{ToTokens, TokenStreamExt};
-use proc_macro2::{TokenStream, Span};
+use syn::spanned::Spanned;
 
 //--------------------------------------------------------------------------------------------------
 struct CrateName;
@@ -28,19 +29,53 @@ impl ToTokens for CrateName {
 
 //--------------------------------------------------------------------------------------------------
 
-mod vertex_input_interface;
 mod descriptor_set_interface;
+mod vertex_data;
+mod vertex_input_interface;
 
-#[proc_macro_derive(DescriptorSetInterface, attributes(layout))]
-pub fn descriptor_set_interface_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let derive_input: syn::DeriveInput = syn::parse(input).expect("Couldn't parse item");
+fn derive_struct(
+    name: &str,
+    input: proc_macro::TokenStream,
+    generator: fn(&syn::DeriveInput, &syn::Fields) -> proc_macro2::TokenStream,
+) -> proc_macro::TokenStream {
+    let derive_input: syn::DeriveInput = syn::parse(input).expect("couldn't parse item");
 
     let result = match derive_input.data {
-        syn::Data::Struct(ref s) => descriptor_set_interface::generate(&derive_input, &s.fields),
-        _ => panic!("DescriptorSetInterface trait can only be derived on structs"),
+        syn::Data::Struct(ref s) => generator(&derive_input, &s.fields),
+        _ => {
+            derive_input
+                .span()
+                .unwrap()
+                .error(format!("`{}` can only be derived for struct types", name))
+                .emit();
+            return Default::default();
+        }
     };
 
     result.into()
+}
+
+#[proc_macro_derive(DescriptorSetInterface, attributes(layout))]
+pub fn descriptor_set_interface_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    derive_struct(
+        "DescriptorSetInterface",
+        input,
+        descriptor_set_interface::generate,
+    )
+}
+
+#[proc_macro_derive(VertexData)]
+pub fn vertex_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    derive_struct("VertexData", input, vertex_data::generate_vertex_data)
+}
+
+#[proc_macro_derive(VertexInputInterface, attributes(layout))]
+pub fn vertex_input_interface_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    derive_struct(
+        "VertexInputInterface",
+        input,
+        vertex_input_interface::generate,
+    )
 }
 
 /*

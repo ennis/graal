@@ -361,10 +361,6 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenS
     let descriptor_counts = cg_desc.descriptor_counts;
     let descriptor_types = cg_desc.descriptor_types;
 
-    // image_bindings
-    // image_descriptor_indices
-    // image_descriptor_offsets
-
     let q = quote! {
         impl #impl_generics #G::DescriptorSetInterface for #struct_name #ty_generics #where_clause {
             const LAYOUT: &'static [#G::DescriptorSetLayoutBindingInfo] = &[ #(#binding_infos,)* ];

@@ -1,6 +1,5 @@
 use graal::vk;
 use graal::DescriptorSetInterface;
-use graal_macros::DescriptorSetInterface;
 
 #[derive(Copy,Clone,Debug)]
 #[repr(C)]

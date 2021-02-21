@@ -1,5 +1,5 @@
 use ash::version::DeviceV1_0;
-use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemoryInfo, extract_descriptor_set_layouts_from_shader_stages};
+use graal::{vk, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceMemoryInfo, extract_descriptor_set_layouts_from_shader_stages, Norm, VertexBufferView, VertexInputInterface};
 use raw_window_handle::HasRawWindowHandle;
 use std::path::Path;
 use std::{mem, ptr};
@@ -9,13 +9,38 @@ use winit::{
     window::WindowBuilder,
 };
 use graal::PipelineShaderStage;
+use graal::VertexData;
 use inline_spirv::include_spirv;
 
-/*static BACKGROUND_SHADER_VERT : &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/background.vert.spv"));
-static BACKGROUND_SHADER_FRAG : &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/background.frag.spv"));*/
+static BACKGROUND_SHADER_VERT : &[u32] = include_spirv!("shaders/background.vert", vert);
+static BACKGROUND_SHADER_FRAG : &[u32] = include_spirv!("shaders/background.frag", frag);
 
-static BACKGROUND_SHADER_VERT : &[u32] = include_spirv!("../shaders/background.vert");
-static BACKGROUND_SHADER_FRAG : &[u32] = include_spirv!("../shaders/background.frag");
+#[derive(Copy,Clone,Debug)]
+#[repr(C)]
+struct Uniforms {
+    u_resolution: [f32;2],
+    u_scroll_offset: [f32;2],
+    u_zoom: f32
+}
+
+#[derive(graal::DescriptorSetInterface)]
+struct BackgroundShaderInterface {
+    #[layout(binding=0, uniform_buffer, stages(fragment))]
+    uniforms: vk::DescriptorBufferInfo,
+}
+
+#[derive(Copy,Clone,Debug,VertexData)]
+#[repr(C)]
+struct Vertex {
+    position: [f32;2],
+    texcoords: Norm<[u16;2]>,
+}
+
+#[derive(Copy,Clone,Debug,VertexInputInterface)]
+struct VertexInput {
+    #[layout(binding=0,location=0,per_vertex)]
+    vertices: VertexBufferView<Vertex>
+}
 
 
 fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal::DescriptorSetLayoutCache)
@@ -23,59 +48,46 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
     let vert = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo {
             flags: Default::default(),
-            code_size: BACKGROUND_SHADER_VERT.len(),
+            code_size: BACKGROUND_SHADER_VERT.len()*4,
             p_code: BACKGROUND_SHADER_VERT.as_ptr(),
             .. Default::default()
-        }).expect("failed to create shader module")
+        }, None).expect("failed to create shader module")
     };
 
     let frag = unsafe {
         device.create_shader_module(&vk::ShaderModuleCreateInfo {
             flags: Default::default(),
-            code_size: BACKGROUND_SHADER_FRAG.len(),
+            code_size: BACKGROUND_SHADER_FRAG.len()*4,
             p_code: BACKGROUND_SHADER_FRAG.as_ptr(),
             .. Default::default()
-        }).expect("failed to create shader module")
+        }, None).expect("failed to create shader module")
     };
 
     let shader_stages = [
         vk::PipelineShaderStageCreateInfo {
             flags: Default::default(),
-            stage: s.stage,
-            module,
+            stage: vk::ShaderStageFlags::VERTEX,
+            module: vert,
             p_name: b"main\0".as_ptr() as *const i8,
             p_specialization_info: ptr::null(),
             .. Default::default()
         },
         vk::PipelineShaderStageCreateInfo {
             flags: Default::default(),
-            stage: s.stage,
-            module,
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            module: frag,
             p_name: b"main\0".as_ptr() as *const i8,
             p_specialization_info: ptr::null(),
             .. Default::default()
         }
     ];
 
-    let set_layout_infos = extract_descriptor_set_layouts_from_shader_stages(&[
-        PipelineShaderStage {
-            stage: vk::ShaderStageFlags::VERTEX,
-            spirv: BACKGROUND_SHADER_VERT,
-        },
-        PipelineShaderStage {
-            stage: vk::ShaderStageFlags::FRAGMENT,
-            spirv: BACKGROUND_SHADER_FRAG,
-        }
-    ]);
-
     let mut set_layouts = Vec::new();
     let mut set_layout_ids = Vec::new();
 
-    for (&set, set_layout_info) in set_layout_infos.iter() {
-        let (layout_handle, layout_id) = descriptor_set_layout_cache.create_descriptor_set_layout(device, set_info);
-        set_layouts.push(layout_handle);
-        set_layout_ids.push(layout_id);
-    }
+    let (layout_handle, layout_id) = descriptor_set_layout_cache.create_descriptor_set_layout_from_interface::<BackgroundShaderInterface>(device);
+    set_layouts.push(layout_handle);
+    set_layout_ids.push(layout_id);
 
     let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo {
         flags: Default::default(),
@@ -90,7 +102,12 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
         device.create_pipeline_layout(&pipeline_layout_create_info, None).unwrap()
     };
 
-    // TODO
+    let mut vertex_attributes = Vec::with_capacity(<VertexInput as VertexInputInterface>::ATTRIBUTE_COUNT);
+    for b in <VertexInput as VertexInputInterface>::BINDING_ATTRIBUTES.iter() {
+
+    }
+
+    /*// TODO
     let vertex_input_state = vk::PipelineVertexInputStateCreateInfo {
         flags: Default::default(),
         vertex_binding_description_count: 0,
@@ -204,16 +221,15 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
         base_pipeline_handle: Default::default(),
         base_pipeline_index: 0,
         .. Default::default()
-    };
+    };*/
 
 }
 
-fn load_image(
-    batch: &mut graal::Batch,
+fn load_image(batch: &mut graal::Batch,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
-    mipmaps: bool,
-) -> (graal::ResourceId, u32, u32) {
+    mipmaps: bool) -> (graal::ResourceId, u32, u32)
+{
     use openimageio::{ImageInput, TypeDesc};
 
     let image_input = ImageInput::open(path).expect("could not open image file");
@@ -559,6 +575,7 @@ fn main() {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
+    let mut descriptor_set_layout_cache = graal::DescriptorSetLayoutCache::new();
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
     let device = graal::Device::new(surface);
     let mut context = graal::Context::new(device);
@@ -574,16 +591,7 @@ fn main() {
     let mesh = load_mesh(&mut init_batch, "../data/sphere.obj".as_ref());
     init_batch.finish();
 
-    graal::extract_descriptor_set_layouts_from_shader_stages(&[
-        PipelineShaderStage {
-            stage: vk::ShaderStageFlags::VERTEX,
-            spirv: BACKGROUND_SHADER_VERT
-        },
-        PipelineShaderStage {
-            stage: vk::ShaderStageFlags::FRAGMENT,
-            spirv: BACKGROUND_SHADER_FRAG
-        }
-    ]);
+    create_pipeline(context.device(), &mut descriptor_set_layout_cache);
 
     let mut swapchain_size = window.inner_size().into();
 

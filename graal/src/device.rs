@@ -36,7 +36,7 @@ pub(crate) struct QueuesInfo {
 }
 
 pub struct Device {
-    pub(crate) device: ash::Device,
+    pub device: ash::Device,
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
