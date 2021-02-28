@@ -104,7 +104,7 @@ pub fn generate_structured_buffer_data(
         syn::Fields::Unit => panic!("cannot generate struct layout of unit structs"),
     };
 
-    let mut field_tys = Vec::new();
+    let mut struct_fields = Vec::new();
     let mut layouts = Vec::new();
     let mut offsets = Vec::new();
 
@@ -117,11 +117,16 @@ pub fn generate_structured_buffer_data(
             continue;
         }
 
-        field_tys.push(quote! { <#field_ty as #G::buffer::StructuredBufferData>::TYPE });
+        struct_fields.push(quote! {
+            #G::typedesc::StructField {
+                ty: &<#field_ty as #G::StructuredBufferData>::TYPE,
+                .. #G::typedesc::StructField::new()
+            }
+        });
 
         offsets.push(quote! { #privmod::#offset });
 
-        layouts.push(quote! { <#field_ty as #G::buffer::StructuredBufferData>::LAYOUT });
+        layouts.push(quote! { <#field_ty as #G::StructuredBufferData>::LAYOUT });
     }
 
     let offset_consts = &layout.offsets;
@@ -135,14 +140,17 @@ pub fn generate_structured_buffer_data(
             #(#size_consts)*
         }
 
-        unsafe impl #G::buffer::StructuredBufferData for #struct_name {
-            const TYPE: #G::typedesc::TypeDesc<'static> = #G::typedesc::TypeDesc::Struct {
-                fields: &[#(&#field_tys),*],
-            };
+        unsafe impl #G::StructuredBufferData for #struct_name {
+            const TYPE: #G::typedesc::TypeDesc<'static> = #G::typedesc::TypeDesc::Struct(
+                #G::typedesc::StructType {
+                    fields: &[#(#struct_fields),*],
+                    .. #G::typedesc::StructType::new()
+                }
+            );
             const LAYOUT: #G::layout::Layout<'static> = #G::layout::Layout {
                 align: std::mem::align_of::<#struct_name>(),
                 size: std::mem::size_of::<#struct_name>(),
-                details: #G::layout::LayoutDetails::Struct(#G::layout::FieldsLayout {
+                inner: #G::layout::InnerLayout::Struct(#G::layout::FieldsLayout {
                     offsets: &[#(#offsets),*],
                     layouts: &[#(&#layouts),*]
                 })
@@ -157,7 +165,7 @@ pub fn generate_vertex_data(ast: &syn::DeriveInput, fields: &syn::Fields) -> Tok
     }
 
     let struct_name = &ast.ident;
-    let privmod = syn::Ident::new(&format!("__vertex_data_{}", struct_name), Span::call_site());
+    let privmod = syn::Ident::new(&format!("__VertexData_{}", struct_name), Span::call_site());
 
     let layout = generate_struct_layout(fields);
 

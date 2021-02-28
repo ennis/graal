@@ -42,6 +42,7 @@ pub use crate::descriptor::extract_descriptor_set_layouts_from_shader_stages;
 
 pub use graal_macros::DescriptorSetInterface;
 pub use graal_macros::VertexInputInterface;
+pub use graal_macros::StructuredBufferData;
 pub use graal_macros::VertexData;
 
 pub use crate::resource::get_mip_level_count;

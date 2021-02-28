@@ -102,37 +102,28 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
         device.create_pipeline_layout(&pipeline_layout_create_info, None).unwrap()
     };
 
-    let mut vertex_attributes = Vec::with_capacity(<VertexInput as VertexInputInterface>::ATTRIBUTE_COUNT);
-    for b in <VertexInput as VertexInputInterface>::BINDING_ATTRIBUTES.iter() {
-
-    }
-
-    /*// TODO
     let vertex_input_state = vk::PipelineVertexInputStateCreateInfo {
         flags: Default::default(),
-        vertex_binding_description_count: 0,
-        p_vertex_binding_descriptions: (),
-        vertex_attribute_description_count: 0,
-        p_vertex_attribute_descriptions: (),
+        vertex_binding_description_count: VertexInput::BINDINGS.len(),
+        p_vertex_binding_descriptions: VertexInput::BINDINGS.as_ptr(),
+        vertex_attribute_description_count: VertexInput::ATTRIBUTES.len(),
+        p_vertex_attribute_descriptions: VertexInput::ATTRIBUTES.as_ptr(),
         .. Default::default()
     };
 
-    // TODO
     let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo {
         flags: Default::default(),
-        topology: Default::default(),
+        topology: vk::PrimitiveTopology::TRIANGLE_LIST,
         primitive_restart_enable: 0,
         .. Default::default()
     };
 
-    // TODO
     let tessellation_state = vk::PipelineTessellationStateCreateInfo {
         flags: Default::default(),
         patch_control_points: 0,
         .. Default::default()
     };
 
-    // TODO
     let viewport_state = vk::PipelineViewportStateCreateInfo {
         flags: Default::default(),
         viewport_count: 0,
@@ -142,15 +133,14 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
         .. Default::default()
     };
 
-    // TODO
     let rasterization_state = vk::PipelineRasterizationStateCreateInfo {
         flags: Default::default(),
         depth_clamp_enable: 0,
         rasterizer_discard_enable: 0,
-        polygon_mode: Default::default(),
-        cull_mode: Default::default(),
-        front_face: Default::default(),
-        depth_bias_enable: 0,
+        polygon_mode: vk::PolygonMode::FILL,
+        cull_mode: vk::CullModeFlags::NONE,
+        front_face: vk::FrontFace::CLOCKWISE,
+        depth_bias_enable: vk::FALSE,
         depth_bias_constant_factor: 0.0,
         depth_bias_clamp: 0.0,
         depth_bias_slope_factor: 0.0,
@@ -158,22 +148,21 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
         .. Default::default()
     };
 
-    // TODO
     let multisample_state = vk::PipelineMultisampleStateCreateInfo {
         flags: Default::default(),
         rasterization_samples: Default::default(),
         sample_shading_enable: 0,
         min_sample_shading: 0.0,
         p_sample_mask: ptr::null(),
-        alpha_to_coverage_enable: 0,
-        alpha_to_one_enable: 0,
+        alpha_to_coverage_enable: vk::FALSE,
+        alpha_to_one_enable: vk::FALSE,
         .. Default::default()
     };
 
     let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
         flags: Default::default(),
-        depth_test_enable: 0,
-        depth_write_enable: 0,
+        depth_test_enable: vk::FALSE,
+        depth_write_enable: vk::FALSE,
         depth_compare_op: Default::default(),
         depth_bounds_test_enable: 0,
         stencil_test_enable: 0,
@@ -184,44 +173,108 @@ fn create_pipeline(device: &ash::Device, descriptor_set_layout_cache: &mut graal
         .. Default::default()
     };
 
-
+    let color_blend_attachments = &[
+        vk::PipelineColorBlendAttachmentState {
+            blend_enable: vk::FALSE,
+            src_color_blend_factor: Default::default(),
+            dst_color_blend_factor: Default::default(),
+            color_blend_op: Default::default(),
+            src_alpha_blend_factor: Default::default(),
+            dst_alpha_blend_factor: Default::default(),
+            alpha_blend_op: Default::default(),
+            color_write_mask: Default::default()
+        }
+    ];
+    
     let color_blend_state = vk::PipelineColorBlendStateCreateInfo {
         flags: Default::default(),
         logic_op_enable: 0,
         logic_op: Default::default(),
-        attachment_count: 0,
-        p_attachments: (),
-        blend_constants: [],
+        attachment_count: color_blend_attachments.len() as u32,
+        p_attachments: color_blend_attachments.as_ptr(),
+        blend_constants: [0.0f32;4],
         .. Default::default()
     };
 
+    let dynamic_states = &[vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
     let dynamic_state = vk::PipelineDynamicStateCreateInfo {
         flags: Default::default(),
-        dynamic_state_count: 0,
-        p_dynamic_states: (),
+        dynamic_state_count: dynamic_states.len() as u32,
+        p_dynamic_states: dynamic_states.as_ptr(),
         .. Default::default()
+    };
+
+    let render_pass_attachments = &[vk::AttachmentDescription {
+        flags: vk::AttachmentDescriptionFlags::MAY_ALIAS,
+        format: vk::Format::R16G16B16A16_SFLOAT,      // TODO get from engine / pass as parameter
+        samples: vk::SampleCountFlags::TYPE_1,
+        load_op: vk::AttachmentLoadOp::DONT_CARE,
+        store_op: vk::AttachmentStoreOp::STORE,
+        stencil_load_op: vk::AttachmentLoadOp::DONT_CARE,
+        stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
+        initial_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        final_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    }];
+
+    let color_attachments = &[vk::AttachmentReference {
+        attachment: 0,
+        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL
+    }];
+
+    let subpasses = &[vk::SubpassDescription {
+        flags: Default::default(),
+        pipeline_bind_point: vk::PipelineBindPoint::GRAPHICS,
+        input_attachment_count: 0,
+        p_input_attachments: ptr::null(),
+        color_attachment_count: color_attachments.len() as u32,
+        p_color_attachments: color_attachments.as_ptr(),
+        p_resolve_attachments: ptr::null(),
+        p_depth_stencil_attachment: ptr::null(),
+        preserve_attachment_count: 0,
+        p_preserve_attachments: ptr::null()
+    }];
+
+    // render pass
+    let render_pass_create_info = vk::RenderPassCreateInfo {
+        flags: Default::default(),
+        attachment_count: render_pass_attachments.len() as u32,
+        p_attachments: render_pass_attachments.as_ptr(),
+        subpass_count: subpasses.len() as u32,
+        p_subpasses: subpasses.as_ptr(),
+        dependency_count: 0,
+        p_dependencies: ptr::null(),
+        .. Default::default()
+    };
+
+    let render_pass = unsafe {
+        device.create_render_pass(&render_pass_create_info, None).unwrap()
     };
 
     let gpci = vk::GraphicsPipelineCreateInfo {
         flags: Default::default(),
         stage_count: stages.len() as u32,
         p_stages: stage_create_infos.as_ptr(),
-        p_vertex_input_state: (),
-        p_input_assembly_state: (),
-        p_tessellation_state: (),
-        p_viewport_state: (),
-        p_rasterization_state: (),
-        p_multisample_state: (),
-        p_depth_stencil_state: (),
-        p_color_blend_state: (),
-        p_dynamic_state: (),
-        layout: Default::default(),
-        render_pass: Default::default(),
+        p_vertex_input_state: &vertex_input_state,
+        p_input_assembly_state: &input_assembly_state,
+        p_tessellation_state: &tessellation_state,
+        p_viewport_state: &viewport_state,
+        p_rasterization_state: &rasterization_state,
+        p_multisample_state: &multisample_state,
+        p_depth_stencil_state: &depth_stencil_state,
+        p_color_blend_state: &color_blend_state,
+        p_dynamic_state: &dynamic_state,
+        layout: pipeline_layout,
+        render_pass,
         subpass: 0,
         base_pipeline_handle: Default::default(),
         base_pipeline_index: 0,
         .. Default::default()
-    };*/
+    };
+
+    let pipeline = unsafe {
+        device.create_graphics_pipelines(vk::PipelineCache::null(), &[gpci], None).unwrap()[0]
+    };
 
 }
 
@@ -779,3 +832,36 @@ fn main() {
         }
     });
 }
+
+#[pass(graphics)]
+fn blit_pass(
+    context: &Context,
+    command_buffer: vk::CommandBuffer,
+    #[resource(
+        usage=transfer_src,
+        layout=transfer_src_optimal,
+        input_stages(transfer),
+        output_stages(transfer),
+        access_mask(transfer_read),
+    )]
+    src_image: vk::Image,
+    #[resource(
+        usage=transfer_dst,
+        layout=transfer_dst_optimal,
+        input_stages(transfer),
+        output_stages(transfer),
+        access_mask(transfer_write),
+    )]
+    dst_image: vk::Image,
+    filter: vk::Filter)
+{
+}
+
+
+#[pass(graphics)]
+fn main_pass(
+    context: &Context,
+    command_buffer: vk::CommandBuffer,
+
+
+)

@@ -30,7 +30,7 @@ impl ToTokens for CrateName {
 //--------------------------------------------------------------------------------------------------
 
 mod descriptor_set_interface;
-mod vertex_data;
+mod buffer_data;
 mod vertex_input_interface;
 
 fn derive_struct(
@@ -66,7 +66,7 @@ pub fn descriptor_set_interface_derive(input: proc_macro::TokenStream) -> proc_m
 
 #[proc_macro_derive(VertexData)]
 pub fn vertex_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    derive_struct("VertexData", input, vertex_data::generate_vertex_data)
+    derive_struct("VertexData", input, buffer_data::generate_vertex_data)
 }
 
 #[proc_macro_derive(VertexInputInterface, attributes(layout))]
@@ -78,19 +78,13 @@ pub fn vertex_input_interface_derive(input: proc_macro::TokenStream) -> proc_mac
     )
 }
 
-/*
+
 #[proc_macro_derive(StructuredBufferData)]
 pub fn structured_buffer_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    let ast: syn::DeriveInput = syn::parse(input).expect("Couldn't parse item");
-
-    let result = match ast.data {
-        syn::Data::Struct(ref s) => layout::generate_structured_buffer_data(&ast, &s.fields),
-        _ => panic!("StructuredBufferData trait can only be automatically derived on structs."),
-    };
-
-    result.into()
+    derive_struct("StructuredBufferData", input, buffer_data::generate_structured_buffer_data)
 }
 
+/*
 #[proc_macro_derive(VertexData)]
 pub fn vertex_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let ast: syn::DeriveInput = syn::parse(input).expect("Couldn't parse item");

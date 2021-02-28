@@ -1,7 +1,7 @@
-use std::marker::PhantomData;
-use crate::typedesc::TypeDesc;
+use crate::layout::{Layout, InnerLayout, ArrayLayout};
 use crate::typedesc::PrimitiveType;
-use crate::layout::Layout;
+use crate::typedesc::TypeDesc;
+use std::marker::PhantomData;
 
 //--------------------------------------------------------------------------------------------------
 
@@ -24,6 +24,13 @@ impl<U: BufferData> BufferData for [U] {
         (&self as &[U]).len()
     }
 }
+
+/*impl<U: BufferData, const N: usize> BufferData for [U; N] {
+    type Element = U;
+    fn len(&self) -> usize {
+        N
+    }
+}*/
 
 /// Trait implemented by types that are layout-compatible with an specific
 /// to GLSL/SPIR-V type.
@@ -61,24 +68,71 @@ impl Default for BoolU32 {
     }
 }
 
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
+pub struct Vec2f(pub [f32; 2]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
+pub struct Vec3f(pub [f32; 3]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
+pub struct Vec4f(pub [f32; 4]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Vec2i(pub [i32; 2]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Vec3i(pub [i32; 3]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct Vec4i(pub [i32; 4]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
+pub struct Mat2x2f(pub [[f32; 2]; 2]);
+
+#[repr(transparent)]
+#[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
+pub struct Mat4x4f(pub [[f32; 4]; 4]);
+
+unsafe impl<T: StructuredBufferData+Copy, const N: usize> StructuredBufferData for [T; N] {
+    const TYPE: TypeDesc<'static> = TypeDesc::Array {
+        elem_ty: &T::TYPE,
+        len: N,
+    };
+    const LAYOUT: Layout<'static> = Layout {
+        size: std::mem::size_of::<Self>(),
+        align: std::mem::align_of::<Self>(),
+        inner: InnerLayout::Array(ArrayLayout {
+            elem_layout: &T::LAYOUT,
+            stride: T::LAYOUT.size
+        })
+    };
+}
+
 impl_structured_type!(BoolU32, TypeDesc::Primitive(PrimitiveType::UnsignedInt));
 impl_structured_type!(f32, TypeDesc::Primitive(PrimitiveType::Float));
 impl_structured_type!(
-    [f32; 2],
+    Vec2f,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Float,
         len: 2
     }
 );
 impl_structured_type!(
-    [f32; 3],
+    Vec3f,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Float,
         len: 3
     }
 );
 impl_structured_type!(
-    [f32; 4],
+    Vec4f,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Float,
         len: 4
@@ -86,28 +140,28 @@ impl_structured_type!(
 );
 impl_structured_type!(i32, TypeDesc::Primitive(PrimitiveType::Int));
 impl_structured_type!(
-    [i32; 2],
+    Vec2i,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Int,
         len: 2
     }
 );
 impl_structured_type!(
-    [i32; 3],
+    Vec3i,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Int,
         len: 3
     }
 );
 impl_structured_type!(
-    [i32; 4],
+    Vec4i,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Int,
         len: 4
     }
 );
 impl_structured_type!(
-    [[f32; 2]; 2],
+    Mat2x2f,
     TypeDesc::Matrix {
         elem_ty: PrimitiveType::Float,
         rows: 2,
@@ -115,15 +169,7 @@ impl_structured_type!(
     }
 );
 impl_structured_type!(
-    [[f32; 3]; 3],
-    TypeDesc::Matrix {
-        elem_ty: PrimitiveType::Float,
-        rows: 3,
-        columns: 3
-    }
-);
-impl_structured_type!(
-    [[f32; 4]; 4],
+    Mat4x4f,
     TypeDesc::Matrix {
         elem_ty: PrimitiveType::Float,
         rows: 4,

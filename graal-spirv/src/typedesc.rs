@@ -44,13 +44,19 @@ pub struct ObjectOrMemberInfo {
     pub uniform: bool,
 }
 
-impl Default for ObjectOrMemberInfo {
-    fn default() -> Self {
+impl ObjectOrMemberInfo {
+    pub const fn new() -> ObjectOrMemberInfo {
         ObjectOrMemberInfo {
             no_perspective: false,
             builtin: false,
             uniform: false,
         }
+    }
+}
+
+impl Default for ObjectOrMemberInfo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -66,6 +72,25 @@ pub struct StructField<'a> {
     pub offset: Option<u32>,
     /// Additional information
     pub member_info: ObjectOrMemberInfo,
+}
+
+impl<'a> StructField<'a> {
+    pub const fn new() -> Self {
+        StructField {
+            ty: &TypeDesc::Void,
+            decorations: &[],
+            matrix_layout: None,
+            matrix_stride: None,
+            offset: None,
+            member_info: ObjectOrMemberInfo::new(),
+        }
+    }
+}
+
+impl<'a> Default for StructField<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// SPIR-V variable information.
@@ -105,6 +130,24 @@ pub struct StructType<'a> {
     pub buffer_block: bool,
     ///
     pub struct_layout: Option<StructLayout>,
+}
+
+impl<'a> StructType<'a> {
+    pub const fn new() -> Self {
+        StructType {
+            fields: &[],
+            decorations: &[],
+            block: false,
+            buffer_block: false,
+            struct_layout: None,
+        }
+    }
+}
+
+impl<'a> Default for StructType<'a> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Describes a data type used inside a SPIR-V shader
