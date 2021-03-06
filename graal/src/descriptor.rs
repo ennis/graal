@@ -3,14 +3,14 @@ use crate::vk::{
     BufferView, DescriptorBufferInfo, DescriptorImageInfo, DescriptorPoolSize, DescriptorType,
     ShaderStageFlags,
 };
+use crate::Device;
 use ash::version::DeviceV1_0;
 use ash::vk;
 use graal_spirv as spirv;
 use slotmap::SlotMap;
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::CString;
-use std::ptr;
-use crate::Device;
+use std::{ptr, mem};
 
 const MAX_DESCRIPTOR_SET_LAYOUT_BINDING_DESCRIPTORS: usize = 16;
 const MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS: usize = 16;
@@ -50,8 +50,15 @@ pub struct PushConstantLayout {
 
 pub trait DescriptorSetInterface {
     const LAYOUT: &'static [DescriptorSetLayoutBindingInfo];
+    // only for entries with statically known sizes
+    const UPDATE_TEMPLATE_ENTRIES: &'static [vk::DescriptorUpdateTemplateEntry];
 
-    unsafe fn write_descriptors(&self, device: &ash::Device, set: vk::DescriptorSet);
+    unsafe fn update_descriptors(
+        &self,
+        device: &ash::Device,
+        set: vk::DescriptorSet,
+        update_template: vk::DescriptorUpdateTemplate,
+    );
 }
 
 pub trait PushConstantInterface {
@@ -70,80 +77,43 @@ pub enum DescriptorWriteKind {
 }
 
 /// A trait implemented by types that can produce one or more descriptors.
-pub trait DescriptorSource {
+pub unsafe trait DescriptorSource {
     const KIND: DescriptorWriteKind;
+    const ARRAY_SIZE: u32 = 1;
 
     /// Returns the number of descriptors in this binding.
     fn descriptor_count(&self) -> u32 {
         1
     }
-
-    fn write_descriptors(
-        &self,
-        image_descriptors: &mut [vk::DescriptorImageInfo],
-        buffer_descriptors: &mut [vk::DescriptorBufferInfo],
-        texel_buffer_views: &mut [vk::BufferView],
-    );
 }
 
 /// Impl for descriptor arrays
-impl<'a, D: DescriptorSource> DescriptorSource for &'a [D] {
+unsafe impl<'a, D: DescriptorSource> DescriptorSource for &'a [D] {
     const KIND: DescriptorWriteKind = D::KIND;
 
     fn descriptor_count(&self) -> u32 {
         self.len() as u32
     }
-
-    fn write_descriptors(
-        &self,
-        image_descriptors: &mut [DescriptorImageInfo],
-        buffer_descriptors: &mut [DescriptorBufferInfo],
-        texel_buffer_views: &mut [BufferView],
-    ) {
-        for d in self.iter() {
-            d.write_descriptors(image_descriptors, buffer_descriptors, texel_buffer_views);
-        }
-    }
 }
 
-impl DescriptorSource for vk::Sampler {
+unsafe impl DescriptorSource for vk::Sampler {
     const KIND: DescriptorWriteKind = DescriptorWriteKind::Image;
-
-    fn write_descriptors(
-        &self,
-        image_descriptors: &mut [DescriptorImageInfo],
-        _buffer_descriptors: &mut [DescriptorBufferInfo],
-        _texel_buffer_views: &mut [BufferView],
-    ) {
-        image_descriptors[0] = vk::DescriptorImageInfo {
-            sampler: *self,
-            image_view: vk::ImageView::null(),
-            image_layout: vk::ImageLayout::UNDEFINED,
-        };
-    }
 }
 
-impl DescriptorSource for vk::DescriptorBufferInfo {
+unsafe impl DescriptorSource for vk::DescriptorBufferInfo {
     const KIND: DescriptorWriteKind = DescriptorWriteKind::Buffer;
-    fn write_descriptors(
-        &self,
-        _image_descriptors: &mut [DescriptorImageInfo],
-        buffer_descriptors: &mut [DescriptorBufferInfo],
-        _texel_buffer_views: &mut [BufferView],
-    ) {
-        buffer_descriptors[0] = *self;
-    }
 }
 
-impl DescriptorSource for vk::DescriptorImageInfo {
+unsafe impl DescriptorSource for vk::DescriptorImageInfo {
     const KIND: DescriptorWriteKind = DescriptorWriteKind::Image;
-    fn write_descriptors(
-        &self,
-        image_descriptors: &mut [DescriptorImageInfo],
-        _buffer_descriptors: &mut [DescriptorBufferInfo],
-        _texel_buffer_views: &mut [BufferView],
-    ) {
-        image_descriptors[0] = *self;
+}
+
+unsafe impl<T: DescriptorSource, const N: usize> DescriptorSource for [T; N] {
+    const KIND: DescriptorWriteKind = DescriptorWriteKind::Image;
+    const ARRAY_SIZE: u32 = N as u32;
+
+    fn descriptor_count(&self) -> u32 {
+        N as u32
     }
 }
 
@@ -165,7 +135,7 @@ pub struct DescriptorSetAllocator {
     pool_size_count: u32,
     pool_sizes: [vk::DescriptorPoolSize; 16],
     full_pools: Vec<vk::DescriptorPool>,
-    pool: vk::DescriptorPool,
+    pool: Option<vk::DescriptorPool>,
     free: Vec<vk::DescriptorSet>,
     used: Vec<TrackedDescriptorSet>,
 }
@@ -318,10 +288,39 @@ impl DescriptorSetAllocator {
             pool_sizes,
             pool_size_count: pool_size_count as u32,
             full_pools: vec![],
-            pool: vk::DescriptorPool::null(),
+            pool: None,
             free: vec![],
             used: vec![],
         }
+    }
+
+    fn retire_descriptor_pool(&mut self) {
+        if let Some(pool) = mem::replace(&mut self.pool, None) {
+            self.full_pools.push(pool);
+        }
+    }
+
+    fn get_descriptor_pool(&mut self, device: &ash::Device) -> vk::DescriptorPool {
+        if let Some(pool) = self.pool {
+            return pool;
+        }
+
+        let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo {
+            flags: vk::DescriptorPoolCreateFlags::default(),
+            max_sets: DESCRIPTOR_POOL_SET_COUNT,
+            pool_size_count: self.pool_size_count,
+            p_pool_sizes: self.pool_sizes.as_ptr(),
+            ..Default::default()
+        };
+
+        let pool = unsafe {
+            device
+                .create_descriptor_pool(&descriptor_pool_create_info, None)
+                .unwrap()
+        };
+
+        self.pool = Some(pool);
+        pool
     }
 
     /// Gets a descriptor set.
@@ -330,33 +329,21 @@ impl DescriptorSetAllocator {
         device: &ash::Device,
         batch: BatchSerialNumber,
     ) -> vk::DescriptorSet {
-        let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo {
-            descriptor_pool: self.pool,
-            descriptor_set_count: 1,
-            p_set_layouts: &self.layout_handle,
-            ..Default::default()
-        };
-
         let handle = loop {
+            let descriptor_pool = self.get_descriptor_pool(device);
+            let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo {
+                descriptor_pool,
+                descriptor_set_count: 1,
+                p_set_layouts: &self.layout_handle,
+                ..Default::default()
+            };
+
             let result = unsafe { device.allocate_descriptor_sets(&descriptor_set_allocate_info) };
 
             match result {
                 Ok(d) => break *d.first().unwrap(),
                 Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
-                    // allocate a new pool and continue
-                    let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo {
-                        flags: vk::DescriptorPoolCreateFlags::default(),
-                        max_sets: DESCRIPTOR_POOL_SET_COUNT,
-                        pool_size_count: self.pool_size_count,
-                        p_pool_sizes: self.pool_sizes.as_ptr(),
-                        ..Default::default()
-                    };
-                    self.full_pools.push(self.pool);
-                    self.pool = unsafe {
-                        device
-                            .create_descriptor_pool(&descriptor_pool_create_info, None)
-                            .expect("failed to create descriptor pool")
-                    };
+                    self.retire_descriptor_pool();
                     continue;
                 }
                 Err(e) => panic!("error allocating descriptor sets: {}", e),
@@ -384,7 +371,6 @@ impl DescriptorSetAllocator {
 pub struct DescriptorSetLayoutCache {
     entries: SlotMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
     map: HashMap<DescriptorSetLayoutInfo, DescriptorSetLayoutId>,
-    // TODO type-map
 }
 
 impl DescriptorSetLayoutCache {
@@ -460,10 +446,10 @@ pub fn extract_descriptor_set_layouts_from_shader_stages(
         for v in module.variables {
             if let Some(set) = v.descriptor_set {
                 if let Some(binding) = v.binding {
-                    use spirv::spv::StorageClass;
-                    use crate::typedesc::TypeDesc::*;
-                    use crate::typedesc::StructType;
                     use crate::typedesc::ImageType;
+                    use crate::typedesc::StructType;
+                    use crate::typedesc::TypeDesc::*;
+                    use spirv::spv::StorageClass;
 
                     let (descriptor_type, unbounded_descriptor_array) =
                         match (v.storage_class, v.ty) {

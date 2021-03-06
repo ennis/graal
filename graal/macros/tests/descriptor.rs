@@ -10,17 +10,21 @@ struct PerObjectData {
 }
 
 #[derive(DescriptorSetInterface)]
+#[repr(C)]
 struct GlobalResources<'a> {
-    #[layout(binding=0, sampled_image, array, unbounded, max_count=1024)]
+    #[layout(binding=0, sampled_image, runtime_array(max_count=1024))]
     textures: &'a [vk::DescriptorImageInfo],
 }
 
 #[derive(DescriptorSetInterface)]
+#[repr(C)]
 struct PerObjectResources {
     #[layout(binding=0, uniform_buffer, stages(all_graphics))]
     uniforms: vk::DescriptorBufferInfo,
     #[layout(binding=1, uniform_buffer)]
-    buffer: vk::DescriptorBufferInfo
+    buffer: vk::DescriptorBufferInfo,
+    #[layout(binding=2, sampler, array)]
+    samplers: [vk::Sampler; 4],
 }
 
 #[test]

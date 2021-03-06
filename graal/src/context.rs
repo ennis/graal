@@ -1027,6 +1027,7 @@ impl Context {
     fn destroy_resource(device: &Device, resource: &mut Resource) {
         // destroy the object, if we're responsible for it
         if resource.should_delete {
+            eprintln!("destroying resource: {:?}", resource);
             match &mut resource.kind {
                 ResourceKind::Buffer(buf) => {
                     unsafe {

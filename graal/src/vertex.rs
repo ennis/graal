@@ -45,6 +45,30 @@ pub unsafe trait VertexAttributeType {
 #[repr(transparent)]
 pub struct Norm<T>(pub T);
 
+impl From<f32> for Norm<u8> {
+    fn from(v: f32) -> Self {
+        Norm((v * u8::MAX as f32) as u8)
+    }
+}
+
+impl From<f64> for Norm<u8> {
+    fn from(v: f64) -> Self {
+        Norm((v * u8::MAX as f64) as u8)
+    }
+}
+
+impl From<f32> for Norm<u16> {
+    fn from(v: f32) -> Self {
+        Norm((v * u16::MAX as f32) as u16)
+    }
+}
+
+impl From<f64> for Norm<u16> {
+    fn from(v: f64) -> Self {
+        Norm((v * u16::MAX as f64) as u16)
+    }
+}
+
 // Vertex attribute types --------------------------------------------------------------------------
 macro_rules! impl_attrib_type {
     ($t:ty, $equiv:expr, $fmt:ident) => {

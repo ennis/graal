@@ -32,6 +32,11 @@ impl ToTokens for CrateName {
 mod descriptor_set_interface;
 mod buffer_data;
 mod vertex_input_interface;
+mod struct_layout;
+
+pub(crate) use struct_layout::generate_field_offsets_and_sizes;
+pub(crate) use struct_layout::has_repr_c_attr;
+pub(crate) use struct_layout::ensure_repr_c;
 
 fn derive_struct(
     name: &str,
