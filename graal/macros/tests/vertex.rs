@@ -1,9 +1,7 @@
-use graal::Norm;
-use graal::VertexAttribute;
-use graal::VertexBufferView;
-use graal::VertexData;
-use graal::VertexInputInterface;
-use graal::{vk, VertexInputBindingAttributes};
+use graal::{
+    vk, Norm, VertexAttribute, VertexBufferView, VertexData, VertexInputBindingAttributes,
+    VertexInputInterface,
+};
 use std::mem;
 
 #[repr(C)]
@@ -76,10 +74,28 @@ fn test_vertex_layout() {
     let a4 = <VertexInput as VertexInputInterface>::ATTRIBUTES[4];
     let a5 = <VertexInput as VertexInputInterface>::ATTRIBUTES[5];
 
-    assert_eq!((a0.location, a0.binding, a0.format, a0.offset), (0, 0, vk::Format::R32G32B32_SFLOAT, 0));
-    assert_eq!((a1.location, a1.binding, a1.format, a1.offset), (1, 0, vk::Format::R32G32B32_SFLOAT, 12));
-    assert_eq!((a2.location, a2.binding, a2.format, a2.offset), (2, 0, vk::Format::R16G16_UNORM, 24));
-    assert_eq!((a3.location, a3.binding, a3.format, a3.offset), (3, 2, vk::Format::R32G32B32_SFLOAT, 0));
-    assert_eq!((a4.location, a4.binding, a4.format, a4.offset), (4, 2, vk::Format::R32G32B32_SFLOAT, 12));
-    assert_eq!((a5.location, a5.binding, a5.format, a5.offset), (5, 2, vk::Format::R16G16_UNORM, 24));
+    assert_eq!(
+        (a0.location, a0.binding, a0.format, a0.offset),
+        (0, 0, vk::Format::R32G32B32_SFLOAT, 0)
+    );
+    assert_eq!(
+        (a1.location, a1.binding, a1.format, a1.offset),
+        (1, 0, vk::Format::R32G32B32_SFLOAT, 12)
+    );
+    assert_eq!(
+        (a2.location, a2.binding, a2.format, a2.offset),
+        (2, 0, vk::Format::R16G16_UNORM, 24)
+    );
+    assert_eq!(
+        (a3.location, a3.binding, a3.format, a3.offset),
+        (3, 2, vk::Format::R32G32B32_SFLOAT, 0)
+    );
+    assert_eq!(
+        (a4.location, a4.binding, a4.format, a4.offset),
+        (4, 2, vk::Format::R32G32B32_SFLOAT, 12)
+    );
+    assert_eq!(
+        (a5.location, a5.binding, a5.format, a5.offset),
+        (5, 2, vk::Format::R16G16_UNORM, 24)
+    );
 }

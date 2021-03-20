@@ -1,9 +1,7 @@
-use ash::version::EntryV1_0;
-use ash::vk;
+use ash::{version::EntryV1_0, vk};
 use core::ptr;
 use lazy_static::lazy_static;
-use std::ffi::CStr;
-use std::os::raw::c_char;
+use std::{ffi::CStr, os::raw::c_char};
 
 /// List of validation layers to enable
 const VALIDATION_LAYERS: [*const c_char; 1] =

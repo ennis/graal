@@ -78,11 +78,7 @@ impl Swapchain {
     }
 
     /// Resizes a swapchain.
-    pub(crate) unsafe fn resize(
-        &mut self,
-        device: &Device,
-        size: (u32, u32),
-    ) {
+    pub(crate) unsafe fn resize(&mut self, device: &Device, size: (u32, u32)) {
         let phy = device.physical_device;
         let capabilities = device
             .vk_khr_surface
@@ -134,9 +130,7 @@ impl Swapchain {
             .expect("failed to create swapchain");
         if self.handle != vk::SwapchainKHR::null() {
             // FIXME what if the images are in use?
-            device
-                .vk_khr_swapchain
-                .destroy_swapchain(self.handle, None);
+            device.vk_khr_swapchain.destroy_swapchain(self.handle, None);
         }
 
         self.handle = new_handle;
@@ -163,4 +157,3 @@ impl Swapchain {
             .expect("AcquireNextImage failed")
     }
 }
-

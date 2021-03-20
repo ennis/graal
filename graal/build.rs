@@ -1,14 +1,14 @@
 extern crate shaderc;
 
 use anyhow::Result;
-use std::env;
-use std::fs;
-use std::fs::File;
-use std::io::{Write, Read};
-use std::path::{Path, PathBuf};
+use std::{
+    env, fs,
+    fs::File,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+};
 
 const SHADERS_DIR: &str = "shaders/";
-
 
 fn compile_shader(
     compiler: &mut shaderc::Compiler,
@@ -17,29 +17,22 @@ fn compile_shader(
     kind: shaderc::ShaderKind,
     out_dir: &Path,
 ) -> Result<()> {
-
-    let output_file_path = out_dir
-        .join(format!("{}.spv",source_file_path.file_name().unwrap().to_str().unwrap()));
+    let output_file_path = out_dir.join(format!(
+        "{}.spv",
+        source_file_path.file_name().unwrap().to_str().unwrap()
+    ));
 
     let source_file_name = source_file_path.to_string_lossy();
 
-    eprintln!(
-        "-- Compiling SPIR-V: {}...",
-        output_file_path.display()
-    );
+    eprintln!("-- Compiling SPIR-V: {}...", output_file_path.display());
 
     // load source
     let mut source_file = File::open(source_file_path)?;
     let mut source = String::new();
     source_file.read_to_string(&mut source)?;
 
-    let binary_result = compiler.compile_into_spirv(
-        &source,
-        kind,
-        &source_file_name,
-        "main",
-        Some(&options),
-    )?;
+    let binary_result =
+        compiler.compile_into_spirv(&source, kind, &source_file_name, "main", Some(&options))?;
 
     // write the binary result to the output directory
     let mut output_file = File::create(output_file_path)?;
@@ -98,5 +91,4 @@ fn main() {
     if encountered_errors {
         panic!("Errors encountered when compiling shaders.");
     }
-
 }

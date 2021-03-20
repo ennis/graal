@@ -29,14 +29,12 @@ impl ToTokens for CrateName {
 
 //--------------------------------------------------------------------------------------------------
 
-mod descriptor_set_interface;
 mod buffer_data;
-mod vertex_input_interface;
+mod descriptor_set_interface;
 mod struct_layout;
+mod vertex_input_interface;
 
-pub(crate) use struct_layout::generate_field_offsets_and_sizes;
-pub(crate) use struct_layout::has_repr_c_attr;
-pub(crate) use struct_layout::ensure_repr_c;
+pub(crate) use struct_layout::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr};
 
 fn derive_struct(
     name: &str,
@@ -83,10 +81,13 @@ pub fn vertex_input_interface_derive(input: proc_macro::TokenStream) -> proc_mac
     )
 }
 
-
 #[proc_macro_derive(StructuredBufferData)]
 pub fn structured_buffer_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
-    derive_struct("StructuredBufferData", input, buffer_data::generate_structured_buffer_data)
+    derive_struct(
+        "StructuredBufferData",
+        input,
+        buffer_data::generate_structured_buffer_data,
+    )
 }
 
 /*

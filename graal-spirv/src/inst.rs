@@ -1,6 +1,6 @@
-use spirv_headers::*;
 use crate::ParseError;
 use num_traits::FromPrimitive;
+use spirv_headers::*;
 
 /// Raw representation of a SPIR-V instruction.
 pub struct RawInstruction<'a> {
@@ -220,7 +220,6 @@ pub struct ILabel {
 pub struct IBranch {
     pub result_id: u32,
 }
-
 
 pub trait DecodedInstruction<'m>: 'm {
     const OPCODE: Op;

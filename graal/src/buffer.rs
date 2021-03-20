@@ -1,7 +1,9 @@
-use crate::layout::{Layout, InnerLayout, ArrayLayout};
-use crate::typedesc::PrimitiveType;
-use crate::typedesc::TypeDesc;
-use std::marker::PhantomData;
+use crate::{
+    layout::{ArrayLayout, InnerLayout, Layout},
+    typedesc::{PrimitiveType, TypeDesc},
+    vk, ResourceId,
+};
+use std::{marker::PhantomData, mem::MaybeUninit};
 
 //--------------------------------------------------------------------------------------------------
 
@@ -100,7 +102,7 @@ pub struct Mat2x2f(pub [[f32; 2]; 2]);
 #[derive(Copy, Clone, Debug, PartialEq, PartialOrd)]
 pub struct Mat4x4f(pub [[f32; 4]; 4]);
 
-unsafe impl<T: StructuredBufferData+Copy, const N: usize> StructuredBufferData for [T; N] {
+unsafe impl<T: StructuredBufferData + Copy, const N: usize> StructuredBufferData for [T; N] {
     const TYPE: TypeDesc<'static> = TypeDesc::Array {
         elem_ty: &T::TYPE,
         len: N,
@@ -110,8 +112,8 @@ unsafe impl<T: StructuredBufferData+Copy, const N: usize> StructuredBufferData f
         align: std::mem::align_of::<Self>(),
         inner: InnerLayout::Array(ArrayLayout {
             elem_layout: &T::LAYOUT,
-            stride: T::LAYOUT.size
-        })
+            stride: T::LAYOUT.size,
+        }),
     };
 }
 

@@ -1,4 +1,4 @@
-use crate::{PrimitiveType, TypeDesc, Arena, StructField, StructType};
+use crate::{Arena, PrimitiveType, StructField, StructType, TypeDesc};
 use std::iter;
 
 fn round_up(value: usize, multiple: usize) -> usize {
@@ -94,7 +94,10 @@ fn std140_struct_layout<'a>(arena: &'a Arena, fields: &[StructField]) -> &'a Lay
     */
     // TODO: zero-sized structures?
 
-    let layouts: Vec<_> = fields.iter().map(|&field| std140_layout(arena, field.ty)).collect();
+    let layouts: Vec<_> = fields
+        .iter()
+        .map(|&field| std140_layout(arena, field.ty))
+        .collect();
     let layouts = arena.0.alloc_slice_fill_iter(layouts);
     let n = layouts.iter().map(|l| l.align).max().unwrap_or(0);
     if n == 0 {

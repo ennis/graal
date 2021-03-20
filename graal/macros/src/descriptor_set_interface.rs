@@ -1,6 +1,8 @@
 use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G};
-use darling::util::SpannedValue;
-use darling::{util::Flag, FromDeriveInput, FromField, FromMeta};
+use darling::{
+    util::{Flag, SpannedValue},
+    FromDeriveInput, FromField, FromMeta,
+};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::spanned::Spanned;
@@ -64,8 +66,7 @@ enum DescriptorClass {
     TexelBufferView,
 }
 
-pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenStream
-{
+pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenStream {
     let s: DescriptorStruct =
         <DescriptorStruct as FromDeriveInput>::from_derive_input(derive_input).unwrap();
     let struct_name = &s.ident;
@@ -311,6 +312,11 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenS
         impl #impl_generics #G::DescriptorSetInterface for #struct_name #ty_generics #where_clause {
             const LAYOUT: &'static [#G::DescriptorSetLayoutBindingInfo] = &[ #(#binding_infos,)* ];
             const UPDATE_TEMPLATE_ENTRIES: &'static [#G::vk::DescriptorUpdateTemplateEntry] = &[#(#update_template_entries,)*];
+
+            fn get_or_init_layout(init: impl FnOnce() -> #G::DescriptorSetAllocatorId) -> #G::DescriptorSetAllocatorId {
+                static LAYOUT_ID: #G::internal::OnceCell<#G::DescriptorSetAllocatorId> = #G::internal::OnceCell::new();
+                *LAYOUT_ID.get_or_init(init)
+            }
 
             unsafe fn update_descriptors(
                 &self,

@@ -1,7 +1,6 @@
 use proc_macro2::{Span, TokenStream};
-use syn::spanned::Spanned;
-use syn::Ident;
 use quote::quote;
+use syn::{spanned::Spanned, Ident};
 
 /// Checks that the derive input has a repr(C) attribute.
 pub(crate) fn has_repr_c_attr(ast: &syn::DeriveInput) -> bool {

@@ -1,9 +1,7 @@
 #[cfg(windows)]
 mod platform {
-    use crate::VULKAN_ENTRY;
-    use crate::VULKAN_INSTANCE;
-    use ash::extensions::khr::Win32Surface;
-    use ash::vk;
+    use crate::{VULKAN_ENTRY, VULKAN_INSTANCE};
+    use ash::{extensions::khr::Win32Surface, vk};
     use lazy_static::lazy_static;
     use raw_window_handle::RawWindowHandle;
     use std::os::raw::c_void;

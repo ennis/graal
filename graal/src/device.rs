@@ -1,10 +1,13 @@
-use crate::VULKAN_INSTANCE;
-use crate::VULKAN_ENTRY;
-use ash::version::{DeviceV1_0, InstanceV1_0};
-use ash::vk;
-use std::ffi::CStr;
-use std::os::raw::{c_char, c_void};
-use std::ptr;
+use crate::{VULKAN_ENTRY, VULKAN_INSTANCE};
+use ash::{
+    version::{DeviceV1_0, InstanceV1_0},
+    vk,
+};
+use std::{
+    ffi::CStr,
+    os::raw::{c_char, c_void},
+    ptr,
+};
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
@@ -288,7 +291,8 @@ impl Device {
                 transfer_queue_index,
             ]
             .iter()
-            .max().unwrap() as usize
+            .max()
+            .unwrap() as usize
                 + 1;
 
             let allocator_create_info = vk_mem::AllocatorCreateInfo {
@@ -304,9 +308,7 @@ impl Device {
             let allocator = vk_mem::Allocator::new(&allocator_create_info)
                 .expect("failed to create VMA allocator");
 
-
-            let vk_khr_swapchain =
-                ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
+            let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
             let vk_ext_debug_utils =
                 ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
 
@@ -322,7 +324,7 @@ impl Device {
                 allocator,
                 vk_khr_swapchain,
                 vk_khr_surface,
-                vk_ext_debug_utils
+                vk_ext_debug_utils,
             }
         }
     }

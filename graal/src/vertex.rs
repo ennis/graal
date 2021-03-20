@@ -1,9 +1,9 @@
-use crate::BufferData;
+use crate::{
+    typedesc::{PrimitiveType, TypeDesc},
+    BufferData,
+};
 use ash::vk;
-use crate::typedesc::TypeDesc;
-use crate::typedesc::PrimitiveType;
-use std::marker::PhantomData;
-use std::mem;
+use std::{marker::PhantomData, mem};
 
 /// Describes the type of indices contained in an index buffer.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -41,7 +41,7 @@ pub unsafe trait VertexAttributeType {
 }
 
 /// Wrapper type for normalized integer attributes.
-#[derive(Copy,Clone,Debug,Eq,PartialEq,Ord,PartialOrd,Hash,Default)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 #[repr(transparent)]
 pub struct Norm<T>(pub T);
 
@@ -207,7 +207,7 @@ impl_attrib_type!(
 pub struct VertexBufferView<T: VertexData> {
     pub buffer: vk::Buffer,
     pub offset: vk::DeviceSize,
-    pub _phantom: PhantomData<*const T>
+    pub _phantom: PhantomData<*const T>,
 }
 
 pub trait VertexBindingInterface {
@@ -223,7 +223,7 @@ impl<T: VertexData> VertexBindingInterface for VertexBufferView<T> {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct VertexInputBindingAttributes<'a> {
     pub base_location: u32,
-    pub attributes: &'a [VertexAttribute]
+    pub attributes: &'a [VertexAttribute],
 }
 
 pub trait VertexInputInterface {
@@ -238,14 +238,15 @@ pub mod vertex_macro_helpers {
         head: &'static [vk::VertexInputAttributeDescription],
         binding: u32,
         base_location: u32,
-        tail: &'static [VertexAttribute]) -> [vk::VertexInputAttributeDescription; N]
-    {
-        const NULL_ATTR : vk::VertexInputAttributeDescription = vk::VertexInputAttributeDescription {
-            location: 0,
-            binding: 0,
-            format: vk::Format::UNDEFINED,
-            offset: 0,
-        };
+        tail: &'static [VertexAttribute],
+    ) -> [vk::VertexInputAttributeDescription; N] {
+        const NULL_ATTR: vk::VertexInputAttributeDescription =
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::UNDEFINED,
+                offset: 0,
+            };
         let mut result = [NULL_ATTR; N];
         let mut i = 0;
         while i < head.len() {
@@ -266,4 +267,3 @@ pub mod vertex_macro_helpers {
         result
     }
 }
-

@@ -1,6 +1,8 @@
 use crate::G;
-use darling::util::SpannedValue;
-use darling::{util::Flag, FromDeriveInput, FromField, FromMeta};
+use darling::{
+    util::{Flag, SpannedValue},
+    FromDeriveInput, FromField, FromMeta,
+};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::spanned::Spanned;
