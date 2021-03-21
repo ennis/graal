@@ -99,7 +99,7 @@ pub fn vertex_input_interface_derive(input: proc_macro::TokenStream) -> proc_mac
     )
 }
 
-#[proc_macro_derive(FragmentOutputInterface, attributes(attachment))]
+#[proc_macro_derive(FragmentOutputInterface, attributes(attachment, framebuffer))]
 pub fn fragment_output_interface_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     derive_struct(
         "FragmentOutputInterface",

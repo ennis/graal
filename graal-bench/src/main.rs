@@ -1,8 +1,8 @@
 mod blit;
+mod bounding_box;
+mod camera;
 mod load_image;
 mod pipeline;
-mod camera;
-mod bounding_box;
 
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
@@ -121,8 +121,10 @@ struct MeshVertexInput {
     vertices: graal::VertexBufferView<Vertex3D>,
 }
 
-fn create_color_attachment_description(format: vk::Format, load_op: vk::AttachmentLoadOp) -> vk::AttachmentDescription
-{
+fn create_color_attachment_description(
+    format: vk::Format,
+    load_op: vk::AttachmentLoadOp,
+) -> vk::AttachmentDescription {
     vk::AttachmentDescription {
         flags: vk::AttachmentDescriptionFlags::MAY_ALIAS,
         format,
@@ -217,45 +219,70 @@ struct MeshRenderPass {
     render_pass: vk::RenderPass,
 }
 
-#[derive(FragmentOutputInterface)]
-struct GBuffers
-{
+#[derive(graal::FragmentOutputInterface)]
+struct GBuffers {
     /// Color buffer, R16G16B16A16_SFLOAT
     #[attachment(
-            R16G16B16A16_SFLOAT,
-            samples=1,
-            load_op=CLEAR,
-            store_op=STORE,
-            layout=COLOR_ATTACHMENT_OPTIMAL)]
+        color,
+        format = "R16G16B16A16_SFLOAT",
+        samples = 1,
+        load_op = "CLEAR",
+        store_op = "STORE",
+        layout = "COLOR_ATTACHMENT_OPTIMAL"
+    )]
     color: graal::ImageInfo,
 
     /// Normals, RG16_SFLOAT
     #[attachment(
-        R16G16_SFLOAT,
-        samples=1,
-        load_op=CLEAR,
-        store_op=STORE,
-        layout=COLOR_ATTACHMENT_OPTIMAL)]
+        color,
+        format = "R16G16_SFLOAT",
+        samples = 1,
+        load_op = "CLEAR",
+        store_op = "STORE",
+        layout = "COLOR_ATTACHMENT_OPTIMAL"
+    )]
     normal: graal::ImageInfo,
 
     /// Tangents: RG16_SFLOAT
     #[attachment(
-        R16G16_SFLOAT,
-        samples=1,
-        load_op=CLEAR,
-        store_op=STORE,
-        layout=COLOR_ATTACHMENT_OPTIMAL)]
+        color,
+        format = "R16G16_SFLOAT",
+        samples = 1,
+        load_op = "CLEAR",
+        store_op = "STORE",
+        layout = "COLOR_ATTACHMENT_OPTIMAL"
+    )]
     tangent: graal::ImageInfo,
 
     /// Depth: D32_SFLOAT
     #[attachment(
-        D32_SFLOAT,
-        samples=1,
-        load_op=CLEAR,
-        store_op=STORE,
-        layout=DEPTH_STENCIL_ATTACHMENT_OPTIMAL)]
+        depth,
+        format = "D32_SFLOAT",
+        samples = 1,
+        load_op = "CLEAR",
+        store_op = "STORE",
+        layout = "DEPTH_STENCIL_ATTACHMENT_OPTIMAL"
+    )]
     depth: graal::ImageInfo,
+
+    #[framebuffer]
+    framebuffer: vk::Framebuffer,
 }
+
+/*#[derive(PipelineInterface)]
+#[allow_additional_descriptor_sets(3)]
+#[allow_additional_push_constants]
+#[vertex_shader(MESH_VIS_SHADER_VERT)]
+#[fragment_shader(MESH_VIS_SHADER_VERT)]
+struct MeshPipelineInterface
+{
+    #[vertex_input] vertex_input: MeshVertexInput,
+    #[render_pass] render_pass: vk::RenderPass,
+    #[fragment_output] attachments: GBuffers,
+    #[descriptor_set(0)] globals: GlobalsInterface,
+    #[descriptor_set(1)] material: MaterialsInterface,
+    #[descriptor_set(2)] per_object: PerObjectInterface,
+}*/
 
 fn create_transient_gbuffer_color_image(
     batch: &graal::Batch,
@@ -324,9 +351,18 @@ impl MeshRenderPass {
         };
 
         let attachments = &[
-            create_color_attachment_description(vk::Format::R16G16B16A16_SFLOAT, vk::AttachmentLoadOp::CLEAR),
-            create_color_attachment_description(vk::Format::R16G16_SFLOAT, vk::AttachmentLoadOp::CLEAR),
-            create_color_attachment_description(vk::Format::R16G16_SFLOAT, vk::AttachmentLoadOp::CLEAR),
+            create_color_attachment_description(
+                vk::Format::R16G16B16A16_SFLOAT,
+                vk::AttachmentLoadOp::CLEAR,
+            ),
+            create_color_attachment_description(
+                vk::Format::R16G16_SFLOAT,
+                vk::AttachmentLoadOp::CLEAR,
+            ),
+            create_color_attachment_description(
+                vk::Format::R16G16_SFLOAT,
+                vk::AttachmentLoadOp::CLEAR,
+            ),
             // depth
             vk::AttachmentDescription {
                 flags: Default::default(),
@@ -338,7 +374,7 @@ impl MeshRenderPass {
                 stencil_store_op: vk::AttachmentStoreOp::DONT_CARE,
                 initial_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 final_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            }
+            },
         ];
 
         let color_attachments = &[
@@ -354,7 +390,7 @@ impl MeshRenderPass {
                 attachment: 2,
                 layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             },
-          ];
+        ];
 
         let subpasses = &[vk::SubpassDescription {
             flags: Default::default(),
@@ -386,7 +422,6 @@ impl MeshRenderPass {
                 .create_render_pass(&render_pass_create_info, None)
                 .unwrap()
         };
-
 
         MeshRenderPass {
             pipeline: Default::default(),
@@ -441,9 +476,7 @@ impl MeshRenderPass {
         let g = self.allocate_buffers(batch, target_size);
 
         // setup uniforms & descriptors
-        let globals = batch.upload(vk::BufferUsageFlags::UNIFORM_BUFFER, &Globals {
-
-        });
+        let globals = batch.upload(vk::BufferUsageFlags::UNIFORM_BUFFER, &Globals {});
 
         // setup the pass
         batch.add_graphics_pass("gbuffers", |pass| {
@@ -544,11 +577,9 @@ impl MeshRenderPass {
                         },
                     }],
                 );
-                context.device().cmd_bind_pipeline(
-                    cb,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline,
-                );
+                context
+                    .device()
+                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 context.device().cmd_draw(cb, 6, 1, 0, 0);
                 context.device().cmd_end_render_pass(cb);
             });

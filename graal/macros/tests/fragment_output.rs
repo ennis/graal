@@ -46,12 +46,10 @@ struct GBuffers {
         layout = "DEPTH_STENCIL_ATTACHMENT_OPTIMAL"
     )]
     depth: graal::ImageInfo,
+
+    #[framebuffer]
+    framebuffer: vk::Framebuffer,
 }
-/*    const ATTACHMENTS: &'static [vk::AttachmentDescription];
-    const COLOR_ATTACHMENTS: &'static [vk::AttachmentReference];
-    const DEPTH_ATTACHMENT: Option<&'static vk::AttachmentReference>;
-    const RENDER_PASS_CREATE_INFO: &'static vk::RenderPassCreateInfo;
-*/
 
 #[test]
 fn test_fragment_output() {

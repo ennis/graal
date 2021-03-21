@@ -23,7 +23,7 @@ use crate::{context::{
         ResourceTrackingInfo,
     },
     submission::CommandAllocator,
-}, device::Device, swapchain::Swapchain, vk::Handle, DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo, MAX_QUEUES, ImageInfo};
+}, device::Device, swapchain::Swapchain, vk::Handle, DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo, MAX_QUEUES, ImageInfo, FragmentOutputInterface, FragmentOutputInterfaceExt};
 use std::{
     cmp::Ordering,
     ops::{Index, IndexMut},
@@ -38,6 +38,7 @@ pub(crate) mod submission;
 pub use batch::{Batch, PassBuilder};
 pub use descriptor::DescriptorSetAllocatorId;
 use crate::context::resource::{ImageId, BufferId};
+use crate::vk::RenderPass;
 
 /// A number that uniquely identifies a batch.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
@@ -344,9 +345,11 @@ pub struct SwapchainImage {
 
 slotmap::new_key_type! {
     pub struct SwapchainId;
+    pub struct RenderPassId;
 }
 
 type SwapchainMap = SlotMap<SwapchainId, Swapchain>;
+type RenderPassMap = SlotMap<RenderPassId, vk::RenderPass>;
 
 /// Stores the set of resources owned by a currently executing batch.
 struct InFlightBatch {
@@ -391,6 +394,10 @@ pub struct Context {
     completed_batch_count: u64,
     /// Swapchains.
     swapchains: SwapchainMap,
+    /// ID-mapped render passes. These are used mostly to store the render passes for
+    /// fragment output interface types, but still be able to delete the objects when the context
+    /// is dropped.
+    render_passes: RenderPassMap,
     /// Batches that are currently executing on the GPU.
     in_flight: VecDeque<InFlightBatch>,
 }
@@ -432,6 +439,7 @@ impl Context {
             completed_batch_count: 0,
             resources: ResourceMap::with_key(),
             swapchains: SlotMap::with_key(),
+            render_passes: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             cache: Default::default(),
             semaphore_pool: vec![],
@@ -645,8 +653,21 @@ impl Context {
     }
 
     //
-    pub fn destroy_swapchain(&mut self, swapchain: SwapchainId) {
+    pub unsafe fn destroy_swapchain(&mut self, swapchain: SwapchainId) {
+        // TODO wait for the device to finish, then destroy swapchain
         unimplemented!()
+    }
+
+    /// Gets or creates the associated render pass object for the specified fragment output interface type.
+    pub fn get_or_create_render_pass_from_interface<T: FragmentOutputInterface>(
+        &mut self,
+    ) -> vk::RenderPass {
+        let id = T::get_or_init_render_pass(|| {
+            let render_pass = T::create_render_pass(self);
+            self.render_passes.insert(render_pass)
+        });
+
+        *self.render_passes.get(id).unwrap()
     }
 
     pub fn start_batch(&mut self) -> Batch {

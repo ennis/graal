@@ -14,7 +14,7 @@ pub use crate::{
             get_mip_level_count, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceId,
             ResourceMemoryInfo, BufferInfo, ImageInfo, ImageId, BufferId, TypedBufferInfo
         },
-        Batch, Context, DescriptorSetAllocatorId, SwapchainId,
+        Batch, Context, DescriptorSetAllocatorId, SwapchainId, RenderPassId
     },
     descriptor::{
         extract_descriptor_set_layouts_from_shader_stages, BufferDescriptor,
@@ -27,7 +27,7 @@ pub use crate::{
         VertexBindingInterface, VertexBufferView, VertexData, VertexInputBindingAttributes,
         VertexInputInterface, VertexInputInterfaceExt
     },
-    fragment_output::FragmentOutputInterface
+    fragment_output::{FragmentOutputInterface, FragmentOutputInterfaceExt}
 };
 pub(crate) use crate::{
     device::MAX_QUEUES,

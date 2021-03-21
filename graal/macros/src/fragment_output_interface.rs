@@ -18,7 +18,7 @@ struct FragmentOutputStruct {
     attrs: Vec<syn::Attribute>,
 }
 
-#[derive(FromField)]
+#[derive(Debug,FromField)]
 #[darling(attributes(attachment))]
 struct AttachmentAttr {
     format: syn::Ident,
@@ -36,6 +36,13 @@ struct AttachmentAttr {
     ty: syn::Type,
 }
 
+#[derive(FromField)]
+#[darling(attributes(framebuffer))]
+struct FramebufferAttr {
+    ident: Option<syn::Ident>
+}
+
+
 pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStream {
     let s: FragmentOutputStruct =
         <FragmentOutputStruct as FromDeriveInput>::from_derive_input(derive_input).unwrap();
@@ -45,86 +52,152 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
     let mut attachments = Vec::new();
     let mut color_attachments = Vec::new();
     let mut depth_attachment = None;
+    let mut create_transient_image_statements = Vec::new();
+    let mut create_image_view_statements = Vec::new();
+    let mut field_names = Vec::new();
+    let mut image_view_names = Vec::new();
+    let mut framebuffer_name = None;
+
+    // TODO reject tuple structs
+
+    eprintln!("num fields: {}", fields.len());
 
     for field in fields.iter() {
-        match <AttachmentAttr as FromField>::from_field(field) {
-            Ok(attr) => {
-                let attr: &AttachmentAttr = &attr;
-                let i_attachment = attachments.len() as u32;
-                let ty = &attr.ty;
+        let field_name = field.ident.as_ref().unwrap();
+        field_names.push(field_name);
 
-                let format = &attr.format;
-                let layout = &attr.layout;
-                let dont_care = &syn::Ident::new("DONT_CARE", Span::call_site());
-                let load_op = &attr.load_op.as_ref().unwrap_or(dont_care);
-                let store_op = &attr.store_op.as_ref().unwrap_or(dont_care);
+        if let Ok(attr) = <AttachmentAttr as FromField>::from_field(field) {
+            eprintln!("valid attachment attr");
+            let attr: AttachmentAttr = attr;
+            let i_attachment = attachments.len() as u32;
 
-                let samples = match attr.samples.deref() {
-                    None | Some(1) => syn::Ident::new("TYPE_1", Span::call_site()),
-                    Some(2) => syn::Ident::new("TYPE_2", Span::call_site()),
-                    Some(4) => syn::Ident::new("TYPE_4", Span::call_site()),
-                    Some(8) => syn::Ident::new("TYPE_8", Span::call_site()),
-                    Some(16) => syn::Ident::new("TYPE_16", Span::call_site()),
-                    Some(32) => syn::Ident::new("TYPE_32", Span::call_site()),
-                    Some(64) => syn::Ident::new("TYPE_64", Span::call_site()),
-                    _ => {
-                        attr.samples
-                            .span()
-                            .unwrap()
-                            .error("Invalid sample count.")
-                            .note("Valid values are: `1`, `2` ,`4`, `8`, `16`, `32`, `64`.")
-                            .emit();
-                        syn::Ident::new("TYPE_1", Span::call_site())
-                    }
-                };
+            dbg!(&attr);
 
-                attachments.push(quote! {
-                    #G::vk::AttachmentDescription {
-                        flags: #G::vk::AttachmentDescriptionFlags::empty(),
-                        format: #G::vk::Format::#format,
-                        samples: #G::vk::SampleCountFlags::TYPE_1,
-                        load_op: #G::vk::AttachmentLoadOp::#load_op,
-                        store_op: #G::vk::AttachmentStoreOp::#store_op,
-                        stencil_load_op: #G::vk::AttachmentLoadOp::DONT_CARE,   // TODO
-                        stencil_store_op: #G::vk::AttachmentStoreOp::DONT_CARE,
-                        initial_layout: #G::vk::ImageLayout::#layout,
-                        final_layout: #G::vk::ImageLayout::#layout,
-                    }
-                });
+            let format = attr.format;
+            let layout = attr.layout;
+            let dont_care = &syn::Ident::new("DONT_CARE", Span::call_site());
+            let load_op = attr.load_op.as_ref().unwrap_or(dont_care);
+            let store_op = attr.store_op.as_ref().unwrap_or(dont_care);
 
-                if attr.color.is_some() && attr.depth.is_some() {
-                    Diagnostic::spanned(
-                        &[attr.color.span().unwrap(), attr.depth.span().unwrap()][..],
-                        Level::Error,
-                        "Attachment cannot be both a color and a depth attachment within the same subpass.")
+            let samples = match attr.samples.deref() {
+                None | Some(1) => syn::Ident::new("TYPE_1", Span::call_site()),
+                Some(2) => syn::Ident::new("TYPE_2", Span::call_site()),
+                Some(4) => syn::Ident::new("TYPE_4", Span::call_site()),
+                Some(8) => syn::Ident::new("TYPE_8", Span::call_site()),
+                Some(16) => syn::Ident::new("TYPE_16", Span::call_site()),
+                Some(32) => syn::Ident::new("TYPE_32", Span::call_site()),
+                Some(64) => syn::Ident::new("TYPE_64", Span::call_site()),
+                _ => {
+                    attr.samples
+                        .span()
+                        .unwrap()
+                        .error("Invalid sample count.")
+                        .note("Valid values are: `1`, `2` ,`4`, `8`, `16`, `32`, `64`.")
                         .emit();
-                } else if attr.depth.is_some() {
-                    if depth_attachment.is_some() {
-                        attr.depth
-                            .span()
-                            .unwrap()
-                            .error("More than one depth attachment specified.")
-                            .emit();
-                    } else {
-                        depth_attachment = Some(quote! {
-                             #G::vk::AttachmentReference {
-                                attachment: #i_attachment,
-                                layout: #G::vk::ImageLayout::#layout,
-                             }
-                        });
-                    }
+                    syn::Ident::new("TYPE_1", Span::call_site())
+                }
+            };
+
+            attachments.push(quote! {
+                #G::vk::AttachmentDescription {
+                    flags: #G::vk::AttachmentDescriptionFlags::empty(),
+                    format: #G::vk::Format::#format,
+                    samples: #G::vk::SampleCountFlags::#samples,
+                    load_op: #G::vk::AttachmentLoadOp::#load_op,
+                    store_op: #G::vk::AttachmentStoreOp::#store_op,
+                    stencil_load_op: #G::vk::AttachmentLoadOp::DONT_CARE,   // TODO
+                    stencil_store_op: #G::vk::AttachmentStoreOp::DONT_CARE,
+                    initial_layout: #G::vk::ImageLayout::#layout,
+                    final_layout: #G::vk::ImageLayout::#layout,
+                }
+            });
+
+            let n_samples = attr.samples.unwrap_or(1);
+
+            create_transient_image_statements.push(quote! {
+                let #field_name = batch.context().create_image(
+                    stringify!(#struct_name::#field_name),
+                    &#G::ResourceMemoryInfo::DEVICE_LOCAL,
+                    &#G::ImageResourceCreateInfo {
+                        image_type: vk::ImageType::TYPE_2D,
+                        usage: vk::ImageUsageFlags::COLOR_ATTACHMENT // TODO control usage flags per-image
+                            | additional_usage,
+                        format: #G::vk::Format::#format,
+                        extent,
+                        mip_levels: 1,
+                        array_layers: 1,
+                        samples: #n_samples,
+                        tiling: #G::vk::ImageTiling::OPTIMAL,
+                    },
+                    true
+                );
+            });
+
+            let image_view_name = syn::Ident::new(
+                &format!("{}_view", field_name.to_string()),
+                Span::call_site(),
+            );
+
+            create_image_view_statements.push(quote! {
+                let #image_view_name = unsafe {
+                    batch.create_image_view(&#G::vk::ImageViewCreateInfo {
+                        flags: #G::vk::ImageViewCreateFlags::empty(),
+                        image: #field_name.handle,
+                        view_type: #G::vk::ImageViewType::TYPE_2D,
+                        format: #G::vk::Format::#format,
+                        components: #G::vk::ComponentMapping::default(),
+                        subresource_range: #G::vk::ImageSubresourceRange {
+                            aspect_mask: #G::vk::ImageAspectFlags::COLOR,   // TODO
+                            base_mip_level: 0,
+                            level_count: #G::vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: #G::vk::REMAINING_ARRAY_LAYERS,
+                        },
+                        .. Default::default()
+                    })
+                };
+            });
+
+            image_view_names.push(image_view_name);
+
+            if attr.color.is_some() && attr.depth.is_some() {
+                Diagnostic::spanned(
+                    &[attr.color.span().unwrap(), attr.depth.span().unwrap()][..],
+                    Level::Error,
+                    "Attachment cannot be both a color and a depth attachment within the same subpass.")
+                    .emit();
+            } else if attr.depth.is_some() {
+                if depth_attachment.is_some() {
+                    attr.depth
+                        .span()
+                        .unwrap()
+                        .error("More than one depth attachment specified.")
+                        .emit();
                 } else {
-                    color_attachments.push(quote! {
-                        #G::vk::AttachmentReference {
+                    depth_attachment = Some(quote! {
+                         #G::vk::AttachmentReference {
                             attachment: #i_attachment,
                             layout: #G::vk::ImageLayout::#layout,
-                        }
+                         }
                     });
                 }
+            } else {
+                color_attachments.push(quote! {
+                    #G::vk::AttachmentReference {
+                        attachment: #i_attachment,
+                        layout: #G::vk::ImageLayout::#layout,
+                    }
+                });
             }
-            Err(e) => {
-                e.write_errors();
-            }
+        } else if let Ok(attr) = <FramebufferAttr as FromField>::from_field(field) {
+            eprintln!("valid framebuffer attr");
+            framebuffer_name = Some(field_name);
+        } else {
+            panic!("at the disco");
+            field.span().unwrap()
+                .error("unrecognized field")
+                .note("all fields of a `FragmentOutputInteface` should be annotated with either `#[framebuffer]` or `#[attachment]`")
+                .emit()
         }
     }
 
@@ -134,11 +207,34 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
         (quote! { None }, quote! { ::std::ptr::null() })
     };
 
+    let framebuffer_init = if let Some(framebuffer_name) = framebuffer_name {
+        Some(quote! {
+            let #framebuffer_name = {
+                let render_pass = batch.context().get_or_create_render_pass_from_interface::<Self>();
+
+                #(#create_image_view_statements)*
+
+                unsafe {
+                    batch.create_framebuffer(
+                        size.0,
+                        size.1,
+                        1,
+                        render_pass,
+                        &[#(#image_view_names,)*],
+                    )
+                }
+            };
+        })
+    } else {
+        None
+    };
+
     let q = quote! {
-        impl #impl_generics #G::FragmentOutputInterface for #struct_name #ty_generics #where_clause {
+        unsafe impl #impl_generics #G::FragmentOutputInterface for #struct_name #ty_generics #where_clause {
             const ATTACHMENTS: &'static [#G::vk::AttachmentDescription] = &[ #(#attachments,)* ];
             const COLOR_ATTACHMENTS: &'static [#G::vk::AttachmentReference] = &[ #(#color_attachments,)* ];
             const DEPTH_ATTACHMENT: Option<#G::vk::AttachmentReference> = #depth_attachment;
+
             const RENDER_PASS_CREATE_INFO: &'static #G::vk::RenderPassCreateInfo = &#G::vk::RenderPassCreateInfo {
                 s_type: #G::vk::StructureType::RENDER_PASS_CREATE_INFO,
                 p_next: ::std::ptr::null(),
@@ -161,6 +257,27 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                 dependency_count: 0,
                 p_dependencies: ::std::ptr::null(),
             };
+
+            fn get_or_init_render_pass(init: impl FnOnce() -> #G::RenderPassId) -> #G::RenderPassId {
+                static RENDER_PASS_ID: #G::internal::OnceCell<#G::RenderPassId> = #G::internal::OnceCell::new();
+                *RENDER_PASS_ID.get_or_init(init)
+            }
+
+            fn new(batch: &#G::Batch, additional_usage: #G::vk::ImageUsageFlags, size: (u32, u32)) -> Self {
+                let extent = #G::vk::Extent3D {
+                    width: size.0,
+                    height: size.1,
+                    depth: 1
+                };
+
+                #(#create_transient_image_statements)*
+
+                #framebuffer_init
+
+                #struct_name {
+                    #(#field_names,)*
+                }
+            }
         }
     };
     q
