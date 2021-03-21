@@ -332,6 +332,13 @@ pub struct BufferInfo {
 }
 
 #[derive(Copy,Clone,Debug)]
+pub struct TypedBufferInfo<T: ?Sized> {
+    pub id: BufferId,
+    pub handle: vk::Buffer,
+    pub mapped_ptr: *mut T
+}
+
+#[derive(Copy,Clone,Debug)]
 pub struct ImageInfo {
     pub id: ImageId,
     pub handle: vk::Image,

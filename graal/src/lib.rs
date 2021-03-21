@@ -3,17 +3,16 @@
 
 pub use ash::{self, vk};
 pub use graal_macros::{
-    DescriptorSetInterface, StructuredBufferData, VertexData, VertexInputInterface,
+    DescriptorSetInterface, StructuredBufferData, VertexData, VertexInputInterface, FragmentOutputInterface
 };
 pub use graal_spirv::{layout, typedesc};
 
 pub use crate::{
     buffer::{BoolU32, BufferData, StructuredBufferData},
     context::{
-        batch::{BufferRef, MappedBufferRef},
         resource::{
             get_mip_level_count, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceId,
-            ResourceMemoryInfo, BufferInfo, ImageInfo, ImageId, BufferId
+            ResourceMemoryInfo, BufferInfo, ImageInfo, ImageId, BufferId, TypedBufferInfo
         },
         Batch, Context, DescriptorSetAllocatorId, SwapchainId,
     },
@@ -26,8 +25,9 @@ pub use crate::{
     vertex::{
         vertex_macro_helpers, IndexData, Norm, VertexAttribute, VertexAttributeType,
         VertexBindingInterface, VertexBufferView, VertexData, VertexInputBindingAttributes,
-        VertexInputInterface,
+        VertexInputInterface, VertexInputInterfaceExt
     },
+    fragment_output::FragmentOutputInterface
 };
 pub(crate) use crate::{
     device::MAX_QUEUES,
@@ -44,6 +44,7 @@ pub mod pipeline;
 pub mod surface;
 pub(crate) mod swapchain;
 pub(crate) mod vertex;
+pub(crate) mod fragment_output;
 
 /// For internal use by `graal_macros`.
 pub mod internal {

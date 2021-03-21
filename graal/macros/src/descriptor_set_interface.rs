@@ -1,4 +1,4 @@
-use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G};
+use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G, FieldList};
 use darling::{
     util::{Flag, SpannedValue},
     FromDeriveInput, FromField, FromMeta,
@@ -66,7 +66,7 @@ enum DescriptorClass {
     TexelBufferView,
 }
 
-pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenStream {
+pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStream {
     let s: DescriptorStruct =
         <DescriptorStruct as FromDeriveInput>::from_derive_input(derive_input).unwrap();
     let struct_name = &s.ident;
@@ -77,19 +77,6 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenS
     }
 
     let field_offsets_sizes = generate_field_offsets_and_sizes(derive_input);
-
-    let fields = match fields {
-        syn::Fields::Named(ref fields_named) => &fields_named.named,
-        syn::Fields::Unnamed(ref fields_unnamed) => &fields_unnamed.unnamed,
-        syn::Fields::Unit => {
-            derive_input
-                .span()
-                .unwrap()
-                .error("`DescriptorSetInterface` cannot be derived on unit structs")
-                .emit();
-            return Default::default();
-        }
-    };
 
     enum DescriptorType {
         Sampler,

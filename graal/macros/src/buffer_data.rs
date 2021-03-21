@@ -1,11 +1,11 @@
-use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G};
+use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G, FieldList};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{spanned::Spanned, Ident};
 
 pub fn generate_structured_buffer_data(
     derive_input: &syn::DeriveInput,
-    fields: &syn::Fields,
+    fields: &FieldList,
 ) -> TokenStream {
     if let Err(e) = ensure_repr_c("StructuredBufferData", derive_input) {
         return e;
@@ -13,19 +13,6 @@ pub fn generate_structured_buffer_data(
 
     let struct_name = &derive_input.ident;
     let field_offsets_sizes = generate_field_offsets_and_sizes(derive_input);
-
-    let fields = match *fields {
-        syn::Fields::Named(ref fields_named) => &fields_named.named,
-        syn::Fields::Unnamed(ref fields_unnamed) => &fields_unnamed.unnamed,
-        syn::Fields::Unit => {
-            derive_input
-                .span()
-                .unwrap()
-                .error("`StructuredBufferData` cannot be derived on unit structs")
-                .emit();
-            return Default::default();
-        }
-    };
 
     let mut struct_fields = Vec::new();
     let mut layouts = Vec::new();
@@ -75,26 +62,13 @@ pub fn generate_structured_buffer_data(
     }
 }
 
-pub fn generate_vertex_data(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenStream {
+pub fn generate_vertex_data(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStream {
     if let Err(e) = ensure_repr_c("VertexData", derive_input) {
         return e;
     }
 
     let struct_name = &derive_input.ident;
     let field_offsets_sizes = generate_field_offsets_and_sizes(derive_input);
-
-    let fields = match *fields {
-        syn::Fields::Named(ref fields_named) => &fields_named.named,
-        syn::Fields::Unnamed(ref fields_unnamed) => &fields_unnamed.unnamed,
-        syn::Fields::Unit => {
-            derive_input
-                .span()
-                .unwrap()
-                .error("`VertexData` cannot be derived on unit structs")
-                .emit();
-            return Default::default();
-        }
-    };
 
     let mut attribs = Vec::new();
 

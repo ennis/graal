@@ -1,19 +1,13 @@
-use crate::{
-    context::{
-        descriptor::DescriptorSet,
-        format_aspect_mask, is_read_access, is_write_access,
-        pass::{Pass, PassKind, ResourceAccess},
-        resource::{
-            BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
-            ResourceMemory,
-        },
-        BatchSerialNumber, InFlightBatch, SubmissionNumber, SwapchainImage,
+use crate::{context::{
+    descriptor::DescriptorSet,
+    format_aspect_mask, is_read_access, is_write_access,
+    pass::{Pass, PassKind, ResourceAccess},
+    resource::{
+        BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
+        ResourceMemory, TypedBufferInfo,
     },
-    descriptor::BufferDescriptor,
-    device::QueuesInfo,
-    vk, BufferResourceCreateInfo, Context, DescriptorSetInterface, Device, ImageInfo,
-    ImageResourceCreateInfo, ResourceMemoryInfo, MAX_QUEUES,
-};
+    BatchSerialNumber, InFlightBatch, SubmissionNumber, SwapchainImage,
+}, descriptor::BufferDescriptor, device::QueuesInfo, vk, BufferResourceCreateInfo, Context, DescriptorSetInterface, Device, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo, MAX_QUEUES, BufferData};
 use ash::version::DeviceV1_0;
 use std::{
     cell::{Ref, RefCell, RefMut},
@@ -54,117 +48,6 @@ fn add_execution_dependency(
         dst.wait_before = true;
         dst.wait_serials[q] = dst.wait_serials[q].max(src_snn.serial());
         dst.wait_dst_stages[q as usize] |= dst_stage_mask;
-    }
-}
-
-/// Lifetime-bound wrapper over a vulkan image view.
-#[derive(Copy, Clone, Debug)]
-#[repr(transparent)]
-pub struct ImageView<'a> {
-    pub(crate) handle: vk::ImageView,
-    _phantom: PhantomData<&'a ()>,
-}
-
-impl<'a> ImageView<'a> {
-    pub fn handle(&self) -> vk::ImageView {
-        self.handle
-    }
-}
-
-/// Lifetime-bound wrapper over a vulkan framebuffer.
-#[derive(Copy, Clone, Debug)]
-#[repr(transparent)]
-pub struct Framebuffer<'a> {
-    pub(crate) handle: vk::Framebuffer,
-    _phantom: PhantomData<&'a ()>,
-}
-
-impl<'a> Framebuffer<'a> {
-    pub fn handle(&self) -> vk::Framebuffer {
-        self.handle
-    }
-}
-
-/// Represents a reference to an image object containing T.
-#[derive(Copy, Clone, Debug)]
-pub struct ImageRef<'a> {
-    pub id: ImageId,
-    pub handle: vk::Image,
-    _phantom: PhantomData<&'a ()>,
-}
-
-/// Represents a reference to a buffer object containing T.
-/// FIXME: remove the borrow, it causes more trouble than necessary
-#[derive(Copy, Clone, Debug)]
-pub struct BufferRef<'a, T: ?Sized> {
-    pub id: BufferId,
-    pub handle: vk::Buffer,
-    //pub(crate) byte_size: usize,
-    _phantom: PhantomData<&'a T>,
-}
-
-impl<'a, T: ?Sized> BufferRef<'a, T> {
-    pub fn handle(&self) -> vk::Buffer {
-        self.handle
-    }
-}
-
-impl<'a, U> BufferRef<'a, [U]> {
-    /*pub fn len(&self) -> usize {
-        self.byte_size / mem::size_of::<U>()
-    }*/
-}
-
-/// A buffer mapped in memory with an associated lifetime.
-/// FIXME: it's tempting to accidentally move this into a command callback, which causes
-/// a lot of lifetime issues
-pub struct MappedBufferRef<'a, T: ?Sized> {
-    pub id: BufferId,
-    pub handle: vk::Buffer,
-    pub data: &'a mut T,
-}
-
-impl<'a, T: ?Sized> MappedBufferRef<'a, T> {
-    pub fn handle(&self) -> vk::Buffer {
-        self.handle
-    }
-
-    pub fn access(
-        &self,
-        pass: &mut PassBuilder<'a, '_>,
-        access_mask: vk::AccessFlags,
-        input_stage: vk::PipelineStageFlags,
-        output_stage: vk::PipelineStageFlags,
-    ) {
-        pass.register_buffer_access(self.id, access_mask, input_stage, output_stage);
-    }
-}
-
-impl<'a, T> MappedBufferRef<'a, MaybeUninit<T>> {
-    pub fn as_mut_ptr(&mut self) -> *mut T {
-        self.data.as_mut_ptr()
-    }
-
-    pub unsafe fn assume_init(self) -> MappedBufferRef<'a, T> {
-        MappedBufferRef {
-            id: self.id,
-            handle: self.handle,
-            data: self.data.assume_init_mut(),
-        }
-    }
-}
-
-impl<'a, U> MappedBufferRef<'a, [MaybeUninit<U>]> {
-    pub fn as_mut_ptr(&mut self) -> *mut U {
-        MaybeUninit::slice_as_mut_ptr(self.data)
-    }
-
-    pub unsafe fn assume_init(self) -> MappedBufferRef<'a, [U]> {
-        MappedBufferRef {
-            id: self.id,
-            handle: self.handle,
-            data: MaybeUninit::slice_assume_init_mut(self.data),
-        }
     }
 }
 
@@ -486,84 +369,46 @@ impl<'a> Batch<'a> {
         name: &str,
         memory_info: &ResourceMemoryInfo,
         image_create_info: &ImageResourceCreateInfo,
-    ) -> ImageRef {
+    ) -> ImageInfo {
         let mut inner = self.inner.borrow_mut();
-        let ImageInfo { id, handle } =
-            inner
-                .context
-                .create_image(name, memory_info, image_create_info, true);
-        ImageRef {
-            id,
-            handle,
-            _phantom: PhantomData,
-        }
+        inner
+            .context
+            .create_image(name, memory_info, image_create_info, true)
     }
 
     /// Creates a transient buffer.
-    pub fn create_transient_buffer<T>(
+    pub fn create_transient_buffer(
         &self,
         name: &str,
         memory_info: &ResourceMemoryInfo,
         buffer_create_info: &BufferResourceCreateInfo,
-    ) -> BufferRef<T> {
+    ) -> BufferInfo {
         let mut inner = self.inner.borrow_mut();
-        let BufferInfo { id, handle, .. } =
-            inner
-                .context
-                .create_buffer(name, memory_info, buffer_create_info, true);
-        BufferRef {
-            id,
-            handle,
-            _phantom: PhantomData,
-        }
+        inner
+            .context
+            .create_buffer(name, memory_info, buffer_create_info, true)
     }
 
     /// Creates a transient mapped buffer. The caller must ensure that `memory_info` describes
     /// a mappable buffer (HOST_VISIBLE).
-    pub fn create_mapped_buffer<T>(
+    pub fn create_mapped_buffer(
         &self,
         name: &str,
         memory_info: &ResourceMemoryInfo,
         buffer_create_info: &BufferResourceCreateInfo,
-    ) -> MappedBufferRef<MaybeUninit<T>> {
+    ) -> BufferInfo {
         assert!(memory_info
             .required_flags
             .contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
         let mut inner = self.inner.borrow_mut();
-        let BufferInfo {
-            id,
-            handle,
-            mapped_ptr,
-        } = inner
+        let buffer_info = inner
             .context
             .create_buffer(name, memory_info, buffer_create_info, true);
-        assert!(!mapped_ptr.is_null());
-        MappedBufferRef {
-            id,
-            handle,
-            data: unsafe { &mut *(mapped_ptr as *mut MaybeUninit<T>) },
-        }
+        assert!(!buffer_info.mapped_ptr.is_null());
+        buffer_info
     }
 
-    pub fn image_ref(&self, id: ImageId) -> ImageRef<'a> {
-        let handle = self.inner.borrow().context.image_handle(id);
-        ImageRef {
-            id,
-            handle,
-            _phantom: PhantomData,
-        }
-    }
-
-    pub unsafe fn buffer_ref<T>(&self, id: BufferId) -> BufferRef<'a, T> {
-        let handle = self.inner.borrow().context.buffer_handle(id);
-        BufferRef {
-            _phantom: PhantomData,
-            id,
-            handle,
-        }
-    }
-
-    pub fn add_graphics_pass(&self, name: &str, handler: impl FnOnce(&mut PassBuilder<'a,'_>)) {
+    pub fn add_graphics_pass(&self, name: &str, handler: impl FnOnce(&mut PassBuilder<'a, '_>)) {
         self.add_pass(name, PassKind::Render, false, handler)
     }
 
@@ -598,7 +443,7 @@ impl<'a> Batch<'a> {
             false,
             |builder| {
                 builder.add_image_usage(
-                    image.image_id,
+                    image.image_info.id,
                     vk::AccessFlags::MEMORY_READ,
                     vk::PipelineStageFlags::ALL_COMMANDS,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
@@ -640,12 +485,12 @@ impl<'a> Batch<'a> {
 
     /// Uploads the given object to a transient buffer with the given usage flags and returns the
     /// created buffer resource.
-    pub fn upload<'b, T: Copy>(
-        &'b self,
+    pub fn upload<T: Copy>(
+        &self,
         usage: vk::BufferUsageFlags,
         data: &T,
         name: Option<&str>,
-    ) -> BufferRef<'b, T> {
+    ) -> TypedBufferInfo<T> {
         let byte_size = mem::size_of::<T>();
         let BufferInfo {
             id,
@@ -655,10 +500,10 @@ impl<'a> Batch<'a> {
         unsafe {
             ptr::write(mapped_ptr as *mut T, *data);
         }
-        BufferRef {
+        TypedBufferInfo {
             id,
             handle,
-            _phantom: PhantomData,
+            mapped_ptr: mapped_ptr as *mut T,
         }
     }
 
@@ -674,7 +519,7 @@ impl<'a> Batch<'a> {
         usage: vk::BufferUsageFlags,
         data: &[T],
         name: Option<&str>,
-    ) -> BufferRef<[T]> {
+    ) -> TypedBufferInfo<[T]> {
         let byte_size = mem::size_of_val(data);
         let BufferInfo {
             id,
@@ -685,10 +530,11 @@ impl<'a> Batch<'a> {
         unsafe {
             ptr::copy_nonoverlapping(data.as_ptr(), mapped_ptr as *mut T, data.len());
         }
-        BufferRef {
+
+        TypedBufferInfo {
             id,
             handle,
-            _phantom: PhantomData,
+            mapped_ptr: ptr::slice_from_raw_parts_mut(mapped_ptr as *mut T, data.len()),
         }
     }
 
@@ -704,7 +550,7 @@ impl<'a> Batch<'a> {
         &self,
         usage: vk::BufferUsageFlags,
         name: Option<&str>,
-    ) -> MappedBufferRef<MaybeUninit<T>> {
+    ) -> TypedBufferInfo<T> {
         let byte_size = mem::size_of::<T>();
         let BufferInfo {
             id,
@@ -712,10 +558,10 @@ impl<'a> Batch<'a> {
             mapped_ptr,
         } = self.create_upload_buffer(usage, byte_size, name);
 
-        MappedBufferRef {
+        TypedBufferInfo {
             id,
             handle,
-            data: unsafe { &mut *(mapped_ptr as *mut MaybeUninit<T>) },
+            mapped_ptr: mapped_ptr as *mut T,
         }
     }
 
@@ -732,17 +578,17 @@ impl<'a> Batch<'a> {
         usage: vk::BufferUsageFlags,
         size: usize,
         name: Option<&str>,
-    ) -> MappedBufferRef<[MaybeUninit<T>]> {
+    ) -> TypedBufferInfo<[T]> {
         let byte_size = mem::size_of::<T>() * size;
         let BufferInfo {
             id,
             handle,
             mapped_ptr,
         } = self.create_upload_buffer(usage, byte_size, name);
-        MappedBufferRef {
+        TypedBufferInfo {
             id,
             handle,
-            data: unsafe { slice::from_raw_parts_mut(mapped_ptr as *mut MaybeUninit<T>, size) },
+            mapped_ptr: ptr::slice_from_raw_parts_mut(mapped_ptr as *mut T, size),
         }
     }
 
@@ -765,8 +611,10 @@ impl<'a> Batch<'a> {
         )
     }
 
+    /// Creates a descriptor set from an instance of a DescriptorSetInterface type.
     ///
-    pub fn create_descriptor_set<'b, T: DescriptorSetInterface + 'b>(
+    /// The returned descriptor set lives only for the duration of this batch.
+    pub unsafe fn create_descriptor_set<'b, T: DescriptorSetInterface + 'b>(
         &'b self,
         descriptors: &T,
     ) -> vk::DescriptorSet {
@@ -777,7 +625,14 @@ impl<'a> Batch<'a> {
         set.set
     }
 
-    pub unsafe fn create_image_view(&self, create_info: &vk::ImageViewCreateInfo) -> ImageView {
+    /// Creates a transient image view.
+    ///
+    /// Preconditions:
+    /// - the provided `vk::ImageViewCreateInfo` must be valid.
+    ///
+    /// The returned `vk::ImageView` can only be used in this current batch and is automatically
+    /// reclaimed after that.
+    pub unsafe fn create_image_view(&self, create_info: &vk::ImageViewCreateInfo) -> vk::ImageView {
         let mut inner = self.inner.borrow_mut();
         let handle = inner
             .context
@@ -786,29 +641,33 @@ impl<'a> Batch<'a> {
             .create_image_view(&create_info, None)
             .unwrap();
         inner.image_views.push(handle);
-        ImageView {
-            handle,
-            _phantom: Default::default(),
-        }
+        handle
     }
 
-    pub fn create_framebuffer<'b>(
-        &'b self,
+    /// Creates a transient framebuffer.
+    ///
+    /// Preconditions:
+    /// - render_pass must be a valid render pass object
+    /// - attachment must contain only valid image views
+    ///
+    /// The returned framebuffer lives only for the duration of this batch.
+    pub unsafe fn create_framebuffer(
+        &self,
         width: u32,
         height: u32,
         layers: u32,
         render_pass: vk::RenderPass,
-        attachments: &[ImageView<'b>],
-    ) -> Framebuffer<'b> {
+        attachments: &[vk::ImageView],
+    ) -> vk::Framebuffer {
         unsafe {
             let framebuffer_create_info = vk::FramebufferCreateInfo {
                 flags: Default::default(),
                 render_pass,
                 attachment_count: attachments.len() as u32,
-                p_attachments: attachments.as_ptr() as *const vk::ImageView,
-                width: 1024,
-                height: 768,
-                layers: 1,
+                p_attachments: attachments.as_ptr(),
+                width,
+                height,
+                layers,
                 ..Default::default()
             };
 
@@ -820,11 +679,7 @@ impl<'a> Batch<'a> {
                 .create_framebuffer(&framebuffer_create_info, None)
                 .unwrap();
             inner.framebuffers.push(handle);
-
-            Framebuffer {
-                handle,
-                _phantom: PhantomData,
-            }
+            handle
         }
     }
 

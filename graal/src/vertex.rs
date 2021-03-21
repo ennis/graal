@@ -1,5 +1,6 @@
 use crate::{
     typedesc::{PrimitiveType, TypeDesc},
+    vk::PipelineVertexInputStateCreateInfo,
     BufferData,
 };
 use ash::vk;
@@ -74,7 +75,7 @@ macro_rules! impl_attrib_type {
     ($t:ty, $equiv:expr, $fmt:ident) => {
         unsafe impl VertexAttributeType for $t {
             const EQUIVALENT_TYPE: TypeDesc<'static> = $equiv;
-            const FORMAT: Format = Format::$fmt;
+            const FORMAT: vk::Format = vk::Format::$fmt;
         }
     };
 }
@@ -151,6 +152,36 @@ impl_attrib_vector_type!([i8; 2], Int, R8G8_SINT);
 impl_attrib_vector_type!([i8; 3], Int, R8G8B8_SINT);
 impl_attrib_vector_type!([i8; 4], Int, R8G8B8A8_SINT);
 
+// Vertex types from glam --------------------------------------------------------------------------
+
+#[cfg(feature = "graal-glam")]
+impl_attrib_type!(glam::Vec2,
+    TypeDesc::Vector {
+        elem_ty: PrimitiveType::Float,
+        len: 2
+    },
+    R32G32_SFLOAT
+);
+
+#[cfg(feature = "graal-glam")]
+impl_attrib_type!(glam::Vec3,
+    TypeDesc::Vector {
+        elem_ty: PrimitiveType::Float,
+        len: 3
+    },
+    R32G32B32_SFLOAT
+);
+
+#[cfg(feature = "graal-glam")]
+impl_attrib_type!(glam::Vec4,
+    TypeDesc::Vector {
+        elem_ty: PrimitiveType::Float,
+        len: 4
+    },
+    R32G32B32A32_SFLOAT
+);
+
+
 // Index data types --------------------------------------------------------------------------------
 macro_rules! impl_index_data {
     ($t:ty, $fmt:ident) => {
@@ -162,44 +193,6 @@ macro_rules! impl_index_data {
 
 impl_index_data!(u16, U16);
 impl_index_data!(u32, U32);
-
-/*#[cfg(feature = "glm")]
-impl_attrib_type!(
-    nalgebra_glm::Vec2,
-    TypeDesc::Vector {
-        elem_ty: PrimitiveType::Float,
-        len: 2
-    },
-    R32G32_SFLOAT
-);
-#[cfg(feature = "glm")]
-impl_attrib_type!(
-    nalgebra_glm::Vec3,
-    TypeDesc::Vector {
-        elem_ty: PrimitiveType::Float,
-        len: 3
-    },
-    R32G32B32_SFLOAT
-);
-#[cfg(feature = "glm")]
-impl_attrib_type!(
-    nalgebra_glm::Vec4,
-    TypeDesc::Vector {
-        elem_ty: PrimitiveType::Float,
-        len: 4
-    },
-    R32G32B32A32_SFLOAT
-);
-
-#[cfg(feature = "glm")]
-impl_attrib_type!(
-    nalgebra_glm::U8Vec4,
-    TypeDesc::Vector {
-        elem_ty: PrimitiveType::Float,
-        len: 4
-    },
-    R8G8B8A8_UNORM // FIXME why UNORM and not UINT?
-);*/
 
 // --------------------------------------------------------------------------------
 
@@ -230,6 +223,27 @@ pub trait VertexInputInterface {
     const BINDINGS: &'static [vk::VertexInputBindingDescription];
     const ATTRIBUTES: &'static [vk::VertexInputAttributeDescription];
 }
+
+/// Extension trait for VertexInputInterface
+pub trait VertexInputInterfaceExt: VertexInputInterface {
+    /// Helper function to get a `vk::PipelineVertexInputStateCreateInfo` from this vertex input struct.
+    fn get_pipeline_vertex_input_state_create_info() -> vk::PipelineVertexInputStateCreateInfo;
+}
+
+impl<T: VertexInputInterface> VertexInputInterfaceExt for T {
+    fn get_pipeline_vertex_input_state_create_info() -> vk::PipelineVertexInputStateCreateInfo {
+        vk::PipelineVertexInputStateCreateInfo {
+            vertex_binding_description_count: Self::BINDINGS.len() as u32,
+            p_vertex_binding_descriptions: Self::BINDINGS.as_ptr(),
+            vertex_attribute_description_count: Self::ATTRIBUTES.len() as u32,
+            p_vertex_attribute_descriptions: Self::ATTRIBUTES.as_ptr(),
+            ..Default::default()
+        }
+    }
+}
+
+
+
 
 pub mod vertex_macro_helpers {
     use crate::{vk, VertexAttribute};

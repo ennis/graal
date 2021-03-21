@@ -16,20 +16,14 @@ use ash::{
 use fixedbitset::FixedBitSet;
 use slotmap::{SecondaryMap, SlotMap};
 
-use crate::{
-    context::{
-        descriptor::{DescriptorSet, DescriptorSetAllocator},
-        resource::{
-            ImageResource, Resource, ResourceId, ResourceKind, ResourceMap, ResourceMemory,
-            ResourceTrackingInfo,
-        },
-        submission::CommandAllocator,
+use crate::{context::{
+    descriptor::{DescriptorSet, DescriptorSetAllocator},
+    resource::{
+        ImageResource, Resource, ResourceId, ResourceKind, ResourceMap, ResourceMemory,
+        ResourceTrackingInfo,
     },
-    device::Device,
-    swapchain::Swapchain,
-    vk::Handle,
-    DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo, MAX_QUEUES,
-};
+    submission::CommandAllocator,
+}, device::Device, swapchain::Swapchain, vk::Handle, DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo, MAX_QUEUES, ImageInfo};
 use std::{
     cmp::Ordering,
     ops::{Index, IndexMut},
@@ -344,8 +338,8 @@ fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
 pub struct SwapchainImage {
     pub swapchain_id: SwapchainId,
     pub swapchain_handle: vk::SwapchainKHR,
-    pub image_id: ImageId,
     pub image_index: u32,
+    pub image_info: ImageInfo
 }
 
 slotmap::new_key_type! {
@@ -531,6 +525,23 @@ impl Context {
             // waited on them.
             self.recycle_semaphores(b.semaphores);
 
+            // We can recycle the memory allocated for descriptor sets.
+            unsafe {
+                self.recycle_descriptor_sets(b.descriptor_sets);
+            }
+
+            // Destroy all other batch-bound objects (framebuffers, image views, descriptor sets)
+            for fb in b.framebuffers {
+                unsafe {
+                    self.device.device.destroy_framebuffer(fb, None);
+                }
+            }
+            for img in b.image_views {
+                unsafe {
+                    self.device.device.destroy_image_view(img, None);
+                }
+            }
+
             // free transient allocations
             for alloc in b.transient_allocations.iter() {
                 self.device.allocator.free_memory(alloc).unwrap();
@@ -619,7 +630,10 @@ impl Context {
         SwapchainImage {
             swapchain_id,
             swapchain_handle,
-            image_id: ImageId(image_id),
+            image_info: ImageInfo {
+                id: ImageId(image_id),
+                handle: swapchain.images[image_index as usize]
+            },
             image_index,
         }
     }

@@ -1,4 +1,4 @@
-use crate::G;
+use crate::{G, FieldList};
 use darling::{
     util::{Flag, SpannedValue},
     FromDeriveInput, FromField, FromMeta,
@@ -30,17 +30,11 @@ struct LayoutAttr {
     ty: syn::Type,
 }
 
-pub fn generate(derive_input: &syn::DeriveInput, fields: &syn::Fields) -> TokenStream {
+pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStream {
     let s: VertexInputStruct =
         <VertexInputStruct as FromDeriveInput>::from_derive_input(derive_input).unwrap();
     let struct_name = &s.ident;
     let (impl_generics, ty_generics, where_clause) = s.generics.split_for_impl();
-
-    let fields = match fields {
-        syn::Fields::Named(ref fields_named) => &fields_named.named,
-        syn::Fields::Unnamed(ref fields_unnamed) => &fields_unnamed.unnamed,
-        syn::Fields::Unit => panic!("`VertexInputInterface` cannot be derived on unit structs"),
-    };
 
     let mut bindings = Vec::new();
     let mut attrib_count = Vec::new();

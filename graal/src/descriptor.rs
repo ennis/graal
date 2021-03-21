@@ -1,7 +1,4 @@
-use crate::{
-    internal::OnceCell,
-    BufferRef, DescriptorSetAllocatorId, Device, MappedBufferRef,
-};
+use crate::{internal::OnceCell, DescriptorSetAllocatorId, Device, TypedBufferInfo};
 use ash::{version::DeviceV1_0, vk};
 use graal_spirv as spirv;
 use slotmap::SlotMap;
@@ -137,37 +134,24 @@ unsafe impl<T: DescriptorSource, const N: usize> DescriptorSource for [T; N] {
 /// Strongly-typed buffer descriptor.
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug)]
-pub struct BufferDescriptor<'a, T> {
+pub struct BufferDescriptor<T> {
     pub(crate) descriptor: vk::DescriptorBufferInfo,
-    pub(crate) _phantom: PhantomData<&'a T>,
+    pub(crate) _phantom: PhantomData<*const T>,
 }
 
-unsafe impl<'a, T> DescriptorSource for BufferDescriptor<'a, T> {
+unsafe impl<T> DescriptorSource for BufferDescriptor<T> {
     const KIND: DescriptorWriteKind = DescriptorWriteKind::Buffer;
 }
 
-impl<'a, T> From<BufferRef<'a, T>> for BufferDescriptor<'a, T> {
-    fn from(buf: BufferRef<'a, T>) -> Self {
+impl<T> From<TypedBufferInfo<T>> for BufferDescriptor<T> {
+    fn from(b: TypedBufferInfo<T>) -> Self {
         BufferDescriptor {
             descriptor: vk::DescriptorBufferInfo {
-                buffer: buf.handle,
+                buffer: b.handle,
                 offset: 0,
-                range: vk::WHOLE_SIZE,
+                range: vk::WHOLE_SIZE
             },
-            _phantom: PhantomData,
-        }
-    }
-}
-
-impl<'a, T> From<MappedBufferRef<'a, T>> for BufferDescriptor<'a, T> {
-    fn from(buf: MappedBufferRef<'a, T>) -> Self {
-        BufferDescriptor {
-            descriptor: vk::DescriptorBufferInfo {
-                buffer: buf.handle,
-                offset: 0,
-                range: vk::WHOLE_SIZE,
-            },
-            _phantom: PhantomData,
+            _phantom: PhantomData
         }
     }
 }
