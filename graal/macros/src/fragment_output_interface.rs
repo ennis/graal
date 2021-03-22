@@ -18,7 +18,7 @@ struct FragmentOutputStruct {
     attrs: Vec<syn::Attribute>,
 }
 
-#[derive(Debug,FromField)]
+#[derive(Debug, FromField)]
 #[darling(attributes(attachment))]
 struct AttachmentAttr {
     format: syn::Ident,
@@ -36,13 +36,6 @@ struct AttachmentAttr {
     ty: syn::Type,
 }
 
-#[derive(FromField)]
-#[darling(attributes(framebuffer))]
-struct FramebufferAttr {
-    ident: Option<syn::Ident>
-}
-
-
 pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStream {
     let s: FragmentOutputStruct =
         <FragmentOutputStruct as FromDeriveInput>::from_derive_input(derive_input).unwrap();
@@ -55,8 +48,6 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
     let mut create_transient_image_statements = Vec::new();
     let mut create_image_view_statements = Vec::new();
     let mut field_names = Vec::new();
-    let mut image_view_names = Vec::new();
-    let mut framebuffer_name = None;
 
     // TODO reject tuple structs
 
@@ -114,58 +105,13 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
 
             let n_samples = attr.samples.unwrap_or(1);
 
-            create_transient_image_statements.push(quote! {
-                let #field_name = batch.context().create_image(
-                    stringify!(#struct_name::#field_name),
-                    &#G::ResourceMemoryInfo::DEVICE_LOCAL,
-                    &#G::ImageResourceCreateInfo {
-                        image_type: vk::ImageType::TYPE_2D,
-                        usage: vk::ImageUsageFlags::COLOR_ATTACHMENT // TODO control usage flags per-image
-                            | additional_usage,
-                        format: #G::vk::Format::#format,
-                        extent,
-                        mip_levels: 1,
-                        array_layers: 1,
-                        samples: #n_samples,
-                        tiling: #G::vk::ImageTiling::OPTIMAL,
-                    },
-                    true
-                );
-            });
-
-            let image_view_name = syn::Ident::new(
-                &format!("{}_view", field_name.to_string()),
-                Span::call_site(),
-            );
-
-            create_image_view_statements.push(quote! {
-                let #image_view_name = unsafe {
-                    batch.create_image_view(&#G::vk::ImageViewCreateInfo {
-                        flags: #G::vk::ImageViewCreateFlags::empty(),
-                        image: #field_name.handle,
-                        view_type: #G::vk::ImageViewType::TYPE_2D,
-                        format: #G::vk::Format::#format,
-                        components: #G::vk::ComponentMapping::default(),
-                        subresource_range: #G::vk::ImageSubresourceRange {
-                            aspect_mask: #G::vk::ImageAspectFlags::COLOR,   // TODO
-                            base_mip_level: 0,
-                            level_count: #G::vk::REMAINING_MIP_LEVELS,
-                            base_array_layer: 0,
-                            layer_count: #G::vk::REMAINING_ARRAY_LAYERS,
-                        },
-                        .. Default::default()
-                    })
-                };
-            });
-
-            image_view_names.push(image_view_name);
-
-            if attr.color.is_some() && attr.depth.is_some() {
+            let is_depth = if attr.color.is_some() && attr.depth.is_some() {
                 Diagnostic::spanned(
                     &[attr.color.span().unwrap(), attr.depth.span().unwrap()][..],
                     Level::Error,
                     "Attachment cannot be both a color and a depth attachment within the same subpass.")
                     .emit();
+                false
             } else if attr.depth.is_some() {
                 if depth_attachment.is_some() {
                     attr.depth
@@ -181,6 +127,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                          }
                     });
                 }
+                true
             } else {
                 color_attachments.push(quote! {
                     #G::vk::AttachmentReference {
@@ -188,15 +135,67 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                         layout: #G::vk::ImageLayout::#layout,
                     }
                 });
-            }
-        } else if let Ok(attr) = <FramebufferAttr as FromField>::from_field(field) {
-            eprintln!("valid framebuffer attr");
-            framebuffer_name = Some(field_name);
+                false
+            };
+
+            let debug_name = format!("{}::{}", struct_name.to_string(), field_name.to_string());
+
+            let base_usage = if is_depth {
+                quote! { #G::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT }
+            } else {
+                quote! { #G::vk::ImageUsageFlags::COLOR_ATTACHMENT }
+            };
+
+            let aspect_mask = if is_depth {
+                quote! { #G::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT }
+            } else {
+                quote! { #G::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT }
+            };
+
+            create_transient_image_statements.push(quote! {
+                let #field_name = batch.context().create_image(
+                    #debug_name,
+                    &#G::ResourceMemoryInfo::DEVICE_LOCAL,
+                    &#G::ImageResourceCreateInfo {
+                        image_type: #G::vk::ImageType::TYPE_2D,
+                        usage: #base_usage // TODO control usage flags per-image
+                            | additional_usage,
+                        format: #G::vk::Format::#format,
+                        extent,
+                        mip_levels: 1,
+                        array_layers: 1,
+                        samples: #n_samples,
+                        tiling: #G::vk::ImageTiling::OPTIMAL,
+                    },
+                    true
+                );
+            });
+
+            create_image_view_statements.push(quote! {
+                let #field_name = unsafe {
+                    cmd_ctx.create_image_view(&#G::vk::ImageViewCreateInfo {
+                        flags: #G::vk::ImageViewCreateFlags::empty(),
+                        image: self.#field_name.handle,
+                        view_type: #G::vk::ImageViewType::TYPE_2D,
+                        format: #G::vk::Format::#format,
+                        components: #G::vk::ComponentMapping::default(),
+                        subresource_range: #G::vk::ImageSubresourceRange {
+                            aspect_mask: #G::format_aspect_mask(#G::vk::Format::#format),   // TODO
+                            base_mip_level: 0,
+                            level_count: #G::vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: #G::vk::REMAINING_ARRAY_LAYERS,
+                        },
+                        .. Default::default()
+                    })
+                };
+            });
         } else {
-            panic!("at the disco");
-            field.span().unwrap()
-                .error("unrecognized field")
-                .note("all fields of a `FragmentOutputInteface` should be annotated with either `#[framebuffer]` or `#[attachment]`")
+            field
+                .span()
+                .unwrap()
+                .error("missing `#[attachment]` attribute")
+                .note("all fields of a `FragmentOutputInteface` should represent attachments")
                 .emit()
         }
     }
@@ -207,27 +206,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
         (quote! { None }, quote! { ::std::ptr::null() })
     };
 
-    let framebuffer_init = if let Some(framebuffer_name) = framebuffer_name {
-        Some(quote! {
-            let #framebuffer_name = {
-                let render_pass = batch.context().get_or_create_render_pass_from_interface::<Self>();
-
-                #(#create_image_view_statements)*
-
-                unsafe {
-                    batch.create_framebuffer(
-                        size.0,
-                        size.1,
-                        1,
-                        render_pass,
-                        &[#(#image_view_names,)*],
-                    )
-                }
-            };
-        })
-    } else {
-        None
-    };
+    let field_names = &field_names[..];
 
     let q = quote! {
         unsafe impl #impl_generics #G::FragmentOutputInterface for #struct_name #ty_generics #where_clause {
@@ -272,10 +251,24 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
 
                 #(#create_transient_image_statements)*
 
-                #framebuffer_init
-
                 #struct_name {
                     #(#field_names,)*
+                }
+            }
+
+            fn create_framebuffer(&self, cmd_ctx: &mut #G::CommandContext, size: (u32,u32)) -> #G::vk::Framebuffer {
+                let render_pass = cmd_ctx.get_or_create_render_pass_from_interface::<Self>();
+
+                #(#create_image_view_statements)*
+
+                unsafe {
+                    cmd_ctx.create_framebuffer(
+                        size.0,
+                        size.1,
+                        1,
+                        render_pass,
+                        &[#(#field_names,)*],
+                    )
                 }
             }
         }

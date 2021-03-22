@@ -26,6 +26,20 @@ pub struct Camera {
     pub projection: glam::Mat4,
 }
 
+impl Default for Camera {
+    fn default() -> Self {
+        Camera {
+            frustum: Default::default(),
+            view: glam::Mat4::look_at_rh(
+                glam::vec3(0.0, 0.0, -1.0),
+                glam::vec3(0.0, 0.0, 0.0),
+                glam::Vec3::Y,
+            ),
+            projection: glam::Mat4::perspective_rh(std::f32::consts::PI / 2.0, 1.0, 0.001, 10.0),
+        }
+    }
+}
+
 /// A camera controller that generates `Camera` instances.
 ///
 /// TODO describe parameters
@@ -45,14 +59,14 @@ pub struct CameraControl {
 impl Default for CameraControl {
     fn default() -> CameraControl {
         CameraControl {
-            fov_y_radians: f32::consts::PI / 2.0,
+            fov_y_radians: std::f32::consts::PI / 2.0,
             aspect_ratio: 1.0,
             z_near: 0.001,
             z_far: 10.0,
             zoom: 1.0,
             orbit_radius: 1.0,
             theta: 0.0,
-            phi: f32::consts::PI / 2.0,
+            phi: std::f32::consts::PI / 2.0,
             target: glam::Vec3A::new(0.0, 0.0, 0.0),
         }
     }
@@ -68,7 +82,7 @@ impl CameraControl {
     pub fn center_on_bounds(&mut self, bounds: &BoundingBox, fov_y_radians: f32) {
         let size = bounds.size().max_element();
         let center = bounds.center();
-        let cam_dist = (0.5 * size) / f32::tan(0.5 * fovy);
+        let cam_dist = (0.5 * size) / f32::tan(0.5 * fov_y_radians);
 
         self.orbit_radius = cam_dist;
         self.target = center;
@@ -90,7 +104,11 @@ impl CameraControl {
     /// Returns the look-at matrix
     fn get_look_at(&self) -> glam::Mat4 {
         let dir = self.orbit_to_cartesian();
-        glam::Mat4::look_at_rh((self.target + dir).into(), self.target.into(), glam::Vec3::Y)
+        glam::Mat4::look_at_rh(
+            (self.target + dir).into(),
+            self.target.into(),
+            glam::Vec3::Y,
+        )
     }
 
     /// Returns a `Camera` for the current viewpoint.

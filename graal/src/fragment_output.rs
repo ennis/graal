@@ -1,4 +1,5 @@
 use crate::{ash::version::DeviceV1_0, context::RenderPassId, vk, vk::RenderPass, Batch, Context};
+use crate::context::CommandContext;
 
 /// Types that describe a fragment output interface (a set of images that act as attachments).
 /// They contain the images that should be bound as attachments and metadata to create
@@ -28,6 +29,9 @@ pub unsafe trait FragmentOutputInterface {
     fn new(batch: &Batch, additional_usage: vk::ImageUsageFlags, size: (u32, u32)) -> Self
     where
         Self: Sized;
+
+    /// Creates a framebuffer composed of all attachments in `self`.
+    fn create_framebuffer(&self, cctx: &mut CommandContext, size: (u32, u32)) -> vk::Framebuffer;
 }
 
 pub trait FragmentOutputInterfaceExt: FragmentOutputInterface {

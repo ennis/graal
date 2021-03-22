@@ -1,6 +1,6 @@
 use graal::{ash::version::DeviceV1_0, vk, ImageInfo};
 
-fn blit_images(
+pub fn blit_images(
     batch: &graal::Batch,
     src_image: ImageInfo,
     dst_image: ImageInfo,
@@ -23,7 +23,7 @@ fn blit_images(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
 
-        pass.set_commands(|context, command_buffer| {
+        pass.set_commands(move |context, command_buffer| {
             let regions = &[vk::ImageBlit {
                 src_subresource: vk::ImageSubresourceLayers {
                     aspect_mask,

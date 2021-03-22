@@ -1,10 +1,14 @@
-use crate::{context::{QueueSerialNumbers, SubmissionNumber}, Context, MAX_QUEUES, ResourceId};
-use ash::vk;
+use crate::{
+    context::{descriptor::DescriptorSet, QueueSerialNumbers, SubmissionNumber},
+    Context, DescriptorSetInterface, ResourceId, MAX_QUEUES,
+};
+use ash::{version::DeviceV1_0, vk};
 use std::{
     cmp::Ordering,
     fmt,
     ops::{Index, IndexMut},
 };
+use crate::context::submission::CommandContext;
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ResourceAccess {
@@ -54,7 +58,7 @@ pub(crate) struct Pass<'a> {
     pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
     pub(crate) wait_binary_semaphores: Vec<vk::Semaphore>,
     pub(crate) kind: PassKind,
-    pub(crate) commands: Option<Box<dyn FnOnce(&Context, vk::CommandBuffer) + 'a>>,
+    pub(crate) commands: Option<Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>>,
 }
 
 impl<'a> Pass<'a> {

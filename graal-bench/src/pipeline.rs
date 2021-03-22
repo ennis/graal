@@ -1,20 +1,24 @@
 use graal::vk;
 use std::ptr;
 
-static INPUT_ASSEMBLY_STATE_TRIANGLE_LIST: vk::PipelineInputAssemblyStateCreateInfo =
+fn input_assembly_state_triangle_list() -> vk::PipelineInputAssemblyStateCreateInfo {
     vk::PipelineInputAssemblyStateCreateInfo {
+        s_type: vk::StructureType::PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+        p_next: ::std::ptr::null(),
+        flags: vk::PipelineInputAssemblyStateCreateFlags::empty(),
+        primitive_restart_enable: vk::FALSE,
         topology: vk::PrimitiveTopology::TRIANGLE_LIST,
-        primitive_restart_enable: 0,
-        ..Default::default()
-    };
+    }
+}
 
-static VIEWPORT_STATE_SINGLE_VIEWPORT_SCISSOR: vk::PipelineViewportStateCreateInfo =
+fn viewport_state_single_viewport_scissor() -> vk::PipelineViewportStateCreateInfo {
     vk::PipelineViewportStateCreateInfo {
-        flags: Default::default(),
+        s_type: vk::StructureType::PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+        p_next: ::std::ptr::null(),
+        flags: vk::PipelineViewportStateCreateFlags::default(),
         viewport_count: 1,
-        p_viewports: ptr::null(),
+        p_viewports: ::std::ptr::null(),
         scissor_count: 1,
-        p_scissors: ptr::null(),
-        ..Default::default()
-    };
-
+        p_scissors: ::std::ptr::null(),
+    }
+}

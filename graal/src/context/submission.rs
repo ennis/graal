@@ -1,19 +1,130 @@
-use crate::{
-    context::{
-        pass::{Pass, PassKind},
-        QueueSerialNumbers, SubmissionNumber,
-    },
-    vk, Context, Device, MAX_QUEUES,
-};
+use crate::{context::{
+    pass::{Pass, PassKind},
+    QueueSerialNumbers, SubmissionNumber,
+}, vk, Context, Device, MAX_QUEUES, DescriptorSetInterface};
 
 use ash::version::{DeviceV1_0, DeviceV1_2};
 use std::{
     ffi::{c_void, CString},
     ptr,
 };
+use crate::context::descriptor::DescriptorSet;
+use std::ops::{Deref, DerefMut};
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
 const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
+
+/// Resources created at submission time.
+struct SubmissionTimeResources {
+    /// Image views created in this batch
+    image_views: Vec<vk::ImageView>,
+    /// Framebuffers created in this batch
+    framebuffers: Vec<vk::Framebuffer>,
+    descriptor_sets: Vec<DescriptorSet>,
+}
+
+impl SubmissionTimeResources {
+    fn new() -> SubmissionTimeResources {
+        SubmissionTimeResources {
+            image_views: vec![],
+            framebuffers: vec![],
+            descriptor_sets: vec![]
+        }
+    }
+}
+
+/// Context passed to the command callbacks.
+pub struct CommandContext<'a> {
+    context: &'a mut Context,
+    resources: &'a mut SubmissionTimeResources,
+}
+
+impl<'a> Deref for CommandContext<'a> {
+    type Target = Context;
+
+    fn deref(&self) -> &Context {
+        self.context
+    }
+}
+
+impl<'a> DerefMut for CommandContext<'a> {
+    fn deref_mut(&mut self) -> &mut Context {
+        self.context
+    }
+}
+
+impl<'a> CommandContext<'a> {
+    /// Creates a descriptor set from an instance of a DescriptorSetInterface type.
+    ///
+    /// The returned descriptor set lives only for the duration of this pass.
+    pub unsafe fn create_descriptor_set<T: DescriptorSetInterface>(
+        &mut self,
+        descriptors: &T,
+    ) -> vk::DescriptorSet {
+        let set = self.context.create_descriptor_set(descriptors);
+        self.resources.descriptor_sets.push(set);
+        set.set
+    }
+
+    /// Creates a transient image view.
+    ///
+    /// Preconditions:
+    /// - the provided `vk::ImageViewCreateInfo` must be valid.
+    ///
+    /// The returned `vk::ImageView` can only be used in this current batch and is automatically
+    /// reclaimed after that.
+    pub unsafe fn create_image_view(
+        &mut self,
+        create_info: &vk::ImageViewCreateInfo,
+    ) -> vk::ImageView {
+        let handle = self
+            .context
+            .device
+            .device
+            .create_image_view(&create_info, None)
+            .unwrap();
+        self.resources.image_views.push(handle);
+        handle
+    }
+
+    /// Creates a transient framebuffer.
+    ///
+    /// Preconditions:
+    /// - render_pass must be a valid render pass object
+    /// - attachment must contain only valid image views
+    ///
+    /// The returned framebuffer lives only for the duration of this batch.
+    pub unsafe fn create_framebuffer(
+        &mut self,
+        width: u32,
+        height: u32,
+        layers: u32,
+        render_pass: vk::RenderPass,
+        attachments: &[vk::ImageView],
+    ) -> vk::Framebuffer {
+        unsafe {
+            let framebuffer_create_info = vk::FramebufferCreateInfo {
+                flags: Default::default(),
+                render_pass,
+                attachment_count: attachments.len() as u32,
+                p_attachments: attachments.as_ptr(),
+                width,
+                height,
+                layers,
+                ..Default::default()
+            };
+
+            let handle = self
+                .context
+                .device
+                .device
+                .create_framebuffer(&framebuffer_create_info, None)
+                .unwrap();
+            self.resources.framebuffers.push(handle);
+            handle
+        }
+    }
+}
 
 pub(crate) struct CommandAllocator {
     queue_family: u32,
@@ -106,6 +217,12 @@ pub(crate) struct BatchSubmissionResult {
     /// All semaphores used in this batch. When the batch is complete, those
     /// semaphores are guaranteed to be in the unsignalled state.
     pub(crate) semaphores: Vec<vk::Semaphore>,
+    /// Image views created during command buffer creation.
+    pub(crate) image_views: Vec<vk::ImageView>,
+    /// Framebuffers created during command buffer creation.
+    pub(crate) framebuffers: Vec<vk::Framebuffer>,
+    /// Descriptor sets created during command buffer creation.
+    pub(crate) descriptor_sets: Vec<DescriptorSet>,
 }
 
 impl Context {
@@ -245,6 +362,7 @@ impl Context {
         let mut cmd_pools: [Option<CommandAllocator>; MAX_QUEUES] = Default::default();
         // all binary semaphores waited on
         let mut used_semaphores = Vec::new();
+        let mut submission_time_resources = SubmissionTimeResources::new();
 
         for p in passes.iter_mut() {
             let q = p.snn.queue();
@@ -377,7 +495,11 @@ impl Context {
                 }
                 _ => {
                     if let Some(handler) = p.commands.take() {
-                        handler(self, cb);
+                        let mut cctx = CommandContext {
+                            context: self,
+                            resources: &mut submission_time_resources
+                        };
+                        handler(&mut cctx, cb);
                     }
 
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
@@ -412,6 +534,9 @@ impl Context {
             command_pools,
             signalled_serials: self.last_signalled_serials,
             semaphores: used_semaphores,
+            image_views: submission_time_resources.image_views,
+            framebuffers: submission_time_resources.framebuffers,
+            descriptor_sets: submission_time_resources.descriptor_sets
         }
     }
 

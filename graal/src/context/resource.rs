@@ -704,12 +704,12 @@ impl Context {
         for &tmp in temporaries {
             if let Some(alloc_state) = alloc_map.get(tmp) {
                 println!(
-                    "{} => {:?}",
+                    "`{}` => {:?}",
                     self.resources.get(tmp).unwrap().name,
                     alloc_state
                 );
             } else {
-                println!("{} => N/A", self.resources.get(tmp).unwrap().name);
+                println!("`{}` => N/A", self.resources.get(tmp).unwrap().name);
             }
         }
 

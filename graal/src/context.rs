@@ -14,7 +14,7 @@ use ash::{
     vk::BufferUsageFlags,
 };
 use fixedbitset::FixedBitSet;
-use slotmap::{SecondaryMap, SlotMap};
+use slotmap::{SecondaryMap, SlotMap, Key};
 
 use crate::{context::{
     descriptor::{DescriptorSet, DescriptorSetAllocator},
@@ -35,6 +35,7 @@ pub(crate) mod pass;
 pub(crate) mod resource;
 pub(crate) mod submission;
 
+pub use submission::CommandContext;
 pub use batch::{Batch, PassBuilder};
 pub use descriptor::DescriptorSetAllocatorId;
 use crate::context::resource::{ImageId, BufferId};
@@ -323,7 +324,7 @@ fn is_stencil_only_format(fmt: vk::Format) -> bool {
     }
 }
 
-fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
+pub fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
     if is_depth_only_format(fmt) {
         vk::ImageAspectFlags::DEPTH
     } else if is_stencil_only_format(fmt) {
@@ -491,7 +492,7 @@ impl Context {
         self.completed_batch_count >= serial.0
     }
 
-    /*fn image_resource_by_handle(&self, handle: vk::Image) -> ResourceId {
+    fn image_resource_by_handle(&self, handle: vk::Image) -> ResourceId {
         self.resources
             .iter()
             .find_map(|(id, r)| match &r.kind {
@@ -505,7 +506,23 @@ impl Context {
                 _ => None,
             })
             .unwrap_or(ResourceId::null())
-    }*/
+    }
+
+    fn buffer_resource_by_handle(&self, handle: vk::Buffer) -> ResourceId {
+        self.resources
+            .iter()
+            .find_map(|(id, r)| match &r.kind {
+                ResourceKind::Buffer(buf) => {
+                    if buf.handle == handle {
+                        Some(id)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            })
+            .unwrap_or(ResourceId::null())
+    }
 
     fn get_next_serial(&mut self) -> u64 {
         self.next_serial += 1;
@@ -680,3 +697,5 @@ impl Drop for Context {
         // TODO
     }
 }
+
+

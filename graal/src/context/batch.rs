@@ -1,14 +1,21 @@
-use crate::{context::{
-    descriptor::DescriptorSet,
-    format_aspect_mask, is_read_access, is_write_access,
-    pass::{Pass, PassKind, ResourceAccess},
-    resource::{
-        BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
-        ResourceMemory, TypedBufferInfo,
+use crate::{
+    context::{
+        descriptor::DescriptorSet,
+        format_aspect_mask, is_read_access, is_write_access,
+        pass::{Pass, PassKind, ResourceAccess},
+        resource::{
+            BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
+            ResourceMemory, TypedBufferInfo,
+        },
+        BatchSerialNumber, CommandContext, InFlightBatch, SubmissionNumber, SwapchainImage,
     },
-    BatchSerialNumber, InFlightBatch, SubmissionNumber, SwapchainImage,
-}, descriptor::BufferDescriptor, device::QueuesInfo, vk, BufferResourceCreateInfo, Context, DescriptorSetInterface, Device, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo, MAX_QUEUES, BufferData};
+    descriptor::BufferDescriptor,
+    device::QueuesInfo,
+    vk, BufferData, BufferResourceCreateInfo, Context, DescriptorSetInterface, Device, ImageInfo,
+    ImageResourceCreateInfo, ResourceMemoryInfo, MAX_QUEUES,
+};
 use ash::version::DeviceV1_0;
+use slotmap::Key;
 use std::{
     cell::{Ref, RefCell, RefMut},
     marker::PhantomData,
@@ -114,7 +121,10 @@ impl<'a, 'batch> PassBuilder<'a, 'batch> {
 
     /// Sets the command handler for this pass.
     /// The handler will be called when building the command buffer, on batch submission.
-    pub fn set_commands(&mut self, commands: impl FnOnce(&Context, vk::CommandBuffer) + 'a) {
+    pub fn set_commands(
+        &mut self,
+        commands: impl FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a,
+    ) {
         self.pass.commands = Some(Box::new(commands));
     }
 }
@@ -128,11 +138,6 @@ struct BatchInner<'a> {
     temporary_set: TemporarySet,
     /// List of passes
     passes: Vec<Pass<'a>>,
-    /// Image views created in this batch
-    image_views: Vec<vk::ImageView>,
-    /// Framebuffers created in this batch
-    framebuffers: Vec<vk::Framebuffer>,
-    descriptor_sets: Vec<DescriptorSet>,
 }
 
 impl<'a> BatchInner<'a> {
@@ -230,15 +235,19 @@ impl<'a> BatchInner<'a> {
         // see the last version of the resource.
 
         // are all writes to the resource visible to the requested access type?
-        let writes_visible =
-            // resource was last written in a previous batch, so all writes are made visible
-            // by the semaphore wait inserted by the execution dependency
-            resource.tracking.writer.serial() < self.base_serial ||
-                // resource visible to all MEMORY_READ, or to the requested mask
-                resource
-                    .tracking
-                    .visibility_mask
-                    .contains(vk::AccessFlags::MEMORY_READ | access.access_mask);
+        // resource was last written in a previous batch, so all writes are made visible
+        // by the semaphore wait inserted by the execution dependency (FIXME is that true? is it not "available" only?)
+        // resource.tracking.writer.serial() <= self.base_serial ||
+        // resource visible to all MEMORY_READ, or to the requested mask
+        let writes_visible = resource
+            .tracking
+            .visibility_mask
+            .contains(access.access_mask)
+            || resource
+                .tracking
+                .visibility_mask
+                .contains(vk::AccessFlags::MEMORY_READ | access.access_mask);
+
         // is the layout of the resource different? do we need a transition?
         let layout_transition = resource.tracking.layout != access.layout;
         // is there a possible write-after-write hazard, that requires a memory dependency?
@@ -246,9 +255,9 @@ impl<'a> BatchInner<'a> {
             is_write && is_write_access(resource.tracking.availability_mask);
 
         if !writes_visible || layout_transition || write_after_write_hazard {
-            // if the last writer of the serial is in another batch, all writes are made available (FIXME and visible?) because of the semaphore
+            // if the last writer of the serial is in another batch, all writes are made available because of the semaphore
             // wait inserted by the execution dependency. Otherwise, we need to consider the available writes on the resource.
-            let src_access_mask = if resource.tracking.writer.serial() < self.base_serial {
+            let src_access_mask = if resource.tracking.writer.serial() <= self.base_serial {
                 vk::AccessFlags::empty()
             } else {
                 resource.tracking.availability_mask
@@ -346,9 +355,6 @@ impl<'a> Batch<'a> {
                 temporaries: vec![],
                 temporary_set: TemporarySet::new(),
                 passes: vec![],
-                image_views: vec![],
-                framebuffers: vec![],
-                descriptor_sets: vec![],
             }),
         }
     }
@@ -611,83 +617,15 @@ impl<'a> Batch<'a> {
         )
     }
 
-    /// Creates a descriptor set from an instance of a DescriptorSetInterface type.
-    ///
-    /// The returned descriptor set lives only for the duration of this batch.
-    pub unsafe fn create_descriptor_set<'b, T: DescriptorSetInterface + 'b>(
-        &'b self,
-        descriptors: &T,
-    ) -> vk::DescriptorSet {
-        let serial = self.serial();
-        let mut inner = self.inner.borrow_mut();
-        let set = inner.context.create_descriptor_set(descriptors);
-        inner.descriptor_sets.push(set);
-        set.set
-    }
-
-    /// Creates a transient image view.
-    ///
-    /// Preconditions:
-    /// - the provided `vk::ImageViewCreateInfo` must be valid.
-    ///
-    /// The returned `vk::ImageView` can only be used in this current batch and is automatically
-    /// reclaimed after that.
-    pub unsafe fn create_image_view(&self, create_info: &vk::ImageViewCreateInfo) -> vk::ImageView {
-        let mut inner = self.inner.borrow_mut();
-        let handle = inner
-            .context
-            .device
-            .device
-            .create_image_view(&create_info, None)
-            .unwrap();
-        inner.image_views.push(handle);
-        handle
-    }
-
-    /// Creates a transient framebuffer.
-    ///
-    /// Preconditions:
-    /// - render_pass must be a valid render pass object
-    /// - attachment must contain only valid image views
-    ///
-    /// The returned framebuffer lives only for the duration of this batch.
-    pub unsafe fn create_framebuffer(
-        &self,
-        width: u32,
-        height: u32,
-        layers: u32,
-        render_pass: vk::RenderPass,
-        attachments: &[vk::ImageView],
-    ) -> vk::Framebuffer {
-        unsafe {
-            let framebuffer_create_info = vk::FramebufferCreateInfo {
-                flags: Default::default(),
-                render_pass,
-                attachment_count: attachments.len() as u32,
-                p_attachments: attachments.as_ptr(),
-                width,
-                height,
-                layers,
-                ..Default::default()
-            };
-
-            let mut inner = self.inner.borrow_mut();
-            let handle = inner
-                .context
-                .device
-                .device
-                .create_framebuffer(&framebuffer_create_info, None)
-                .unwrap();
-            inner.framebuffers.push(handle);
-            handle
-        }
-    }
-
     /// Finishes building the batch and submits all the passes to the command queues.
     pub fn finish(mut self) {
         println!("====== Batch #{} ======", self.batch_serial.0);
-        /*println!("Passes:");
-        for p in self.passes.iter() {
+
+        let mut inner = self.inner.into_inner();
+        let context = inner.context;
+
+        println!("Passes:");
+        for p in inner.passes.iter() {
             println!("- `{}` ({:?})", p.name, p.snn);
             if p.wait_before {
                 println!("    semaphore wait:");
@@ -710,13 +648,13 @@ impl<'a> Batch<'a> {
             );
             println!("    input memory barriers:");
             for imb in p.image_memory_barriers.iter() {
-                let id = self.context.image_resource_by_handle(imb.image);
+                let id = context.image_resource_by_handle(imb.image);
                 print!("        image handle={:?} ", imb.image);
                 if !id.is_null() {
                     print!(
                         "(id={:?}, name={})",
                         id,
-                        self.context.resources.get(id).unwrap().name
+                        context.resources.get(id).unwrap().name
                     );
                 } else {
                     print!("(unknown resource)");
@@ -724,6 +662,23 @@ impl<'a> Batch<'a> {
                 println!(
                     " access_mask:{:?}->{:?} layout:{:?}->{:?}",
                     imb.src_access_mask, imb.dst_access_mask, imb.old_layout, imb.new_layout
+                );
+            }
+            for bmb in p.buffer_memory_barriers.iter() {
+                let id = context.buffer_resource_by_handle(bmb.buffer);
+                print!("        buffer handle={:?} ", bmb.buffer);
+                if !id.is_null() {
+                    print!(
+                        "(id={:?}, name={})",
+                        id,
+                        context.resources.get(id).unwrap().name
+                    );
+                } else {
+                    print!("(unknown resource)");
+                }
+                println!(
+                    " access_mask:{:?}->{:?}",
+                    bmb.src_access_mask, bmb.dst_access_mask
                 );
             }
 
@@ -734,8 +689,8 @@ impl<'a> Batch<'a> {
         }
 
         println!("Final resource states: ");
-        for &id in self.temporaries.iter() {
-            let resource = self.context.resources.get(id).unwrap();
+        for &id in inner.temporaries.iter() {
+            let resource = context.resources.get(id).unwrap();
             println!("`{}`", resource.name);
             println!("    stages={:?}", resource.tracking.stages);
             println!("    avail={:?}", resource.tracking.availability_mask);
@@ -760,11 +715,8 @@ impl<'a> Batch<'a> {
             if resource.tracking.has_writer() {
                 println!("    writer: {:?}", resource.tracking.writer);
             }
-        }*/
+        }
 
-        let mut inner = self.inner.into_inner();
-
-        let context = inner.context;
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the batch that are not in use anymore.
         context.wait_for_batches_in_flight();
@@ -789,9 +741,9 @@ impl<'a> Batch<'a> {
             signalled_serials: submission_result.signalled_serials,
             transient_allocations,
             command_pools: submission_result.command_pools,
-            image_views: vec![],
-            framebuffers: vec![],
-            descriptor_sets: inner.descriptor_sets,
+            image_views: submission_result.image_views,
+            framebuffers: submission_result.framebuffers,
+            descriptor_sets: submission_result.descriptor_sets,
             semaphores: submission_result.semaphores,
         });
 

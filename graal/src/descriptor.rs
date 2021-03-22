@@ -79,10 +79,6 @@ pub trait PushConstantInterface {
     const LAYOUT: &'static [PushConstantLayout];
 }
 
-pub trait FragmentOutputInterface {
-    const ATTACHMENTS: &'static [OutputAttachment];
-}
-
 ///
 pub enum DescriptorWriteKind {
     Image,
