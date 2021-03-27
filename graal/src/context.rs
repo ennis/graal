@@ -14,16 +14,23 @@ use ash::{
     vk::BufferUsageFlags,
 };
 use fixedbitset::FixedBitSet;
-use slotmap::{SecondaryMap, SlotMap, Key};
+use slotmap::{Key, SecondaryMap, SlotMap};
 
-use crate::{context::{
-    descriptor::{DescriptorSet, DescriptorSetAllocator},
-    resource::{
-        ImageResource, Resource, ResourceId, ResourceKind, ResourceMap, ResourceMemory,
-        ResourceTrackingInfo,
+use crate::{
+    context::{
+        descriptor::{DescriptorSet, DescriptorSetAllocator},
+        resource::{
+            ImageResource, Resource, ResourceId, ResourceKind, ResourceMap, ResourceMemory,
+            ResourceTrackingInfo,
+        },
+        submission::CommandAllocator,
     },
-    submission::CommandAllocator,
-}, device::Device, swapchain::Swapchain, vk::Handle, DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo, MAX_QUEUES, ImageInfo, FragmentOutputInterface, FragmentOutputInterfaceExt};
+    device::Device,
+    swapchain::Swapchain,
+    vk::Handle,
+    DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo,
+    FragmentOutputInterface, FragmentOutputInterfaceExt, ImageInfo, MAX_QUEUES,
+};
 use std::{
     cmp::Ordering,
     ops::{Index, IndexMut},
@@ -35,11 +42,14 @@ pub(crate) mod pass;
 pub(crate) mod resource;
 pub(crate) mod submission;
 
-pub use submission::CommandContext;
-pub use batch::{Batch, PassBuilder};
+use crate::{
+    context::resource::{BufferId, ImageId},
+    vk::RenderPass,
+};
+pub use batch::{AccessType, AccessTypeInfo, Batch, PassBuilder};
 pub use descriptor::DescriptorSetAllocatorId;
-use crate::context::resource::{ImageId, BufferId};
-use crate::vk::RenderPass;
+pub use submission::CommandContext;
+use std::sync::Arc;
 
 /// A number that uniquely identifies a batch.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
@@ -341,16 +351,18 @@ pub struct SwapchainImage {
     pub swapchain_id: SwapchainId,
     pub swapchain_handle: vk::SwapchainKHR,
     pub image_index: u32,
-    pub image_info: ImageInfo
+    pub image_info: ImageInfo,
 }
 
 slotmap::new_key_type! {
     pub struct SwapchainId;
     pub struct RenderPassId;
+    pub struct PipelineLayoutId;
 }
 
 type SwapchainMap = SlotMap<SwapchainId, Swapchain>;
 type RenderPassMap = SlotMap<RenderPassId, vk::RenderPass>;
+type PipelineLayoutMap = SlotMap<PipelineLayoutId, vk::PipelineLayout>;
 
 /// Stores the set of resources owned by a currently executing batch.
 struct InFlightBatch {
@@ -399,6 +411,8 @@ pub struct Context {
     /// fragment output interface types, but still be able to delete the objects when the context
     /// is dropped.
     render_passes: RenderPassMap,
+    /// ID-mapped pipeline layout associated to `PipelineInterface` types.
+    pipeline_layouts: PipelineLayoutMap,
     /// Batches that are currently executing on the GPU.
     in_flight: VecDeque<InFlightBatch>,
 }
@@ -438,9 +452,10 @@ impl Context {
             next_serial: 0,
             submitted_batch_count: 0,
             completed_batch_count: 0,
-            resources: ResourceMap::with_key(),
+            resources: SlotMap::with_key(),
             swapchains: SlotMap::with_key(),
             render_passes: SlotMap::with_key(),
+            pipeline_layouts: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             cache: Default::default(),
             semaphore_pool: vec![],
@@ -600,7 +615,7 @@ impl Context {
                 cmd_pool.free.len()
             );
         }*/
-        println!("VMA stats:");
+        /*println!("VMA stats:");
         if let Ok(stats) = self.device.allocator.calculate_stats() {
             println!(
                 "- number of allocations: {} in {} device memory blocks",
@@ -612,7 +627,7 @@ impl Context {
                 stats.total.usedBytes / 1000,
                 stats.total.unusedBytes / 1000
             );
-        }
+        }*/
     }
 
     pub fn current_batch_index(&self) -> u64 {
@@ -657,7 +672,7 @@ impl Context {
             swapchain_handle,
             image_info: ImageInfo {
                 id: ImageId(image_id),
-                handle: swapchain.images[image_index as usize]
+                handle: swapchain.images[image_index as usize],
             },
             image_index,
         }
@@ -697,5 +712,3 @@ impl Drop for Context {
         // TODO
     }
 }
-
-

@@ -36,6 +36,7 @@ mod descriptor_set_interface;
 mod fragment_output_interface;
 mod struct_layout;
 mod vertex_input_interface;
+//mod pipeline_interface;
 
 pub(crate) use struct_layout::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr};
 
@@ -99,7 +100,7 @@ pub fn vertex_input_interface_derive(input: proc_macro::TokenStream) -> proc_mac
     )
 }
 
-#[proc_macro_derive(FragmentOutputInterface, attributes(attachment, framebuffer))]
+#[proc_macro_derive(FragmentOutputInterface, attributes(attachment))]
 pub fn fragment_output_interface_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     derive_struct(
         "FragmentOutputInterface",
@@ -107,6 +108,17 @@ pub fn fragment_output_interface_derive(input: proc_macro::TokenStream) -> proc_
         fragment_output_interface::generate,
     )
 }
+
+/*
+#[proc_macro_derive(PipelineInterface, attributes(descriptor_set))]
+pub fn pipeline_interface_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
+    derive_struct(
+        "PipelineInterface",
+        input,
+        pipeline_interface::generate,
+    )
+}
+*/
 
 #[proc_macro_derive(StructuredBufferData)]
 pub fn structured_buffer_data_derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {

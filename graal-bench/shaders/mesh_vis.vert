@@ -29,6 +29,7 @@ void main() {
     mat4 model_view_matrix = u_view_matrix * u_model_matrix;
 
     gl_Position = u_view_proj_matrix * u_model_matrix * pos;
+    gl_Position.y = -gl_Position.y;
 
     v_position_vs = (model_view_matrix * pos).xyz;
     v_normal_vs = (u_view_matrix * u_model_it_matrix * n).xyz;

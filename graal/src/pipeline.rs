@@ -1,44 +1,18 @@
+use crate::{context::PipelineLayoutId, VertexInputInterface};
 use ash::vk;
-use std::sync::Arc;
+use std::{marker::PhantomData, sync::Arc};
 
-// Goals: cheap to clone, cheap to modify
-// Partition in state groups, each group in Arc,
-//
-pub struct PipelineQuery {
-    vertex: Option<Arc<[u32]>>,
-    fragment: Option<Arc<[u32]>>,
+pub trait PipelineInterface {
+    const VERTEX_INPUT_BINDINGS: &'static [vk::VertexInputBindingDescription];
+    const VERTEX_INPUT_ATTRIBUTES: &'static [vk::VertexInputAttributeDescription];
+    fn get_or_init_pipeline_layout(init: impl FnOnce() -> PipelineLayoutId) -> PipelineLayoutId;
 }
 
-/*fn make_arc_slice(spirv:&[u32]) -> Arc<[u32]> {
-    unsafe {
-        let mut arr = Arc::new_uninit_slice(spirv.len());
-        ptr::copy(spirv.as_ptr(), arr.as_mut_ptr() as *mut u32, spirv.len());
-        arr.assume_init()
-    }
+pub struct Pipeline {
+    pub handle: vk::Pipeline,
 }
 
-impl PipelineQuery {
-    pub fn new() -> PipelineQuery {
-        PipelineQuery {
-            vertex: None,
-            fragment: None
-        }
-    }
-
-    pub fn vertex_shader(&mut self, spirv: &[u32]) -> &mut Self {
-        self.vertex = make_arc_slice(spirv).into();
-        self
-    }
-
-    pub fn fragment_shader(&mut self, spirv: &[u32]) -> &mut Self {
-        self.fragment = make_arc_slice(spirv).into();
-        self
-    }
-
-    // Those pipeline queries may be long-lived; e.g. stored in a struct
-
-    // Solutions:
-    // - borrows
+pub struct TypedPipeline<T: PipelineInterface> {
+    pub handle: vk::Pipeline,
+    _phantom: PhantomData<*const T>,
 }
-
-*/

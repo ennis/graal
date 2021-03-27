@@ -145,9 +145,9 @@ impl<T> From<TypedBufferInfo<T>> for BufferDescriptor<T> {
             descriptor: vk::DescriptorBufferInfo {
                 buffer: b.handle,
                 offset: 0,
-                range: vk::WHOLE_SIZE
+                range: vk::WHOLE_SIZE,
             },
-            _phantom: PhantomData
+            _phantom: PhantomData,
         }
     }
 }

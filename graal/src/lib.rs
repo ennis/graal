@@ -3,19 +3,21 @@
 
 pub use ash::{self, vk};
 pub use graal_macros::{
-    DescriptorSetInterface, StructuredBufferData, VertexData, VertexInputInterface, FragmentOutputInterface
+    DescriptorSetInterface, FragmentOutputInterface, StructuredBufferData, VertexData,
+    VertexInputInterface,
 };
 pub use graal_spirv::{layout, typedesc};
 
 pub use crate::{
     buffer::{BoolU32, BufferData, StructuredBufferData},
     context::{
+        format_aspect_mask,
         resource::{
-            get_mip_level_count, BufferResourceCreateInfo, ImageResourceCreateInfo, ResourceId,
-            ResourceMemoryInfo, BufferInfo, ImageInfo, ImageId, BufferId, TypedBufferInfo
+            get_mip_level_count, BufferId, BufferInfo, BufferResourceCreateInfo, ImageId,
+            ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, TypedBufferInfo,
         },
-        Batch, Context, DescriptorSetAllocatorId, SwapchainId, RenderPassId, CommandContext,
-        format_aspect_mask
+        AccessType, AccessTypeInfo, Batch, CommandContext, Context, DescriptorSetAllocatorId,
+        PipelineLayoutId, RenderPassId, SwapchainId,
     },
     descriptor::{
         extract_descriptor_set_layouts_from_shader_stages, BufferDescriptor,
@@ -23,12 +25,12 @@ pub use crate::{
         DescriptorSource, PipelineShaderStage,
     },
     device::Device,
+    fragment_output::{FragmentOutputInterface, FragmentOutputInterfaceExt},
     vertex::{
         vertex_macro_helpers, IndexData, Norm, VertexAttribute, VertexAttributeType,
         VertexBindingInterface, VertexBufferView, VertexData, VertexInputBindingAttributes,
-        VertexInputInterface, VertexInputInterfaceExt
+        VertexInputInterface, VertexInputInterfaceExt,
     },
-    fragment_output::{FragmentOutputInterface, FragmentOutputInterfaceExt}
 };
 pub(crate) use crate::{
     device::MAX_QUEUES,
@@ -40,12 +42,12 @@ pub mod cache;
 mod context;
 pub(crate) mod descriptor;
 pub mod device;
+pub(crate) mod fragment_output;
 pub(crate) mod instance;
 pub mod pipeline;
 pub mod surface;
 pub(crate) mod swapchain;
 pub(crate) mod vertex;
-pub(crate) mod fragment_output;
 
 /// For internal use by `graal_macros`.
 pub mod internal {

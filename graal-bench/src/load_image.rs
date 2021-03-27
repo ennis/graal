@@ -108,19 +108,8 @@ pub fn load_image(
 
     // build the upload pass
     batch.add_graphics_pass("image upload", |pass| {
-        pass.add_image_usage(
-            image.id,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
-        pass.register_buffer_access(
-            staging_buffer.id,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-        );
+        pass.register_image_access(image.id, graal::AccessType::TransferWrite);
+        pass.register_buffer_access(staging_buffer.id, graal::AccessType::TransferRead);
 
         pass.set_commands(move |context, command_buffer| unsafe {
             let device = context.device();
@@ -158,6 +147,6 @@ pub fn load_image(
         width,
         height,
         mip_levels,
-        format: vk_format
+        format: vk_format,
     }
 }

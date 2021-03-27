@@ -8,20 +8,8 @@ pub fn blit_images(
     aspect_mask: vk::ImageAspectFlags,
 ) {
     batch.add_graphics_pass("blit_images", |pass| {
-        pass.add_image_usage(
-            src_image.id,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::empty(),
-            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        );
-        pass.add_image_usage(
-            dst_image.id,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        );
+        pass.register_image_access(src_image.id, graal::AccessType::TransferRead);
+        pass.register_image_access(dst_image.id, graal::AccessType::TransferWrite);
 
         pass.set_commands(move |context, command_buffer| {
             let regions = &[vk::ImageBlit {

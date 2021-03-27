@@ -10,5 +10,6 @@ winit = "0.24.0"
 raw-window-handle = "0.3.3"
 inline-spirv = "0.1.2"
 openimageio = { path = "../../openimageio-rs" }
-obj = "0.10.2"
+tobj = "2.0.4"
 glam = "0.13.0"
+slotmap = "1.0.2"

@@ -1,5 +1,3 @@
-use glam::Vec4Swizzles;
-
 /// Axis-aligned bounding boxes
 #[derive(Copy, Clone, Debug)]
 pub struct BoundingBox {

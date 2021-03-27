@@ -155,7 +155,8 @@ impl_attrib_vector_type!([i8; 4], Int, R8G8B8A8_SINT);
 // Vertex types from glam --------------------------------------------------------------------------
 
 #[cfg(feature = "graal-glam")]
-impl_attrib_type!(glam::Vec2,
+impl_attrib_type!(
+    glam::Vec2,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Float,
         len: 2
@@ -164,7 +165,8 @@ impl_attrib_type!(glam::Vec2,
 );
 
 #[cfg(feature = "graal-glam")]
-impl_attrib_type!(glam::Vec3,
+impl_attrib_type!(
+    glam::Vec3,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Float,
         len: 3
@@ -173,14 +175,14 @@ impl_attrib_type!(glam::Vec3,
 );
 
 #[cfg(feature = "graal-glam")]
-impl_attrib_type!(glam::Vec4,
+impl_attrib_type!(
+    glam::Vec4,
     TypeDesc::Vector {
         elem_ty: PrimitiveType::Float,
         len: 4
     },
     R32G32B32A32_SFLOAT
 );
-
 
 // Index data types --------------------------------------------------------------------------------
 macro_rules! impl_index_data {
@@ -241,9 +243,6 @@ impl<T: VertexInputInterface> VertexInputInterfaceExt for T {
         }
     }
 }
-
-
-
 
 pub mod vertex_macro_helpers {
     use crate::{vk, VertexAttribute};

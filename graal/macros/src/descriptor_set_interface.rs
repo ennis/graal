@@ -1,4 +1,4 @@
-use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G, FieldList};
+use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, FieldList, G};
 use darling::{
     util::{Flag, SpannedValue},
     FromDeriveInput, FromField, FromMeta,

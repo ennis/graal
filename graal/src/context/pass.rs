@@ -1,5 +1,7 @@
 use crate::{
-    context::{descriptor::DescriptorSet, QueueSerialNumbers, SubmissionNumber},
+    context::{
+        descriptor::DescriptorSet, submission::CommandContext, QueueSerialNumbers, SubmissionNumber,
+    },
     Context, DescriptorSetInterface, ResourceId, MAX_QUEUES,
 };
 use ash::{version::DeviceV1_0, vk};
@@ -8,7 +10,6 @@ use std::{
     fmt,
     ops::{Index, IndexMut},
 };
-use crate::context::submission::CommandContext;
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ResourceAccess {
@@ -41,10 +42,14 @@ pub(crate) struct Pass<'a> {
     // FIXME Right now, this is used only for debugging purposes, and when allocating memory for the resources.
     // It probably could be removed.
     pub(crate) accesses: Vec<ResourceAccess>,
-    /// The list of image memory barriers that must be applied before executing the pass.
+    /// Image memory barriers that must be applied before executing the pass.
     pub(crate) image_memory_barriers: Vec<vk::ImageMemoryBarrier>,
-    /// The list of buffer memory barriers that must be applied before executing the pass.
+    /// Buffer memory barriers that must be applied before executing the pass.
     pub(crate) buffer_memory_barriers: Vec<vk::BufferMemoryBarrier>,
+    /// Image memory barriers that should be applied immediately after executing the pass.
+    /// This is used when the resource is read-only in subsequent passes and you know in advance
+    /// how it will be used.
+    //pub(crate) exit_image_memory_barriers
     /// Source stage mask for the pre-execution barrier.
     pub(crate) src_stage_mask: vk::PipelineStageFlags,
     /// Destination stage mask for the pre-execution barrier.

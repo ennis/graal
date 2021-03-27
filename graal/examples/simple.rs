@@ -486,14 +486,16 @@ impl BackgroundPass {
             // access uniforms buffer as SHADER_READ, vertex and fragment stages
 
             //dbg!(ubo);
-            pass.register_buffer_access(ubo.id,
+            pass.register_buffer_access(
+                ubo.id,
                 vk::AccessFlags::SHADER_READ,
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
                 vk::PipelineStageFlags::empty(),
             );
 
             // access quad VBO as vertex input
-            pass.register_buffer_access(vbo.id,
+            pass.register_buffer_access(
+                vbo.id,
                 vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
                 vk::PipelineStageFlags::VERTEX_INPUT,
                 vk::PipelineStageFlags::empty(),
@@ -680,7 +682,8 @@ fn load_image(
             vk::PipelineStageFlags::TRANSFER,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
-        pass.register_buffer_access(staging_buffer.id,
+        pass.register_buffer_access(
+            staging_buffer.id,
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,
@@ -817,19 +820,17 @@ fn load_mesh(batch: &graal::Batch, obj_file_path: &Path) -> MeshData {
             vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,
         );
-        pass.set_commands(move |context, command_buffer| {
-            unsafe {
-                context.device().cmd_copy_buffer(
-                    command_buffer,
-                    staging_buffer_handle,
-                    vertex_buffer_handle,
-                    &[vk::BufferCopy {
-                        src_offset: 0,
-                        dst_offset: 0,
-                        size: byte_size,
-                    }],
-                );
-            }
+        pass.set_commands(move |context, command_buffer| unsafe {
+            context.device().cmd_copy_buffer(
+                command_buffer,
+                staging_buffer_handle,
+                vertex_buffer_handle,
+                &[vk::BufferCopy {
+                    src_offset: 0,
+                    dst_offset: 0,
+                    size: byte_size,
+                }],
+            );
         });
     });
 
@@ -1028,11 +1029,7 @@ fn main() {
                         compute_write(img_e),
                     ],
                 );
-                test_pass(
-                    &batch,
-                    "P5",
-                    &[compute_read(img_d1), compute_write(img_f)],
-                );
+                test_pass(&batch, "P5", &[compute_read(img_d1), compute_write(img_f)]);
                 test_pass(
                     &batch,
                     "P6",
@@ -1042,16 +1039,8 @@ fn main() {
                         compute_write(img_g),
                     ],
                 );
-                test_pass(
-                    &batch,
-                    "P7",
-                    &[compute_read(img_g), compute_write(img_h)],
-                );
-                test_pass(
-                    &batch,
-                    "P8",
-                    &[compute_read(img_h), compute_write(img_i)],
-                );
+                test_pass(&batch, "P7", &[compute_read(img_g), compute_write(img_h)]);
+                test_pass(&batch, "P8", &[compute_read(img_h), compute_write(img_i)]);
                 test_pass(
                     &batch,
                     "P9",
@@ -1061,11 +1050,7 @@ fn main() {
                         compute_write(img_j),
                     ],
                 );
-                test_pass(
-                    &batch,
-                    "P10",
-                    &[compute_read(img_j), compute_write(img_k)],
-                );
+                test_pass(&batch, "P10", &[compute_read(img_j), compute_write(img_k)]);
 
                 test_pass(
                     &batch,

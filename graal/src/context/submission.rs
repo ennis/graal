@@ -1,15 +1,18 @@
-use crate::{context::{
-    pass::{Pass, PassKind},
-    QueueSerialNumbers, SubmissionNumber,
-}, vk, Context, Device, MAX_QUEUES, DescriptorSetInterface};
+use crate::{
+    context::{
+        pass::{Pass, PassKind},
+        QueueSerialNumbers, SubmissionNumber,
+    },
+    vk, Context, DescriptorSetInterface, Device, MAX_QUEUES,
+};
 
+use crate::context::descriptor::DescriptorSet;
 use ash::version::{DeviceV1_0, DeviceV1_2};
 use std::{
     ffi::{c_void, CString},
+    ops::{Deref, DerefMut},
     ptr,
 };
-use crate::context::descriptor::DescriptorSet;
-use std::ops::{Deref, DerefMut};
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
 const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -28,7 +31,7 @@ impl SubmissionTimeResources {
         SubmissionTimeResources {
             image_views: vec![],
             framebuffers: vec![],
-            descriptor_sets: vec![]
+            descriptor_sets: vec![],
         }
     }
 }
@@ -497,7 +500,7 @@ impl Context {
                     if let Some(handler) = p.commands.take() {
                         let mut cctx = CommandContext {
                             context: self,
-                            resources: &mut submission_time_resources
+                            resources: &mut submission_time_resources,
                         };
                         handler(&mut cctx, cb);
                     }
@@ -536,7 +539,7 @@ impl Context {
             semaphores: used_semaphores,
             image_views: submission_time_resources.image_views,
             framebuffers: submission_time_resources.framebuffers,
-            descriptor_sets: submission_time_resources.descriptor_sets
+            descriptor_sets: submission_time_resources.descriptor_sets,
         }
     }
 

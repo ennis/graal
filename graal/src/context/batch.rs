@@ -15,6 +15,7 @@ use crate::{
     ImageResourceCreateInfo, ResourceMemoryInfo, MAX_QUEUES,
 };
 use ash::version::DeviceV1_0;
+use bitflags::bitflags;
 use slotmap::Key;
 use std::{
     cell::{Ref, RefCell, RefMut},
@@ -25,6 +26,345 @@ use std::{
 };
 
 type TemporarySet = std::collections::BTreeSet<ResourceId>;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum AccessType {
+    /// Vertex attribute read in the vertex input stage
+    VertexAttributeRead,
+    /// Index read in the vertex input stage
+    IndexRead,
+
+    /// Uniform buffer read in the vertex shader stage.
+    VertexShaderReadUniformBuffer,
+    /// Uniform buffer read in the fragment shader stage.
+    FragmentShaderReadUniformBuffer,
+    /// Uniform buffer read in the geometry shader stage.
+    GeometryShaderReadUniformBuffer,
+    /// Uniform buffer read in the tessellation control shader stage.
+    TessControlShaderReadUniformBuffer,
+    /// Uniform buffer read in the tessellation evaluation shader stage.
+    TessEvalShaderReadUniformBuffer,
+    /// Uniform buffer read in the compute shader stage.
+    ComputeShaderReadUniformBuffer,
+    /// Uniform buffer read in any shader stage.
+    AnyShaderReadUniformBuffer,
+
+    /// Sampled image read in the vertex shader stage.
+    VertexShaderReadSampledImage,
+    /// Sampled image read in the fragment shader stage.
+    FragmentShaderReadSampledImage,
+    /// Sampled image read in the geometry shader stage.
+    GeometryShaderReadSampledImage,
+    /// Sampled image read in the tessellation control shader stage.
+    TessControlShaderReadSampledImage,
+    /// Sampled image read in the tessellation evaluation shader stage.
+    TessEvalShaderReadSampledImage,
+    /// Sampled image read in the compute shader stage.
+    ComputeShaderReadSampledImage,
+    /// Sampled image read in any shader stage.
+    AnyShaderReadSampledImage,
+
+    /// Any read other than uniform buffers & sampled images in the vertex shader stage.
+    VertexShaderReadOther,
+    /// Any read other than uniform buffers & sampled images in the fragment shader stage.
+    FragmentShaderReadOther,
+    /// Any read other than uniform buffers & sampled images in the geometry shader stage.
+    GeometryShaderReadOther,
+    /// Any read other than uniform buffers & sampled images in the tessellation control shader stage.
+    TessControlShaderReadOther,
+    /// Any read other than uniform buffers & sampled images in the tessellation evaluation shader stage.
+    TessEvalShaderReadOther,
+    /// Any read other than uniform buffers & sampled images in the compute shader stage.
+    ComputeShaderReadOther,
+    /// Any read other than uniform buffers & sampled images in any shader stage.
+    AnyShaderReadOther,
+
+    /// Any write in the vertex shader stage.
+    VertexShaderWrite,
+    /// Any write in the fragment shader stage.
+    FragmentShaderWrite,
+    /// Any write in the geometry shader stage.
+    GeometryShaderWrite,
+    /// Any write in the tessellation control shader stage.
+    TessControlShaderWrite,
+    /// Any write in the tessellation evaluation shader stage.
+    TessEvalShaderWrite,
+    /// Any write in the compute shader stage.
+    ComputeShaderWrite,
+    /// Any write in any shader stage.
+    AnyShaderWrite,
+
+    /// Read transfer source
+    TransferRead,
+    /// Written transfer destination
+    TransferWrite,
+
+    /// Written color attachment
+    ColorAttachmentWrite,
+    /// Read and written color attachment.
+    ColorAttachmentReadWrite,
+    /// Read-only depth attachment
+    DepthStencilAttachmentRead,
+    /// Written depth attachment
+    DepthStencilAttachmentWrite,
+    /// Read/written depth attachment
+    DepthStencilAttachmentReadWrite,
+}
+
+// FIXME it would be more precise to specify each shader stage instead of ALL_COMMANDS, but
+// then we need to check that the device actually supports the stages in question.
+// VK_KHR_synchronization2 has VK_PIPELINE_STAGE_2_PRE_RASTERIZATION_SHADERS_BIT_KHR that can be used to this effect.
+const ANY_SHADER_STAGE: vk::PipelineStageFlags = vk::PipelineStageFlags::ALL_COMMANDS;
+
+impl AccessType {
+    pub fn to_access_info(&self) -> AccessTypeInfo {
+        match *self {
+            AccessType::VertexAttributeRead => AccessTypeInfo {
+                access_mask: vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+                input_stage: vk::PipelineStageFlags::VERTEX_INPUT,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::IndexRead => AccessTypeInfo {
+                access_mask: vk::AccessFlags::INDEX_READ,
+                input_stage: vk::PipelineStageFlags::VERTEX_INPUT,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::VertexShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: vk::PipelineStageFlags::VERTEX_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::FragmentShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::GeometryShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: vk::PipelineStageFlags::GEOMETRY_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::TessControlShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::TessEvalShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::ComputeShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: vk::PipelineStageFlags::COMPUTE_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+            AccessType::AnyShaderReadUniformBuffer => AccessTypeInfo {
+                access_mask: vk::AccessFlags::UNIFORM_READ,
+                input_stage: ANY_SHADER_STAGE,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::UNDEFINED,
+            },
+
+            AccessType::VertexShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::VERTEX_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+            AccessType::FragmentShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+            AccessType::GeometryShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::GEOMETRY_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+            AccessType::TessControlShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+            AccessType::TessEvalShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+            AccessType::ComputeShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::COMPUTE_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+            AccessType::AnyShaderReadSampledImage => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: ANY_SHADER_STAGE,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            },
+
+            AccessType::VertexShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::VERTEX_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::FragmentShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::GeometryShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::GEOMETRY_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::TessControlShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::TessEvalShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::ComputeShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: vk::PipelineStageFlags::COMPUTE_SHADER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::AnyShaderReadOther => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_READ,
+                input_stage: ANY_SHADER_STAGE,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::GENERAL,
+            },
+
+            AccessType::VertexShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: vk::PipelineStageFlags::VERTEX_SHADER,
+                output_stage: vk::PipelineStageFlags::VERTEX_SHADER,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::FragmentShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                output_stage: vk::PipelineStageFlags::FRAGMENT_SHADER,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::GeometryShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: vk::PipelineStageFlags::GEOMETRY_SHADER,
+                output_stage: vk::PipelineStageFlags::GEOMETRY_SHADER,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::TessControlShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                output_stage: vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::TessEvalShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                output_stage: vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::ComputeShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: vk::PipelineStageFlags::COMPUTE_SHADER,
+                output_stage: vk::PipelineStageFlags::COMPUTE_SHADER,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::AnyShaderWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::SHADER_WRITE,
+                input_stage: ANY_SHADER_STAGE,
+                output_stage: ANY_SHADER_STAGE,
+                layout: vk::ImageLayout::GENERAL,
+            },
+            AccessType::TransferRead => AccessTypeInfo {
+                access_mask: vk::AccessFlags::TRANSFER_READ,
+                input_stage: vk::PipelineStageFlags::TRANSFER,
+                output_stage: vk::PipelineStageFlags::empty(),
+                layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            },
+            AccessType::TransferWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::TRANSFER_WRITE,
+                input_stage: vk::PipelineStageFlags::TRANSFER,
+                output_stage: vk::PipelineStageFlags::TRANSFER,
+                layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            },
+
+            AccessType::ColorAttachmentWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                input_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                output_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            },
+
+            AccessType::ColorAttachmentReadWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::COLOR_ATTACHMENT_READ
+                    | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+                input_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                output_stage: vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            },
+            AccessType::DepthStencilAttachmentWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                input_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                output_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            },
+            AccessType::DepthStencilAttachmentReadWrite => AccessTypeInfo {
+                access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+                    | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+                input_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                output_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+            },
+            AccessType::DepthStencilAttachmentRead => AccessTypeInfo {
+                access_mask: vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ,
+                input_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                output_stage: vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS
+                    | vk::PipelineStageFlags::LATE_FRAGMENT_TESTS,
+                layout: vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL,
+            },
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct AccessTypeInfo {
+    pub access_mask: vk::AccessFlags,
+    pub input_stage: vk::PipelineStageFlags,
+    pub output_stage: vk::PipelineStageFlags,
+    pub layout: vk::ImageLayout,
+}
 
 /// Adds an execution dependency between a source and destination pass, identified by their submission numbers.
 fn add_execution_dependency(
@@ -79,8 +419,18 @@ pub struct PassBuilder<'a, 'batch> {
 }
 
 impl<'a, 'batch> PassBuilder<'a, 'batch> {
+    pub fn register_image_access(&mut self, id: ImageId, access_type: AccessType) {
+        let AccessTypeInfo {
+            access_mask,
+            input_stage,
+            output_stage,
+            layout,
+        } = access_type.to_access_info();
+        self.register_image_access_2(id, access_mask, input_stage, output_stage, layout);
+    }
+
     /// Registers an image access made by this pass.
-    pub fn add_image_usage(
+    pub fn register_image_access_2(
         &mut self,
         id: ImageId,
         access_mask: vk::AccessFlags,
@@ -100,7 +450,17 @@ impl<'a, 'batch> PassBuilder<'a, 'batch> {
         )
     }
 
-    pub fn register_buffer_access(
+    pub fn register_buffer_access(&mut self, id: BufferId, access_type: AccessType) {
+        let AccessTypeInfo {
+            access_mask,
+            input_stage,
+            output_stage,
+            ..
+        } = access_type.to_access_info();
+        self.register_buffer_access_2(id, access_mask, input_stage, output_stage);
+    }
+
+    pub fn register_buffer_access_2(
         &mut self,
         id: BufferId,
         access_mask: vk::AccessFlags,
@@ -311,8 +671,10 @@ impl<'a> BatchInner<'a> {
             resource.tracking.layout = access.layout;
         }
 
-        // all previous writes are flushed
         if is_write_access(access.access_mask) {
+            // we're writing to the resource, so reset visibility...
+            resource.tracking.visibility_mask = vk::AccessFlags::empty();
+            // ... but signal that there is data to be made available for this resource.
             resource.tracking.availability_mask |= access.access_mask;
         }
 
@@ -448,7 +810,7 @@ impl<'a> Batch<'a> {
             },
             false,
             |builder| {
-                builder.add_image_usage(
+                builder.register_image_access_2(
                     image.image_info.id,
                     vk::AccessFlags::MEMORY_READ,
                     vk::PipelineStageFlags::ALL_COMMANDS,
@@ -525,7 +887,7 @@ impl<'a> Batch<'a> {
         usage: vk::BufferUsageFlags,
         data: &[T],
         name: Option<&str>,
-    ) -> TypedBufferInfo<[T]> {
+    ) -> TypedBufferInfo<T> {
         let byte_size = mem::size_of_val(data);
         let BufferInfo {
             id,
@@ -540,7 +902,7 @@ impl<'a> Batch<'a> {
         TypedBufferInfo {
             id,
             handle,
-            mapped_ptr: ptr::slice_from_raw_parts_mut(mapped_ptr as *mut T, data.len()),
+            mapped_ptr: mapped_ptr as *mut T,
         }
     }
 
@@ -584,7 +946,7 @@ impl<'a> Batch<'a> {
         usage: vk::BufferUsageFlags,
         size: usize,
         name: Option<&str>,
-    ) -> TypedBufferInfo<[T]> {
+    ) -> TypedBufferInfo<T> {
         let byte_size = mem::size_of::<T>() * size;
         let BufferInfo {
             id,
@@ -594,7 +956,7 @@ impl<'a> Batch<'a> {
         TypedBufferInfo {
             id,
             handle,
-            mapped_ptr: ptr::slice_from_raw_parts_mut(mapped_ptr as *mut T, size),
+            mapped_ptr: mapped_ptr as *mut T,
         }
     }
 
@@ -619,12 +981,12 @@ impl<'a> Batch<'a> {
 
     /// Finishes building the batch and submits all the passes to the command queues.
     pub fn finish(mut self) {
-        println!("====== Batch #{} ======", self.batch_serial.0);
+        //println!("====== Batch #{} ======", self.batch_serial.0);
 
         let mut inner = self.inner.into_inner();
         let context = inner.context;
 
-        println!("Passes:");
+        /*println!("Passes:");
         for p in inner.passes.iter() {
             println!("- `{}` ({:?})", p.name, p.snn);
             if p.wait_before {
@@ -715,7 +1077,7 @@ impl<'a> Batch<'a> {
             if resource.tracking.has_writer() {
                 println!("    writer: {:?}", resource.tracking.writer);
             }
-        }
+        }*/
 
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the batch that are not in use anymore.

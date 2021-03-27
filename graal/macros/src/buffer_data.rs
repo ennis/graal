@@ -1,4 +1,4 @@
-use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, G, FieldList};
+use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, FieldList, G};
 use proc_macro2::{Span, TokenStream};
 use quote::quote;
 use syn::{spanned::Spanned, Ident};

@@ -1,5 +1,4 @@
 use graal::vk;
-use std::ptr;
 
 fn input_assembly_state_triangle_list() -> vk::PipelineInputAssemblyStateCreateInfo {
     vk::PipelineInputAssemblyStateCreateInfo {

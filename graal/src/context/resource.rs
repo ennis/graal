@@ -2,6 +2,7 @@ use crate::{
     context::{
         get_vk_sample_count, is_write_access,
         pass::{Pass, ResourceAccess},
+        resource::ResourceKind::Image,
         set_debug_object_name, QueueSerialNumbers, SubmissionNumber,
     },
     Context, Device,
@@ -10,16 +11,15 @@ use ash::{version::DeviceV1_0, vk, vk::Handle};
 use fixedbitset::FixedBitSet;
 use slotmap::{SecondaryMap, SlotMap};
 use std::{mem, ptr};
-use crate::context::resource::ResourceKind::Image;
 
 slotmap::new_key_type! {
     pub struct ResourceId;
 }
 
-#[derive(Copy,Clone,Debug,Eq,PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BufferId(pub(crate) ResourceId);
 
-#[derive(Copy,Clone,Debug,Eq,PartialEq, Ord, PartialOrd, Hash)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ImageId(pub(crate) ResourceId);
 
 pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
@@ -179,7 +179,10 @@ pub(crate) struct ResourceTrackingInfo {
     pub(crate) readers: QueueSerialNumbers,
     pub(crate) writer: SubmissionNumber,
     pub(crate) layout: vk::ImageLayout,
+    /// Access types for the last write to this resource that have yet to be made available.
+    /// (FIXME usually there's only one WRITE flag, no?)
     pub(crate) availability_mask: vk::AccessFlags,
+    /// Which access types can see the last write to the resource.
     pub(crate) visibility_mask: vk::AccessFlags,
     pub(crate) stages: vk::PipelineStageFlags,
     pub(crate) wait_binary_semaphore: vk::Semaphore,
@@ -263,7 +266,7 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     // destroy the object, if we're responsible for it (we're not responsible of destroying
     // swapchain images, for example, since they are destroyed with the swapchain).
     if resource.should_delete {
-        eprintln!("destroying resource: {:?}", resource);
+        //eprintln!("destroying resource: {:?}", resource);
         match &mut resource.kind {
             ResourceKind::Buffer(buf) => {
                 device
@@ -324,21 +327,21 @@ fn compute_reachability(passes: &[Pass]) -> Reachability {
     Reachability { m }
 }
 
-#[derive(Copy,Clone,Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct BufferInfo {
     pub id: BufferId,
     pub handle: vk::Buffer,
-    pub mapped_ptr: *mut u8
+    pub mapped_ptr: *mut u8,
 }
 
-#[derive(Copy,Clone,Debug)]
-pub struct TypedBufferInfo<T: ?Sized> {
+#[derive(Copy, Clone, Debug)]
+pub struct TypedBufferInfo<T> {
     pub id: BufferId,
     pub handle: vk::Buffer,
-    pub mapped_ptr: *mut T
+    pub mapped_ptr: *mut T,
 }
 
-#[derive(Copy,Clone,Debug)]
+#[derive(Copy, Clone, Debug)]
 pub struct ImageInfo {
     pub id: ImageId,
     pub handle: vk::Image,
@@ -377,7 +380,7 @@ impl Context {
         name: &str,
         memory_info: &ResourceMemoryInfo,
         image_info: &ImageResourceCreateInfo,
-        transient: bool
+        transient: bool,
     ) -> ImageInfo {
         // for now all resources are CONCURRENT, because that's the only way they can
         // be read across multiple queues.
@@ -455,7 +458,7 @@ impl Context {
 
         ImageInfo {
             id: ImageId(id),
-            handle
+            handle,
         }
     }
 
@@ -465,9 +468,8 @@ impl Context {
         name: &str,
         memory_info: &ResourceMemoryInfo,
         buffer_create_info: &BufferResourceCreateInfo,
-        transient: bool
-    ) -> BufferInfo
-    {
+        transient: bool,
+    ) -> BufferInfo {
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
             size: buffer_create_info.byte_size,
@@ -552,7 +554,7 @@ impl Context {
         BufferInfo {
             id: BufferId(id),
             handle,
-            mapped_ptr
+            mapped_ptr,
         }
     }
 
@@ -696,7 +698,7 @@ impl Context {
         }
 
         // --- print some debug info
-        println!("Memory blocks:");
+        /*println!("Memory blocks:");
         for (i, req) in requirements.iter().enumerate() {
             println!(" block #{}: {:?}", i, req);
         }
@@ -711,7 +713,7 @@ impl Context {
             } else {
                 println!("`{}` => N/A", self.resources.get(tmp).unwrap().name);
             }
-        }
+        }*/
 
         // now allocate device memory
         let mut allocations = Vec::with_capacity(requirements.len());
