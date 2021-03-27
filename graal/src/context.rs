@@ -36,7 +36,7 @@ use std::{
     ops::{Index, IndexMut},
 };
 
-pub(crate) mod batch;
+pub(crate) mod frame;
 pub(crate) mod descriptor;
 pub(crate) mod pass;
 pub(crate) mod resource;
@@ -46,15 +46,15 @@ use crate::{
     context::resource::{BufferId, ImageId},
     vk::RenderPass,
 };
-pub use batch::{AccessType, AccessTypeInfo, Batch, PassBuilder};
+pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
 pub use descriptor::DescriptorSetAllocatorId;
 pub use submission::CommandContext;
 use std::sync::Arc;
 
-/// A number that uniquely identifies a batch.
+/// A number that uniquely identifies a frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 #[repr(transparent)]
-pub struct BatchSerialNumber(pub u64);
+pub struct FrameSerialNumber(pub u64);
 
 /// A number that combines the serial number of a pass and the queue it was submitted on.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Default)]
@@ -364,14 +364,14 @@ type SwapchainMap = SlotMap<SwapchainId, Swapchain>;
 type RenderPassMap = SlotMap<RenderPassId, vk::RenderPass>;
 type PipelineLayoutMap = SlotMap<PipelineLayoutId, vk::PipelineLayout>;
 
-/// Stores the set of resources owned by a currently executing batch.
-struct InFlightBatch {
+/// Stores the set of resources owned by a currently executing frame.
+struct FrameInFlight {
     signalled_serials: QueueSerialNumbers,
     transient_allocations: Vec<vk_mem::Allocation>,
     command_pools: Vec<CommandAllocator>,
-    /// Image views allocated for this batch.
+    /// Image views allocated for this frame.
     image_views: Vec<vk::ImageView>,
-    /// Framebuffers allocated for this batch.
+    /// Framebuffers allocated for this frame.
     framebuffers: Vec<vk::Framebuffer>,
     descriptor_sets: Vec<DescriptorSet>,
     semaphores: Vec<vk::Semaphore>,
@@ -397,14 +397,14 @@ pub struct Context {
     semaphore_pool: Vec<vk::Semaphore>,
     resources: ResourceMap,
 
-    /// The serial to be used for the next pass (used by `Batch`)
+    /// The serial to be used for the next pass (used by `Frame`)
     next_serial: u64,
     /// Array containing the last completed pass serials for each queue
     completed_serials: QueueSerialNumbers,
-    /// Number of submitted batches
-    submitted_batch_count: u64,
-    /// Number of completed batches
-    completed_batch_count: u64,
+    /// Number of submitted frames
+    submitted_frame_count: u64,
+    /// Number of completed frames
+    completed_frame_count: u64,
     /// Swapchains.
     swapchains: SwapchainMap,
     /// ID-mapped render passes. These are used mostly to store the render passes for
@@ -413,8 +413,8 @@ pub struct Context {
     render_passes: RenderPassMap,
     /// ID-mapped pipeline layout associated to `PipelineInterface` types.
     pipeline_layouts: PipelineLayoutMap,
-    /// Batches that are currently executing on the GPU.
-    in_flight: VecDeque<InFlightBatch>,
+    /// Frames that are currently executing on the GPU.
+    in_flight: VecDeque<FrameInFlight>,
 }
 
 impl Context {
@@ -450,8 +450,8 @@ impl Context {
             set_allocators: Default::default(),
             completed_serials: Default::default(),
             next_serial: 0,
-            submitted_batch_count: 0,
-            completed_batch_count: 0,
+            submitted_frame_count: 0,
+            completed_frame_count: 0,
             resources: SlotMap::with_key(),
             swapchains: SlotMap::with_key(),
             render_passes: SlotMap::with_key(),
@@ -502,9 +502,9 @@ impl Context {
         self.semaphore_pool.append(&mut semaphores)
     }
 
-    /// Returns whether the given batch, identified by its serial, has completed execution.
-    pub fn is_batch_completed(&self, serial: BatchSerialNumber) -> bool {
-        self.completed_batch_count >= serial.0
+    /// Returns whether the given frame, identified by its serial, has completed execution.
+    pub fn is_frame_completed(&self, serial: FrameSerialNumber) -> bool {
+        self.completed_frame_count >= serial.0
     }
 
     fn image_resource_by_handle(&self, handle: vk::Image) -> ResourceId {
@@ -544,12 +544,12 @@ impl Context {
         self.next_serial
     }
 
-    /// Waits for all but the last submitted batch to finish and then recycles their resources.
+    /// Waits for all but the last submitted frame to finish and then recycles their resources.
     /// Calls `cleanup_resources` internally.
-    fn wait_for_batches_in_flight(&mut self) {
+    fn wait_for_frames_in_flight(&mut self) {
         // pacing
         while self.in_flight.len() >= 2 {
-            // two batches in flight already, must wait for the oldest one
+            // two frames in flight already, must wait for the oldest one
             let mut b = self.in_flight.pop_front().unwrap();
             self.wait(&b.signalled_serials);
 
@@ -557,11 +557,11 @@ impl Context {
             // we just waited on those serials, so we know they are completed
             self.completed_serials = b.signalled_serials;
 
-            // Recycle the command pools allocated for the batch. The allocated command buffers
+            // Recycle the command pools allocated for the frame. The allocated command buffers
             // can then be reused for future submissions.
             self.recycle_command_pools(b.command_pools);
 
-            // Recycle the semaphores. They are guaranteed to be unsignalled since the batch must have
+            // Recycle the semaphores. They are guaranteed to be unsignalled since the frame must have
             // waited on them.
             self.recycle_semaphores(b.semaphores);
 
@@ -570,7 +570,7 @@ impl Context {
                 self.recycle_descriptor_sets(b.descriptor_sets);
             }
 
-            // Destroy all other batch-bound objects (framebuffers, image views, descriptor sets)
+            // Destroy all other frame-bound objects (framebuffers, image views, descriptor sets)
             for fb in b.framebuffers {
                 unsafe {
                     self.device.device.destroy_framebuffer(fb, None);
@@ -587,8 +587,8 @@ impl Context {
                 self.device.allocator.free_memory(alloc).unwrap();
             }
 
-            // bump completed batch count
-            self.completed_batch_count += 1;
+            // bump completed frame count
+            self.completed_frame_count += 1;
         }
 
         // given the new completed serials, free resources that have expired
@@ -596,7 +596,7 @@ impl Context {
     }
 
     fn dump_state(&self) {
-        /*println!("Number of batches in flight: {}", self.in_flight.len());
+        /*println!("Number of frames in flight: {}", self.in_flight.len());
         println!("Resources:");
         for (id, r) in self.resources.iter() {
             println!("- {:?}: {:?}", id, r);
@@ -630,8 +630,8 @@ impl Context {
         }*/
     }
 
-    pub fn current_batch_index(&self) -> u64 {
-        self.submitted_batch_count
+    pub fn current_frame_index(&self) -> u64 {
+        self.submitted_frame_count
     }
 
     pub unsafe fn create_swapchain(
@@ -702,8 +702,8 @@ impl Context {
         *self.render_passes.get(id).unwrap()
     }
 
-    pub fn start_batch(&mut self) -> Batch {
-        Batch::new(self)
+    pub fn start_frame(&mut self) -> Frame {
+        Frame::new(self)
     }
 }
 

@@ -32,8 +32,8 @@ pub(crate) struct Pass<'a> {
     pub(crate) name: String,
     /// Submission number of the pass.
     pub(crate) snn: SubmissionNumber,
-    /// Index of the pass in the batch.
-    pub(crate) batch_index: usize,
+    /// Index of the pass in the frame.
+    pub(crate) frame_index: usize,
     /// @brief Predecessors of the pass (all passes that must happen before this one).
     pub(crate) preds: Vec<usize>,
     /// @brief Successors of the pass (all passes for which this task is a predecessor).
@@ -76,7 +76,7 @@ impl<'a> Pass<'a> {
 
     pub(crate) fn new(
         name: &str,
-        batch_index: usize,
+        frame_index: usize,
         snn: SubmissionNumber,
         kind: PassKind,
     ) -> Pass<'a> {
@@ -97,7 +97,7 @@ impl<'a> Pass<'a> {
             wait_dst_stages: Default::default(),
             wait_binary_semaphores: Vec::new(),
             kind,
-            batch_index,
+            frame_index,
             commands: None,
         }
     }

@@ -17,7 +17,7 @@ pub struct LoadedImageInfo {
 
 /// Loads an image from a file into a GPU image object.
 pub fn load_image(
-    batch: &graal::Batch,
+    frame: &graal::Frame,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
     mipmaps: bool,
@@ -63,7 +63,7 @@ pub fn load_image(
     let mip_levels = graal::get_mip_level_count(width, height);
 
     // create the texture
-    let image = batch.context().create_image(
+    let image = frame.context().create_image(
         path.to_str().unwrap(),
         &graal::ResourceMemoryInfo::DEVICE_LOCAL,
         &graal::ImageResourceCreateInfo {
@@ -86,7 +86,7 @@ pub fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = batch.alloc_upload_slice::<u8>(
+    let mut staging_buffer = frame.alloc_upload_slice::<u8>(
         vk::BufferUsageFlags::TRANSFER_SRC,
         byte_size as usize,
         Some("staging"),
@@ -107,7 +107,7 @@ pub fn load_image(
     }
 
     // build the upload pass
-    batch.add_graphics_pass("image upload", |pass| {
+    frame.add_graphics_pass("image upload", |pass| {
         pass.register_image_access(image.id, graal::AccessType::TransferWrite);
         pass.register_buffer_access(staging_buffer.id, graal::AccessType::TransferRead);
 

@@ -153,7 +153,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
             };
 
             create_transient_image_statements.push(quote! {
-                let #field_name = batch.context().create_image(
+                let #field_name = frame.context().create_image(
                     #debug_name,
                     &#G::ResourceMemoryInfo::DEVICE_LOCAL,
                     &#G::ImageResourceCreateInfo {
@@ -242,7 +242,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                 *RENDER_PASS_ID.get_or_init(init)
             }
 
-            fn new(batch: &#G::Batch, additional_usage: #G::vk::ImageUsageFlags, size: (u32, u32)) -> Self {
+            fn new(frame: &#G::Frame, additional_usage: #G::vk::ImageUsageFlags, size: (u32, u32)) -> Self {
                 let extent = #G::vk::Extent3D {
                     width: size.0,
                     height: size.1,

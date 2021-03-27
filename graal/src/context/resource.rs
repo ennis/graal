@@ -286,7 +286,7 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
         // We have our own exclusive device memory block, free it.
         ResourceMemory::Exclusive(allocation) => device.allocator.free_memory(&allocation).unwrap(),
         // External or aliasable memory: the memory is freed elsewhere.
-        // For aliasable memory: the memory block is freed when the batch is completed.
+        // For aliasable memory: the memory block is freed when the frame is completed.
         _ => {}
     }
 }
@@ -372,9 +372,9 @@ impl Context {
 
     /// Creates a new image resource.
     ///
-    /// Transient: whether the resource should live only for the duration of the batch it's used in.
-    /// When the batch that uses the resource completes, the resource is automatically deleted.
-    /// The resource can only be used in one batch.
+    /// Transient: whether the resource should live only for the duration of the frame it's used in.
+    /// When the frame that uses the resource completes, the resource is automatically deleted.
+    /// The resource can only be used in one frame.
     pub fn create_image(
         &mut self,
         name: &str,
@@ -608,7 +608,7 @@ impl Context {
                         _ => continue,
                     };
 
-                    // skip if the resource has user handles pointing to it that may live beyond the current batch
+                    // skip if the resource has user handles pointing to it that may live beyond the current frame
                     if alias_candidate.user_ref_count > 0 {
                         continue;
                     }
@@ -625,12 +625,12 @@ impl Context {
                             continue;
                         };
 
-                    // if we want to use the resource, the resource must be dead (no more uses in subsequent tasks),
-                    // and there must be an execution dependency chain between the current task and all tasks that last accessed the resource
+                    // if we want to use the resource, the resource must be dead (no more uses in subsequent passes),
+                    // and there must be an execution dependency chain between the current task and all passes that last accessed the resource
 
                     for &read_serial in alias_candidate.tracking.readers.iter() {
                         // Consider the resource to be live if:
-                        // 1. the reader is in a previous batch (we don't have info about execution dependencies between passes in different batches)
+                        // 1. the reader is in a previous frame (we don't have info about execution dependencies between passes in different frames)
                         // 2. the reader comes after this pass
                         // 3. there's no execution dependency chain from the reader to the current task.
 
@@ -638,8 +638,8 @@ impl Context {
                             && (read_serial <= base_serial
                                 || read_serial >= pass.snn.serial()
                                 || !reachability.is_reachable(
-                                    (read_serial - base_serial - 1) as usize,
-                                    pass.batch_index,
+                            (read_serial - base_serial - 1) as usize,
+                            pass.frame_index,
                                 ))
                         {
                             continue 'alias;
@@ -651,8 +651,8 @@ impl Context {
                         && (write_serial <= base_serial
                             || write_serial >= pass.snn.serial()
                             || !reachability.is_reachable(
-                                (write_serial - base_serial - 1) as usize,
-                                pass.batch_index,
+                        (write_serial - base_serial - 1) as usize,
+                        pass.frame_index,
                             ))
                     {
                         continue;

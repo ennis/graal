@@ -211,8 +211,8 @@ impl Default for CommandBatch {
     }
 }
 
-/// Represents the result of a successful batch submission operation.
-pub(crate) struct BatchSubmissionResult {
+/// Represents the result of a successful frame submission operation.
+pub(crate) struct FrameSubmissionResult {
     /// The command pools used in the batch
     pub(crate) command_pools: Vec<CommandAllocator>,
     /// The last signalled serial numbers for each queue
@@ -357,7 +357,7 @@ impl Context {
     }
 
     ///
-    pub(crate) fn submit_batch(&mut self, passes: &mut [Pass]) -> BatchSubmissionResult {
+    pub(crate) fn submit_frame(&mut self, passes: &mut [Pass]) -> FrameSubmissionResult {
         // current submission batches per queue
         let mut cmd_batches: [CommandBatch; MAX_QUEUES] = Default::default();
         // one command pool per queue (might not be necessary if the queues belong to the same family,
@@ -533,7 +533,7 @@ impl Context {
             .filter_map(|cmd_pool| cmd_pool.take())
             .collect();
 
-        BatchSubmissionResult {
+        FrameSubmissionResult {
             command_pools,
             signalled_serials: self.last_signalled_serials,
             semaphores: used_semaphores,
@@ -543,7 +543,7 @@ impl Context {
         }
     }
 
-    /// Recycles command pools returned by `submit_batch`.
+    /// Recycles command pools returned by `submit_frame`.
     pub(crate) fn recycle_command_pools(&mut self, mut allocators: Vec<CommandAllocator>) {
         for a in allocators.iter_mut() {
             a.reset(&self.device.device)

@@ -3,7 +3,7 @@ use crate::{
     context::{CommandContext, RenderPassId},
     vk,
     vk::RenderPass,
-    Batch, Context,
+    Frame, Context,
 };
 
 /// Types that describe a fragment output interface (a set of images that act as attachments).
@@ -31,7 +31,7 @@ pub unsafe trait FragmentOutputInterface {
 
     /// Creates an instance of this fragment output interface by allocating transient images for each
     /// attachments using the specified size and image usage flags.
-    fn new(batch: &Batch, additional_usage: vk::ImageUsageFlags, size: (u32, u32)) -> Self
+    fn new(batch: &Frame, additional_usage: vk::ImageUsageFlags, size: (u32, u32)) -> Self
     where
         Self: Sized;
 

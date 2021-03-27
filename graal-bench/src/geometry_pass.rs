@@ -340,7 +340,7 @@ impl GeometryPass {
 
     pub fn run<'a>(
         &self,
-        batch: &graal::Batch<'a>,
+        frame: &graal::Frame<'a>,
         scene: &'a Scene,
         target_size: (u32, u32),
         camera: &Camera,
@@ -348,13 +348,13 @@ impl GeometryPass {
     {
         // allocate the G-buffers of the frame
         let g: GBuffers = GBuffers::new(
-            batch,
+            frame,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC,
             target_size,
         );
 
         // setup uniforms & descriptors
-        let global_uniforms = batch.upload(
+        let global_uniforms = frame.upload(
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &Globals {
                 u_view_matrix: camera.view,
@@ -365,7 +365,7 @@ impl GeometryPass {
             None,
         );
 
-        let material_uniforms = batch.upload(
+        let material_uniforms = frame.upload(
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &Material {
                 u_color: Vec4::new(0.0, 1.0, 0.0, 1.0),
@@ -373,7 +373,7 @@ impl GeometryPass {
             None,
         );
 
-        let per_object_uniforms = batch.upload(
+        let per_object_uniforms = frame.upload(
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &PerObject {
                 u_model_matrix: Mat4::IDENTITY,
@@ -383,7 +383,7 @@ impl GeometryPass {
         );
 
         // setup the pass
-        batch.add_graphics_pass("gbuffers", |pass| {
+        frame.add_graphics_pass("gbuffers", |pass| {
             // we don't really need to register those because
             pass.register_buffer_access(
                 global_uniforms.id,

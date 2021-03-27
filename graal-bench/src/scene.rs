@@ -107,8 +107,8 @@ impl Scene {
     }
 
     /// Imports objects from an obj file.
-    /// Vertex data will be uploaded to the GPU as a part of the specified batch.
-    pub fn import_obj(&mut self, batch: &graal::Batch, obj_file_path: &Path) {
+    /// Vertex data will be uploaded to the GPU as a part of the specified frame.
+    pub fn import_obj(&mut self, frame: &graal::Frame, obj_file_path: &Path) {
         let (models, materials) = match tobj::load_obj(obj_file_path, true) {
             Ok(x) => x,
             Err(e) => {
@@ -118,7 +118,7 @@ impl Scene {
         };
 
         for m in models.iter() {
-            let mesh_data = load_mesh_from_obj(batch, m);
+            let mesh_data = load_mesh_from_obj(frame, m);
 
             eprintln!("loaded object {}, {} vertices, {} indices", m.name, mesh_data.vertex_count, mesh_data.index_count);
 
@@ -132,7 +132,7 @@ impl Scene {
     }
 }
 
-fn load_mesh_from_obj(batch: &graal::Batch, model: &tobj::Model) -> MeshData {
+fn load_mesh_from_obj(frame: &graal::Frame, model: &tobj::Model) -> MeshData {
     let mesh = &model.mesh;
     // allocate staging buffers in advance
     let vertex_count = mesh.positions.len() / 3;
@@ -140,12 +140,12 @@ fn load_mesh_from_obj(batch: &graal::Batch, model: &tobj::Model) -> MeshData {
     let vertex_byte_size = mem::size_of::<Vertex3D>() * vertex_count;
     let index_byte_size = mem::size_of::<u32>() * index_count;
 
-    let staging_vbo = batch.alloc_upload_slice::<Vertex3D>(
+    let staging_vbo = frame.alloc_upload_slice::<Vertex3D>(
         vk::BufferUsageFlags::TRANSFER_SRC,
         vertex_count,
         Some("staging vertex buffer"),
     );
-    let staging_ibo = batch.alloc_upload_slice::<u32>(
+    let staging_ibo = frame.alloc_upload_slice::<u32>(
         vk::BufferUsageFlags::TRANSFER_SRC,
         index_count,
         Some("staging index buffer"),
@@ -199,7 +199,7 @@ fn load_mesh_from_obj(batch: &graal::Batch, model: &tobj::Model) -> MeshData {
     }
 
     // create the device local vertex/index buffers
-    let device_vbo = batch.context().create_buffer(
+    let device_vbo = frame.context().create_buffer(
         &model.name,
         &graal::ResourceMemoryInfo::DEVICE_LOCAL,
         &graal::BufferResourceCreateInfo {
@@ -210,7 +210,7 @@ fn load_mesh_from_obj(batch: &graal::Batch, model: &tobj::Model) -> MeshData {
         false,
     );
 
-    let device_ibo = batch.context().create_buffer(
+    let device_ibo = frame.context().create_buffer(
         &model.name,
         &graal::ResourceMemoryInfo::DEVICE_LOCAL,
         &graal::BufferResourceCreateInfo {
@@ -222,7 +222,7 @@ fn load_mesh_from_obj(batch: &graal::Batch, model: &tobj::Model) -> MeshData {
     );
 
     // upload
-    batch.add_transfer_pass("upload mesh", false, |pass| {
+    frame.add_transfer_pass("upload mesh", false, |pass| {
 
         pass.register_buffer_access(staging_vbo.id, graal::AccessType::TransferRead);
         pass.register_buffer_access(device_vbo.id, graal::AccessType::TransferWrite);

@@ -61,13 +61,13 @@ fn main() {
     let mut context = graal::Context::new(device);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
 
-    // Initial batch to upload static resources (meshes and textures)
-    let mut init_batch = context.start_batch();
+    // Initial frame to upload static resources (meshes and textures)
+    let mut init_frame = context.start_frame();
     let mut scene = Scene::new();
-    scene.import_obj(&init_batch, "data/reimu.obj".as_ref());
+    scene.import_obj(&init_frame, "data/reimu.obj".as_ref());
 
-    //let mesh = load_mesh(&init_batch, "data/reimu.obj".as_ref());
-    init_batch.finish();
+    //let mesh = load_mesh(&init_frame, "data/reimu.obj".as_ref());
+    init_frame.finish();
 
     // Create passes
     let bkg_pass = BackgroundPass::new(&mut context);
@@ -125,11 +125,11 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
                 let camera = camera_control.camera();
-                let mut batch = context.start_batch();
+                let mut frame = context.start_frame();
 
                 // draw background
                 bkg_pass.run(
-                    &batch,
+                    &frame,
                     swapchain_image.image_info,
                     vk::Format::B8G8R8A8_SRGB,
                     swapchain_size,
@@ -137,7 +137,7 @@ fn main() {
 
                 /*// draw our mesh to G-buffers
                 let gbuffers = mesh_pass.run(
-                    &batch,
+                    &frame,
                     mesh.vertex_buffer,
                     mesh.vertex_count,
                     swapchain_size,
@@ -146,15 +146,15 @@ fn main() {
 
                 // blit?
                 blit::blit_images(
-                    &batch,
+                    &frame,
                     gbuffers.color,
                     swapchain_image.image_info,
                     swapchain_size,
                     vk::ImageAspectFlags::COLOR,
                 );*/
 
-                batch.present("present", &swapchain_image);
-                batch.finish();
+                frame.present("present", &swapchain_image);
+                frame.finish();
             }
             _ => (),
         }

@@ -150,7 +150,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
             };
 
             create_transient_image_statements.push(quote! {
-                let #field_name = batch.context().create_image(
+                let #field_name = frame.context().create_image(
                     #debug_name,
                     &#G::ResourceMemoryInfo::DEVICE_LOCAL,
                     &#G::ImageResourceCreateInfo {

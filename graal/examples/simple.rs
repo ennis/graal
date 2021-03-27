@@ -350,72 +350,11 @@ impl BackgroundPass {
 
     pub fn run(
         &self,
-        batch: &graal::Batch,
+        frame: &graal::Frame,
         target: graal::ImageInfo,
         target_format: vk::Format,
         target_size: (u32, u32),
     ) {
-        // get:
-        // - descriptor set layout cache
-        // - descriptor set layout allocator
-        // - batch
-        // - context
-        // - device
-        // - UBO ID
-        // - mapped pointer to UBO
-        // - buffer handle to UBO
-        // - shader interface struct
-        // - descriptor set
-        // - update template
-        // - get handle of output image
-        // - create output image view
-        // - create framebuffer
-        //
-        // Issues:
-        // - indirection to allocate the descriptor set
-        // - create_buffer_resource for the UBO is verbose
-        // - unsafe cast of mapped pointer to UBO to update uniforms
-        // - indirection: `batch.context().device()` everywhere
-        // - indirection: `batch.context().buffer_handle/image_handle`
-        // - framebuffers should be recreated
-        //
-        // Mistakes:
-        // - forgot to add usage to a buffer
-        // - transient buffers not used in the pass are immediately deleted?
-        //      - it's not really wrong
-        //
-        // Simplify:
-        // - typed resource IDs
-        // - store handle along with IDs (128-bit resource pointer)
-        // - allocation of the UBO and uniforms
-        //       - batch convenience methods
-        //       - typed UBOs
-        // - batch APIs for:
-        //       - transient image views
-        //       - transient framebuffers
-        //
-        // Pass finish on drop
-        //
-        // Same sizes:
-        // - framebuffer
-        // - viewport
-        // - render area
-        // Same formats:
-        // - framebuffer
-        // - image view
-
-        // who is responsible for the cleanup?
-        // - we could call cleanup here, but since the allocator is possibly shared between
-        // different users, we might have redundant calls.
-        // - we could manually call cleanup in the main loop
-        // - we could put descriptor allocators in the context and have the context automatically
-        //   clean up things on batch submission
-        // Creating a descriptor would simply be done like so:
-        //    batch.allocate_descriptor_set::<BackgroundShaderInterface>();
-        // or even:
-        //    batch.allocate_descriptor_set(&BackgroundShaderInterface { ... });
-        // No need to store the descriptor set layout id => stuff it in a static ONCE_CELL
-
         let (left, top, right, bottom) = (-1.0, -1.0, 1.0, 1.0);
 
         let vertices = &[
@@ -427,12 +366,12 @@ impl BackgroundPass {
             Vertex::new([right, bottom], [1.0, 1.0]),
         ];
 
-        let vbo = batch.upload_slice(
+        let vbo = frame.upload_slice(
             vk::BufferUsageFlags::VERTEX_BUFFER,
             vertices,
             Some("background vertices"),
         );
-        let ubo = batch.upload(
+        let ubo = frame.upload(
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &BackgroundUniforms {
                 u_resolution: [target_size.0 as f32, target_size.1 as f32],
@@ -443,13 +382,13 @@ impl BackgroundPass {
         );
 
         let descriptor_set = unsafe {
-            batch.create_descriptor_set(&BackgroundShaderInterface {
+            frame.create_descriptor_set(&BackgroundShaderInterface {
                 uniforms: ubo.into(),
             })
         };
 
         let output_view = unsafe {
-            batch.create_image_view(&vk::ImageViewCreateInfo {
+            frame.create_image_view(&vk::ImageViewCreateInfo {
                 flags: vk::ImageViewCreateFlags::empty(),
                 image: target.handle,
                 view_type: vk::ImageViewType::TYPE_2D,
@@ -467,7 +406,7 @@ impl BackgroundPass {
         };
 
         let framebuffer = unsafe {
-            batch.create_framebuffer(
+            frame.create_framebuffer(
                 target_size.0,
                 target_size.1,
                 1,
@@ -482,7 +421,7 @@ impl BackgroundPass {
         let pipeline_layout = self.pipeline_layout;
         let pipeline = self.pipeline;
 
-        batch.add_graphics_pass("background render", |pass| {
+        frame.add_graphics_pass("background render", |pass| {
             // access uniforms buffer as SHADER_READ, vertex and fragment stages
 
             //dbg!(ubo);
@@ -579,7 +518,7 @@ impl BackgroundPass {
 }
 
 fn load_image(
-    batch: &graal::Batch,
+    batch: &graal::Frame,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
     mipmaps: bool,
@@ -753,7 +692,7 @@ struct MeshData {
     vertex_count: usize,
 }
 
-fn load_mesh(batch: &graal::Batch, obj_file_path: &Path) -> MeshData {
+fn load_mesh(batch: &graal::Frame, obj_file_path: &Path) -> MeshData {
     let obj = obj::Obj::load(obj_file_path).expect("failed to load obj file");
 
     #[repr(C)]
@@ -841,7 +780,7 @@ fn load_mesh(batch: &graal::Batch, obj_file_path: &Path) -> MeshData {
 }
 
 fn test_pass(
-    batch: &graal::Batch,
+    batch: &graal::Frame,
     name: &str,
     images: &[(
         graal::ImageId,
@@ -945,7 +884,7 @@ fn main() {
     let mut context = graal::Context::new(device);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
 
-    let mut init_batch = context.start_batch();
+    let mut init_batch = context.start_frame();
     let (file_image_id, file_image_width, file_image_height) = load_image(
         &init_batch,
         "../data/El4KUGDU0AAW64U.jpg".as_ref(),
@@ -998,7 +937,7 @@ fn main() {
                 // transient resources are deleted once the batch is finished, regardless of refcounts
 
                 let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
-                let mut batch = context.start_batch();
+                let mut batch = context.start_frame();
 
                 bkgpp.run(
                     &batch,

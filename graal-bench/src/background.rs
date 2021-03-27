@@ -234,7 +234,7 @@ impl BackgroundPass {
 
     pub fn run(
         &self,
-        batch: &graal::Batch,
+        frame: &graal::Frame,
         target: graal::ImageInfo,
         target_format: vk::Format,
         target_size: (u32, u32),
@@ -250,12 +250,12 @@ impl BackgroundPass {
             Vertex2D::new([right, bottom], [1.0, 1.0]),
         ];
 
-        let vbo = batch.upload_slice(
+        let vbo = frame.upload_slice(
             vk::BufferUsageFlags::VERTEX_BUFFER,
             vertices,
             Some("background vertices"),
         );
-        let ubo = batch.upload(
+        let ubo = frame.upload(
             vk::BufferUsageFlags::UNIFORM_BUFFER,
             &BackgroundUniforms {
                 u_resolution: [target_size.0 as f32, target_size.1 as f32],
@@ -265,13 +265,11 @@ impl BackgroundPass {
             Some("background uniforms"),
         );
 
-        // what's left:
-        // - safe transient image objects
         let render_pass = self.render_pass;
         let pipeline_layout = self.pipeline_layout;
         let pipeline = self.pipeline;
 
-        batch.add_graphics_pass("background render", |pass| {
+        frame.add_graphics_pass("background render", |pass| {
             // access uniforms buffer as SHADER_READ, vertex and fragment stages
             pass.register_buffer_access(ubo.id, graal::AccessType::AnyShaderReadUniformBuffer);
             // access quad VBO as vertex input

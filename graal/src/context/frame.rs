@@ -7,7 +7,7 @@ use crate::{
             BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
             ResourceMemory, TypedBufferInfo,
         },
-        BatchSerialNumber, CommandContext, InFlightBatch, SubmissionNumber, SwapchainImage,
+        FrameSerialNumber, CommandContext, FrameInFlight, SubmissionNumber, SwapchainImage,
     },
     descriptor::BufferDescriptor,
     device::QueuesInfo,
@@ -387,8 +387,8 @@ fn add_execution_dependency(
             dst.src_stage_mask |= src.output_stage_mask;
         }
 
-        dst.preds.push(src.batch_index);
-        src.succs.push(dst.batch_index);
+        dst.preds.push(src.frame_index);
+        src.succs.push(dst.frame_index);
     } else {
         // --- Inter-batch synchronization w/ timeline semaphore
         let q = src_snn.queue();
@@ -413,12 +413,12 @@ fn get_pass_mut<'a, 'b>(
 }
 
 /// Builder object for passes.
-pub struct PassBuilder<'a, 'batch> {
-    batch: &'batch mut BatchInner<'a>,
+pub struct PassBuilder<'a, 'frame> {
+    batch: &'frame mut FrameInner<'a>,
     pass: Pass<'a>,
 }
 
-impl<'a, 'batch> PassBuilder<'a, 'batch> {
+impl<'a, 'frame> PassBuilder<'a, 'frame> {
     pub fn register_image_access(&mut self, id: ImageId, access_type: AccessType) {
         let AccessTypeInfo {
             access_mask,
@@ -489,18 +489,18 @@ impl<'a, 'batch> PassBuilder<'a, 'batch> {
     }
 }
 
-struct BatchInner<'a> {
+struct FrameInner<'a> {
     base_serial: u64,
     context: &'a mut Context,
     /// Map temporary index -> resource
     temporaries: Vec<ResourceId>,
-    /// Set of all resources referenced in the batch
+    /// Set of all resources referenced in the frame
     temporary_set: TemporarySet,
     /// List of passes
     passes: Vec<Pass<'a>>,
 }
 
-impl<'a> BatchInner<'a> {
+impl<'a> FrameInner<'a> {
     /// Registers an access to a resource within the specified pass and updates the dependency graph.
     ///
     /// This is the meat of the automatic synchronization system: given the known state of the resources,
@@ -513,14 +513,14 @@ impl<'a> BatchInner<'a> {
         access: &ResourceAccessDetails,
     ) {
         //------------------------
-        // first, add the resource into the set of temporaries used within this batch
+        // first, add the resource into the set of temporaries used within this frame
         let resource = self.context.resources.get_mut(id).unwrap();
         if self.temporary_set.insert(id) {
-            // this is the first time the resource has been used in the batch
+            // this is the first time the resource has been used in the frame
             match resource.memory {
                 ResourceMemory::Aliasable(_) => {
                     if resource.tracking.has_writer() || resource.tracking.has_readers() {
-                        panic!("transient resource was already used in a previous batch")
+                        panic!("transient resource was already used in a previous frame")
                     }
                 }
                 _ => {}
@@ -595,7 +595,7 @@ impl<'a> BatchInner<'a> {
         // see the last version of the resource.
 
         // are all writes to the resource visible to the requested access type?
-        // resource was last written in a previous batch, so all writes are made visible
+        // resource was last written in a previous frame, so all writes are made visible
         // by the semaphore wait inserted by the execution dependency (FIXME is that true? is it not "available" only?)
         // resource.tracking.writer.serial() <= self.base_serial ||
         // resource visible to all MEMORY_READ, or to the requested mask
@@ -615,7 +615,7 @@ impl<'a> BatchInner<'a> {
             is_write && is_write_access(resource.tracking.availability_mask);
 
         if !writes_visible || layout_transition || write_after_write_hazard {
-            // if the last writer of the serial is in another batch, all writes are made available because of the semaphore
+            // if the last writer of the serial is in another frame, all writes are made available because of the semaphore
             // wait inserted by the execution dependency. Otherwise, we need to consider the available writes on the resource.
             let src_access_mask = if resource.tracking.writer.serial() <= self.base_serial {
                 vk::AccessFlags::empty()
@@ -699,19 +699,19 @@ impl<'a> BatchInner<'a> {
     }
 }
 
-pub struct Batch<'a> {
+pub struct Frame<'a> {
     base_serial: u64,
-    batch_serial: BatchSerialNumber,
-    inner: RefCell<BatchInner<'a>>,
+    frame_serial: FrameSerialNumber,
+    inner: RefCell<FrameInner<'a>>,
 }
 
-impl<'a> Batch<'a> {
-    pub(crate) fn new(context: &'a mut Context) -> Batch<'a> {
+impl<'a> Frame<'a> {
+    pub(crate) fn new(context: &'a mut Context) -> Frame<'a> {
         let base_serial = context.next_serial;
-        Batch {
+        Frame {
             base_serial,
-            batch_serial: BatchSerialNumber(context.submitted_batch_count + 1),
-            inner: RefCell::new(BatchInner {
+            frame_serial: FrameSerialNumber(context.submitted_frame_count + 1),
+            inner: RefCell::new(FrameInner {
                 base_serial,
                 context,
                 temporaries: vec![],
@@ -721,14 +721,14 @@ impl<'a> Batch<'a> {
         }
     }
 
-    /// Returns the context from which this batch was started
+    /// Returns the context from which this frame was started
     pub fn context(&self) -> RefMut<Context> {
         RefMut::map(self.inner.borrow_mut(), |inner| inner.context)
     }
 
-    /// Returns this batch's serial
-    pub fn serial(&self) -> BatchSerialNumber {
-        self.batch_serial
+    /// Returns this frame's serial
+    pub fn serial(&self) -> FrameSerialNumber {
+        self.frame_serial
     }
 
     /// Creates a transient image.
@@ -979,7 +979,7 @@ impl<'a> Batch<'a> {
         )
     }
 
-    /// Finishes building the batch and submits all the passes to the command queues.
+    /// Finishes building the frame and submits all the passes to the command queues.
     pub fn finish(mut self) {
         //println!("====== Batch #{} ======", self.batch_serial.0);
 
@@ -1080,9 +1080,9 @@ impl<'a> Batch<'a> {
         }*/
 
         // First, wait for the frames submitted before the last one to finish, for pacing.
-        // This also reclaims the resources referenced by the batch that are not in use anymore.
-        context.wait_for_batches_in_flight();
-        // Allocate and assign memory for all transient resources of this batch.
+        // This also reclaims the resources referenced by the frames that are not in use anymore.
+        context.wait_for_frames_in_flight();
+        // Allocate and assign memory for all transient resources of this frame.
         let transient_allocations = context.allocate_memory_for_transients(
             self.base_serial,
             &inner.temporaries,
@@ -1090,16 +1090,16 @@ impl<'a> Batch<'a> {
         );
         // All resources now have a block of device memory assigned. We're ready to
         // build the command buffers and submit them to the device queues.
-        let submission_result = context.submit_batch(&mut inner.passes);
-        // Add this batch to the list of "batches in flight": batches that might be executing on the device.
-        // When this batch is completed, all resources of the batch will be automatically recycled.
+        let submission_result = context.submit_frame(&mut inner.passes);
+        // Add this frame to the list of "frames in flight": frames that might be executing on the device.
+        // When this frame is completed, all resources of the frame will be automatically recycled.
         // This includes:
         // - device memory blocks for transient allocations
         // - command buffers (in command pools)
         // - image views
         // - framebuffers
         // - descriptor sets
-        context.in_flight.push_back(InFlightBatch {
+        context.in_flight.push_back(FrameInFlight {
             signalled_serials: submission_result.signalled_serials,
             transient_allocations,
             command_pools: submission_result.command_pools,
@@ -1109,7 +1109,7 @@ impl<'a> Batch<'a> {
             semaphores: submission_result.semaphores,
         });
 
-        context.submitted_batch_count += 1;
+        context.submitted_frame_count += 1;
         context.dump_state();
     }
 }

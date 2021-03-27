@@ -1,13 +1,13 @@
 use graal::{ash::version::DeviceV1_0, vk, ImageInfo};
 
 pub fn blit_images(
-    batch: &graal::Batch,
+    frame: &graal::Frame,
     src_image: ImageInfo,
     dst_image: ImageInfo,
     size: (u32, u32),
     aspect_mask: vk::ImageAspectFlags,
 ) {
-    batch.add_graphics_pass("blit_images", |pass| {
+    frame.add_graphics_pass("blit_images", |pass| {
         pass.register_image_access(src_image.id, graal::AccessType::TransferRead);
         pass.register_image_access(dst_image.id, graal::AccessType::TransferWrite);
 
