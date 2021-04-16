@@ -133,7 +133,7 @@ unsafe fn find_queue_family(
 }
 
 impl Device {
-    pub fn new(present_surface: vk::SurfaceKHR) -> Device {
+    pub fn new(present_surface: Option<vk::SurfaceKHR>) -> Device {
         unsafe {
             let instance = &*VULKAN_INSTANCE;
             let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, instance);
@@ -147,7 +147,7 @@ impl Device {
                 &vk_khr_surface,
                 &queue_family_properties,
                 vk::QueueFlags::GRAPHICS,
-                Some(present_surface),
+                present_surface,
             );
             let compute_queue_family = find_queue_family(
                 phy.phy,

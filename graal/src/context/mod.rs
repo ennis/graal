@@ -41,6 +41,7 @@ pub(crate) mod descriptor;
 pub(crate) mod pass;
 pub(crate) mod resource;
 pub(crate) mod submission;
+mod sync_table;
 
 use crate::{
     context::resource::{BufferId, ImageId},
@@ -50,6 +51,11 @@ pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
 pub use descriptor::DescriptorSetAllocatorId;
 pub use submission::CommandContext;
 use std::sync::Arc;
+use std::ops::{Sub, Deref, DerefMut};
+use crate::context::frame::FrameCreateInfo;
+
+/// Maximum time to wait for batches to finish in `SubmissionState::wait`.
+pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// A number that uniquely identifies a frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
@@ -63,14 +69,15 @@ pub struct SubmissionNumber(u64);
 
 impl SubmissionNumber {
     /// Creates a new submission number from a queue index and a serial.
-    pub fn new(queue_index: u8, serial: u64) -> SubmissionNumber {
+    pub fn new(queue_index: usize, serial: u64) -> SubmissionNumber {
+        assert!(queue_index < 4);
         assert!(serial < 1u64 << 62);
         SubmissionNumber(((queue_index as u64) << 62) | serial)
     }
 
     /// The queue that the pass is submitted on.
-    pub const fn queue(&self) -> u8 {
-        (self.0 >> 62) as u8
+    pub const fn queue(&self) -> usize {
+        (self.0 >> 62) as usize
     }
 
     /// The serial number of the pass.
@@ -96,15 +103,31 @@ impl fmt::Debug for SubmissionNumber {
 pub struct QueueSerialNumbers(pub [u64; MAX_QUEUES]);
 
 impl QueueSerialNumbers {
-    pub fn new() -> QueueSerialNumbers {
-        Default::default()
+    pub const fn new() -> QueueSerialNumbers {
+        QueueSerialNumbers([0; MAX_QUEUES])
     }
 
-    pub fn serial(&self, queue: u8) -> u64 {
-        self.0[queue as usize]
+    pub fn from_submission_number(snn: SubmissionNumber) -> QueueSerialNumbers {
+        Self::from_queue_serial(snn.queue(), snn.serial())
     }
 
-    pub fn assign_max_serial(&mut self, queue: u8, other: u64) {
+    pub fn from_queue_serial(queue: usize, serial: u64) -> QueueSerialNumbers {
+        let mut s = Self::new();
+        s[queue] = serial;
+        s
+    }
+
+    pub fn serial(&self, queue: usize) -> u64 {
+        self.0[queue]
+    }
+
+    pub fn assign_max(&mut self, other: &QueueSerialNumbers) {
+        for i in 0..MAX_QUEUES {
+            self.0[i] = self.0[i].max(other.0[i]);
+        }
+    }
+
+    pub fn assign_max_serial(&mut self, queue: usize, other: u64) {
         self.0[queue as usize] = self.0[queue as usize].max(other);
     }
 
@@ -117,19 +140,20 @@ impl QueueSerialNumbers {
     }
 }
 
-impl Index<u8> for QueueSerialNumbers {
-    type Output = u64;
+impl Deref for QueueSerialNumbers {
+    type Target = [u64];
 
-    fn index(&self, index: u8) -> &Self::Output {
-        &self.0[index as usize]
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
-impl IndexMut<u8> for QueueSerialNumbers {
-    fn index_mut(&mut self, index: u8) -> &mut Self::Output {
-        &mut self.0[index as usize]
+impl DerefMut for QueueSerialNumbers {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
     }
 }
+
 
 impl PartialOrd for QueueSerialNumbers {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -375,6 +399,24 @@ struct FrameInFlight {
     framebuffers: Vec<vk::Framebuffer>,
     descriptor_sets: Vec<DescriptorSet>,
     semaphores: Vec<vk::Semaphore>,
+}
+
+/// Represents a point in the future where a given GPU operation has completed.
+#[derive(Copy,Clone,Debug)]
+pub struct GpuFuture {
+    serials: QueueSerialNumbers,
+}
+
+impl GpuFuture {
+    /// Returns a future representing the moment when the operations represented
+    /// by both `self` and `other` have completed.
+    pub fn and(&self, other: &GpuFuture) -> GpuFuture {
+        let mut serials = self.serials;
+        serials.assign_max(&other.serials);
+        GpuFuture {
+            serials
+        }
+    }
 }
 
 pub struct Context {
@@ -702,8 +744,18 @@ impl Context {
         *self.render_passes.get(id).unwrap()
     }
 
-    pub fn start_frame(&mut self) -> Frame {
-        Frame::new(self)
+    /// Starts recording of a new frame. The execution of the frame can optionally be synchronized
+    /// with the given future in `happens_after`.
+    ///
+    /// If `happens_after` is `None`, the frame won't be synchronized and may start executing immediately.
+    /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
+    /// because of resource dependencies.
+    pub fn start_frame(&mut self, create_info: &FrameCreateInfo) -> Frame {
+        Frame::new(self, create_info)
+    }
+
+    pub fn wait_for(&mut self, future: GpuFuture) {
+        self.wait(&future.serials);
     }
 }
 

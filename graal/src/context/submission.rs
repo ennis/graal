@@ -13,9 +13,8 @@ use std::{
     ops::{Deref, DerefMut},
     ptr,
 };
+use crate::context::SEMAPHORE_WAIT_TIMEOUT_NS;
 
-/// Maximum time to wait for batches to finish in `SubmissionState::wait`.
-const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
 
 /// Resources created at submission time.
 struct SubmissionTimeResources {
@@ -246,7 +245,7 @@ impl Context {
 
     fn submit_command_batch(
         &mut self,
-        q: u8,
+        q: usize,
         sb: &CommandBatch,
         used_semaphores: &mut Vec<vk::Semaphore>,
     ) {
@@ -326,8 +325,8 @@ impl Context {
     }
 
     /// Creates a command pool and wraps it in a `CommandAllocator`.
-    fn create_command_pool(&mut self, queue_index: u8) -> CommandAllocator {
-        let queue_family = self.device.queues_info.families[queue_index as usize];
+    fn create_command_pool(&mut self, queue_index: usize) -> CommandAllocator {
+        let queue_family = self.device.queues_info.families[queue_index];
         if let Some(pos) = self
             .available_command_pools
             .iter()
@@ -372,14 +371,14 @@ impl Context {
             if p.wait_before {
                 // the pass needs a semaphore wait, so it needs a separate batch
                 // close the batches on all queues that the pass waits on
-                for i in 0..MAX_QUEUES as u8 {
-                    if !cmd_batches[i as usize].is_empty() && (i == q || p.wait_serials[i] != 0) {
+                for i in 0..MAX_QUEUES {
+                    if !cmd_batches[i].is_empty() && (i == q || p.wait_serials[i] != 0) {
                         self.submit_command_batch(
-                            i as u8,
-                            &cmd_batches[i as usize],
+                            i,
+                            &cmd_batches[i],
                             &mut used_semaphores,
                         );
-                        cmd_batches[i as usize].reset();
+                        cmd_batches[i].reset();
                     }
                 }
             }
@@ -427,20 +426,21 @@ impl Context {
             }
 
             // emit barriers if needed
-            if p.src_stage_mask != vk::PipelineStageFlags::TOP_OF_PIPE
-                || p.input_stage_mask != vk::PipelineStageFlags::BOTTOM_OF_PIPE
-                || !p.buffer_memory_barriers.is_empty()
-                || !p.image_memory_barriers.is_empty()
+            let barrier = &p.pre_execution_barrier;
+            if barrier.src_stage_mask != vk::PipelineStageFlags::TOP_OF_PIPE
+                || barrier.dst_stage_mask != vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                || !barrier.buffer_memory_barriers.is_empty()
+                || !barrier.image_memory_barriers.is_empty()
             {
-                let src_stage_mask = if p.src_stage_mask.is_empty() {
+                let src_stage_mask = if barrier.src_stage_mask.is_empty() {
                     vk::PipelineStageFlags::TOP_OF_PIPE
                 } else {
-                    p.src_stage_mask
+                    barrier.src_stage_mask
                 };
-                let dst_stage_mask = if p.input_stage_mask.is_empty() {
+                let dst_stage_mask = if barrier.dst_stage_mask.is_empty() {
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE
                 } else {
-                    p.input_stage_mask
+                    barrier.dst_stage_mask
                 };
                 unsafe {
                     // TODO safety
@@ -450,8 +450,8 @@ impl Context {
                         dst_stage_mask,
                         Default::default(),
                         &[],
-                        &p.buffer_memory_barriers,
-                        &p.image_memory_barriers,
+                        &barrier.buffer_memory_barriers,
+                        &barrier.image_memory_barriers,
                     )
                 }
             }

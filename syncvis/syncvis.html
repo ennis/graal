@@ -1,0 +1,400 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>Synchronization visualizer</title>
+    <meta charset="UTF-8">
+    <script src="d3.min.js"></script>
+    <script src="syncvis.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/css/bootstrap.min.css" rel="stylesheet"
+          integrity="sha384-eOJMYsd53ii+scO/bJGFsiCZc+5NDVN2yr8+0RDqr0Ql0h+rP48ckxlpbzKgwra6" crossorigin="anonymous">
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.0.0-beta3/dist/js/bootstrap.bundle.min.js"
+            integrity="sha384-JEW9xMcG8R+pH31jmWH6WWP0WintQrMb4s7ZOdauHnUtxwoG2vI5DkLtS3qm9Ekf"
+            crossorigin="anonymous"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <link rel="stylesheet" href="css/font-awesome.min.css">
+    <style type="text/css">
+
+        .pass-label {
+            font-style: italic;
+        }
+
+        .queue-label-graphics {
+            background: #198754;
+        }
+
+        .stage-badge- {
+            color: white;
+            background: darkgray;
+        }
+
+        .stage-badge-DRAW_INDIRECT {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-VERTEX_INPUT {
+            color: white;
+            background: #dc3545;
+        }
+
+        .stage-badge-VERTEX_SHADER {
+            color: white;
+            background: #fd7e14;
+        }
+
+        .stage-badge-TESSELLATION_CONTROL_SHADER {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-TESSELLATION_EVALUATION_SHADER {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-GEOMETRY_SHADER {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-TRANSFORM_FEEDBACK_EXT {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-TASK_SHADER_NV {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-MESH_SHADER_NV {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-SHADING_RATE_IMAGE_NV {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-EARLY_FRAGMENT_TESTS {
+            color: white;
+            background: #d63384;
+        }
+
+        .stage-badge-FRAGMENT_SHADER {
+            color: white;
+            background: #198754;
+        }
+
+        .stage-badge-LATE_FRAGMENT_TESTS {
+            color: white;
+            background: #d63384;
+        }
+
+        .stage-badge-COLOR_ATTACHMENT_OUTPUT {
+            color: white;
+            background: #6610f2;
+        }
+
+        .stage-badge-FRAGMENT_DENSITY_PROCESS_EXT {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-COMPUTE_SHADER {
+            color: white;
+            background: #0d6efd;
+        }
+
+        .stage-badge-RAY_TRACING_SHADER_KHR {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-HOST {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-COMMAND_PREPROCESS_NV {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-ACCELERATION_STRUCTURE_BUILD_KHR {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-TRANSFER {
+            color: black;
+            background: #ffc107;
+        }
+
+        .stage-badge-CONDITIONAL_RENDERING_EXT {
+            color: black;
+            background: #0191f3;
+        }
+
+        .stage-badge-ALL_GRAPHICS {
+            color: white;
+            background: black;
+        }
+
+        .stage-badge-ALL_COMMANDS {
+            color: white;
+            background: black;
+        }
+
+        .access-badge- { color: white; background: black; }
+        .access-badge-INDEX_READ { color: white; background: #0d6efd; }
+        .access-badge-VERTEX_ATTRIBUTE_READ { color: white; background: #0d6efd; }
+        .access-badge-UNIFORM_READ { color: white; background: #198754; }
+        .access-badge-SHADER_READ { color: white; background: #20c997; }
+        .access-badge-SHADER_WRITE { color: white; background: #79bf47; }
+        .access-badge-COLOR_ATTACHMENT_READ { color: white; background: #6610f2; }
+        .access-badge-COLOR_ATTACHMENT_WRITE { color: white; background: #6f42c1; }
+        .access-badge-DEPTH_STENCIL_ATTACHMENT_READ { color: white; background: #d63384; }
+        .access-badge-DEPTH_STENCIL_ATTACHMENT_WRITE { color: white; background: #dc3545; }
+        .access-badge-TRANSFER_READ { color: black; background: #ffc107; }
+        .access-badge-TRANSFER_WRITE { color: white; background: #fd7e14; }
+        .access-badge-MEMORY_READ { color: white; background: gray; }
+        .access-badge-MEMORY_WRITE { color: white; background: gray; }
+
+        .resource-type-badge-image {
+            color: white;
+            background: black;
+        }
+        .resource-type-badge-image::before {
+            content: "Image";
+        }
+
+        .resource-type-badge-buffer {
+            color: white;
+            background: black;
+        }
+
+        .resource-type-badge-buffer::before {
+            content: "Buffer";
+        }
+
+        .btn:focus {
+            outline: none;
+            box-shadow: none;
+        }
+
+    </style>
+</head>
+
+<body>
+<main class="py-4">
+    <div class="container">
+        <h1>Frame view</h1>
+        <input id="frame-json-input" type="file"/>
+        <div class="row">
+            <div>
+                <h2>Passes</h2>
+                <div id="passes">
+                    <table class="table table-hover">
+                        <thead class="table-dark">
+                        <tr>
+                            <th scope="col"></th>
+                            <th scope="col">Queue</th>
+                            <th scope="col">Serial</th>
+                            <th scope="col">Label</th>
+                            <th scope="col">Accesses</th>
+                        </tr>
+                        </thead>
+                        <tbody>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</main>
+
+<script>
+    const input = document.getElementById('frame-json-input');
+    input.addEventListener('change', load);
+
+    function load() {
+        const file = input.files[0];
+        const reader = new FileReader();
+        reader.onload = loadedFrameData;
+        reader.readAsText(file);
+
+        function loadedFrameData() {
+            const data = JSON.parse(reader.result);
+            createTimeline(data);
+        }
+    }
+
+
+
+    // Timeline view
+    function createTimeline(data) {
+        // --- Queues ----------------------------------------------
+        // default mapping from queue index to name
+        const queueNames = ["graphics", "compute", "transfer"];
+        const queuesHeight = queueNames.length * 30;
+
+        // --- Internals ----------------------------------------------
+
+        // get min/max serials
+        const baseSerial = data.frameSerial;
+        const serials = data.passes.map(passData => baseSerial + passData.serial);
+        const serialsExtent = (function () {
+            let ext = d3.extent(serials);
+            return [ext[0] - 1, ext[1]];
+        })();
+
+        // queue indices
+        const queueIndices = d3.extent(data.passes.map(passData => passData.queue));
+        const queueColors = d3.scaleOrdinal(d3.schemeSet2).domain(queueIndices);
+
+        // passes
+        const passTable = $('#passes tbody');
+        const passDetails = $('#pass-details');
+
+        function stageMaskBadges(stageMask) {
+            return stageMask
+                .split("|")
+                .map(s => s.trim())
+                .map(s => `<span class="mx-1 badge stage-badge-${s}">${s === '' ? 'empty' : s}</span>`)
+                .join('');
+        }
+
+        function accessMaskBadges(accessMask) {
+            return accessMask
+                .split("|")
+                .map(s => s.trim())
+                .map(s => `<div class="mx-1 badge access-badge-${s}">${s === '' ? 'none' : s}</div>`)
+                .join('');
+        }
+
+        data.passes.forEach(function (passData) {
+            const queueName = queueNames[passData.queue];
+
+
+            // details view, hidden by default
+            let memoryBarriers = passData.barriers.bufferMemoryBarriers.concat(passData.barriers.imageMemoryBarriers);
+
+            let memoryBarrierRows = memoryBarriers.map(barrier =>
+                `<tr>
+                    <td><div class="badge resource-type-badge-${barrier.type}"></div> ${barrier.name} <span class="text-muted">(${barrier.id},${barrier.handle})</span></td>
+                    <td>${accessMaskBadges(barrier.srcAccessMask)}</td>
+                    <td>${accessMaskBadges(barrier.dstAccessMask)}</td>
+                    <td>${barrier.oldLayout ? barrier.oldLayout : ''}</td>
+                    <td>${barrier.newLayout ? barrier.newLayout : ''}</td>
+                 </tr>`).join('');
+
+            const resourceTrackingInfos = passData.syncDebugInfo.resourceTrackingInfo.map(resourceData =>
+                `<tr>
+                    <td>${resourceData.name}(${resourceData.id})</td>
+                    <td>${resourceData.readers}</td>
+                    <td>${resourceData.writerQueue}:${resourceData.writerSerial}</td>
+                    <td>${resourceData.stages}</td>
+                    <td>${resourceData.layout}</td>
+                    <td>${resourceData.availabilityMask}</td>
+                    <td>${resourceData.visibilityMask}</td>
+                    <td>${resourceData.binarySemaphore}</td>
+                </tr>`
+            ).join('');
+
+            const accessInfos = passData.accesses.map(accessData =>
+                `
+                <div class="mb-1">
+                    <div>${accessData.name} <span class="text-muted">(${accessData.id},${accessData.handle})</span> ${accessMaskBadges(accessData.accessMask)}</div>
+                    <!--<div class="small"><b>Predecessors:</b> <span>420, 69</span> <b>Successors:</b> <span>4412</span> </div> -->
+                </div>
+                `
+            ).join('');
+
+            // Pass table entry
+            const q = passData.queue;
+            const s = passData.serial;
+            const n = passData.name;
+            passTable.append(`
+                <tr id="pass-${s}">
+                    <td><button type="button" class="btn btn-outline-dark sm py-0 px-1 pass-toggle-button" data-pass-serial="${s}">+</button></td>
+                    <td><span class="badge queue-label-${queueName}">${queueName}</span></td>
+                    <td>${s}</th>
+                    <th scope="row">${n}</th>
+                    <td>
+                        <div class="flex-column small">
+                            ${accessInfos}
+                        </div>
+                    </td>
+                </tr>
+                <tr id="pass-details-${s}" class="d-none">
+                    <td colspan="4"></td>
+                    <td>
+                        <div id="pass-details-${s}" class="small">
+                            <!--<ul class="nav nav-tabs">
+                                <li class="nav-item"><a class="nav-link active" href="#">Overview</a></li>
+                                <li class="nav-item"><a class="nav-link" href="#">Memory barriers</a></li>
+                                <li class="nav-item"><a class="nav-link" href="#">Resource tracking</a></li>
+                            </ul>-->
+
+                            <dl class="row">
+                                <dt class="col-sm-2 text-md-end">Execution barrier:</dt>
+                                <dd class="col-sm-10">${stageMaskBadges(passData.barriers.srcStageMask)}🡲${stageMaskBadges(passData.barriers.dstStageMask)}</dd>
+
+                                <dt class="col-sm-2 text-md-end">Memory barriers: </dt>
+                                <dd class="col-sm-10">
+                                    <table class="table">
+                                        <thead>
+                                            <th>Resource</th>
+                                            <th>srcAccessMask</th>
+                                            <th>dstAccessMask</th>
+                                            <th>oldLayout</th>
+                                            <th>newLayout</th>
+                                        </thead>
+                                        <tbody>
+                                            ${memoryBarrierRows}
+                                        </tbody>
+                                    </table>
+                                </dd>
+
+                                <!--<h5>Resource tracking info</h5>
+                                <table class="table">
+                                    <thead>
+                                        <th>Resource</th>
+                                        <th>Readers</th>
+                                        <th>Writer</th>
+                                        <th>Stages</th>
+                                        <th>Layout</th>
+                                        <th>Pending avail</th>
+                                        <th>Visible</th>
+                                        <th>Semaphore</th>
+                                    </thead>
+                                    <tbody>
+                                        ${resourceTrackingInfos}
+                                    </tbody>
+                                </table>-->
+                            </dl>
+                        </div>
+                    </td>
+                </tr>
+                `);
+        });
+
+        /*$('input[type=radio][name="tableRadio"]').change(function() {
+            $('#pass-details>div').addClass('d-none');
+            $(`#pass-details-${this.value}`).removeClass('d-none');
+        });*/
+
+        $('[data-bs-toggle="popover"]').each(function () {
+            return new bootstrap.Popover(this);
+        });
+
+        $('.pass-toggle-button').click(function() {
+            $(`#pass-details-${this.dataset.passSerial}`).toggleClass('d-none');
+        });
+    }
+
+</script>
+</body>
+</html>

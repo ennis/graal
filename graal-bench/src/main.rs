@@ -17,9 +17,7 @@ use crate::{
     scene::Scene,
     shader::create_shader_module,
 };
-use graal::{
-    ash::version::DeviceV1_0, vk, FragmentOutputInterface, TypedBufferInfo, VertexInputInterfaceExt,
-};
+use graal::{ash::version::DeviceV1_0, vk, FragmentOutputInterface, TypedBufferInfo, VertexInputInterfaceExt, FrameCreateInfo};
 use raw_window_handle::HasRawWindowHandle;
 use winit::{
     event::{ElementState, Event, MouseButton, WindowEvent},
@@ -57,28 +55,27 @@ fn main() {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
-    let device = graal::Device::new(surface);
+    let device = graal::Device::new(Some(surface));
     let mut context = graal::Context::new(device);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
 
     // Initial frame to upload static resources (meshes and textures)
-    let mut init_frame = context.start_frame();
+    let mut init_frame = context.start_frame(&graal::FrameCreateInfo {
+        happens_after: None,
+        collect_debug_info: true
+    });
     let mut scene = Scene::new();
     scene.import_obj(&init_frame, "data/reimu.obj".as_ref());
-
-    //let mesh = load_mesh(&init_frame, "data/reimu.obj".as_ref());
-    init_frame.finish();
-
-    // Create passes
+    let mut prev_frame_future = Some(init_frame.finish());
     let bkg_pass = BackgroundPass::new(&mut context);
     let geom_pass = GeometryPass::new(&mut context);
-
     let mut swapchain_size: (u32, u32) = window.inner_size().into();
     let mut camera_control = CameraControl::new(glam::dvec2(
         swapchain_size.0 as f64,
         swapchain_size.1 as f64,
     ));
     //camera_control.center_on_bounds(&mesh.bounds, std::f64::consts::FRAC_PI_2);
+    let mut dump_next_frame = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
@@ -101,6 +98,11 @@ fn main() {
                     };
                     camera_control
                         .handle_input(&CameraControlInput::MouseInput { button, pressed });
+                }
+                WindowEvent::KeyboardInput { input, .. } => {
+                    if let Some(winit::event::VirtualKeyCode::F11) = input.virtual_keycode {
+                        dump_next_frame = true;
+                    }
                 }
                 WindowEvent::CursorMoved { position, .. } => {
                     camera_control.handle_input(&CameraControlInput::CursorMoved {
@@ -125,7 +127,11 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
                 let camera = camera_control.camera();
-                let mut frame = context.start_frame();
+                let mut frame = context.start_frame(&FrameCreateInfo {
+                    happens_after: prev_frame_future,
+                    collect_debug_info: true
+                });
+                prev_frame_future = None;
 
                 // draw background
                 bkg_pass.run(
@@ -135,8 +141,8 @@ fn main() {
                     swapchain_size,
                 );
 
-                /*// draw our mesh to G-buffers
-                let gbuffers = mesh_pass.run(
+                // draw our mesh to G-buffers
+                /*let gbuffers = geom_pass.run(
                     &frame,
                     mesh.vertex_buffer,
                     mesh.vertex_count,
@@ -154,6 +160,11 @@ fn main() {
                 );*/
 
                 frame.present("present", &swapchain_image);
+
+                if dump_next_frame {
+                    frame.dump(Some("bench"));
+                    dump_next_frame = false;
+                }
                 frame.finish();
             }
             _ => (),

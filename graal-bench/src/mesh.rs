@@ -13,13 +13,18 @@ pub struct Vertex3D {
 /// A buffer containing vertices.
 #[derive(Copy, Clone, Debug)]
 pub struct MeshData {
-    /// GPU vertex buffer containing positions and normals.
+    /// GPU vertex buffer containing vertex attributes.
     pub vertex_buffer: graal::TypedBufferInfo<Vertex3D>,
+
+    /// GPU index buffer containing vertex indices.
     pub index_buffer: graal::TypedBufferInfo<u32>,
+
     /// Number of vertices.
     pub vertex_count: usize,
+
     /// Number of indices.
     pub index_count: usize,
+
     /// Bounds of the vertex data.
     pub bounds: BoundingBox,
 }

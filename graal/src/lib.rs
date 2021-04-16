@@ -16,6 +16,7 @@ pub use crate::{
             get_mip_level_count, BufferId, BufferInfo, BufferResourceCreateInfo, ImageId,
             ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, TypedBufferInfo,
         },
+        frame::FrameCreateInfo,
         AccessType, AccessTypeInfo, Frame, CommandContext, Context, DescriptorSetAllocatorId,
         PipelineLayoutId, RenderPassId, SwapchainId,
     },

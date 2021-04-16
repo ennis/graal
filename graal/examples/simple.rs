@@ -2,12 +2,7 @@ use ash::{
     version::DeviceV1_0,
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
-use graal::{
-    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk,
-    BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, ImageId, ImageInfo,
-    ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo,
-    VertexBufferView, VertexData, VertexInputInterface,
-};
+use graal::{ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk, BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, ImageId, ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo, VertexBufferView, VertexData, VertexInputInterface, FrameCreateInfo};
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -381,42 +376,8 @@ impl BackgroundPass {
             Some("background uniforms"),
         );
 
-        let descriptor_set = unsafe {
-            frame.create_descriptor_set(&BackgroundShaderInterface {
-                uniforms: ubo.into(),
-            })
-        };
-
-        let output_view = unsafe {
-            frame.create_image_view(&vk::ImageViewCreateInfo {
-                flags: vk::ImageViewCreateFlags::empty(),
-                image: target.handle,
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: vk::Format::B8G8R8A8_SRGB,
-                components: vk::ComponentMapping::default(),
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                },
-                ..Default::default()
-            })
-        };
-
-        let framebuffer = unsafe {
-            frame.create_framebuffer(
-                target_size.0,
-                target_size.1,
-                1,
-                self.render_pass,
-                &[output_view],
-            )
-        };
 
         // what's left:
-        // - safe transient image objects
         let render_pass = self.render_pass;
         let pipeline_layout = self.pipeline_layout;
         let pipeline = self.pipeline;
@@ -425,32 +386,64 @@ impl BackgroundPass {
             // access uniforms buffer as SHADER_READ, vertex and fragment stages
 
             //dbg!(ubo);
-            pass.register_buffer_access(
+            pass.register_buffer_access_2(
                 ubo.id,
                 vk::AccessFlags::SHADER_READ,
                 vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::PipelineStageFlags::empty(),
             );
 
             // access quad VBO as vertex input
-            pass.register_buffer_access(
+            pass.register_buffer_access_2(
                 vbo.id,
                 vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
                 vk::PipelineStageFlags::VERTEX_INPUT,
-                vk::PipelineStageFlags::empty(),
             );
 
             // write to the target image as a color attachment
-            pass.add_image_usage(
+            pass.register_image_access_2(
                 target.id,
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
 
             pass.set_commands(move |context, cb| {
                 unsafe {
+                    let descriptor_set = unsafe {
+                        context.create_descriptor_set(&BackgroundShaderInterface {
+                            uniforms: ubo.into(),
+                        })
+                    };
+
+
+                    let output_view = unsafe {
+                        context.create_image_view(&vk::ImageViewCreateInfo {
+                            flags: vk::ImageViewCreateFlags::empty(),
+                            image: target.handle,
+                            view_type: vk::ImageViewType::TYPE_2D,
+                            format: vk::Format::B8G8R8A8_SRGB,
+                            components: vk::ComponentMapping::default(),
+                            subresource_range: vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: vk::REMAINING_MIP_LEVELS,
+                                base_array_layer: 0,
+                                layer_count: vk::REMAINING_ARRAY_LAYERS,
+                            },
+                            ..Default::default()
+                        })
+                    };
+
+                    let framebuffer = unsafe {
+                        context.create_framebuffer(
+                            target_size.0,
+                            target_size.1,
+                            1,
+                            render_pass,
+                            &[output_view],
+                        )
+                    };
+
                     let render_pass_begin_info = vk::RenderPassBeginInfo {
                         render_pass,
                         framebuffer,
@@ -614,17 +607,15 @@ fn load_image(
 
     // build the upload pass
     batch.add_graphics_pass("image upload", |pass| {
-        pass.add_image_usage(
+        pass.register_image_access_2(
             image_id,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
-        pass.register_buffer_access(
+        pass.register_buffer_access_2(
             staging_buffer.id,
             vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,
         );
 
@@ -662,16 +653,16 @@ fn load_image(
     (image_id, width, height)
 }
 
-fn create_transient_image(context: &mut graal::Context, name: &str) -> ImageId {
+fn create_transient_image(context: &mut graal::Context, name: &str, is_depth: bool) -> ImageId {
     let ImageInfo { id, .. } = context.create_image(
         name,
         &graal::ResourceMemoryInfo::DEVICE_LOCAL,
         &graal::ImageResourceCreateInfo {
             image_type: graal::vk::ImageType::TYPE_2D,
-            usage: graal::vk::ImageUsageFlags::COLOR_ATTACHMENT
+            usage: if is_depth { graal::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT } else { graal::vk::ImageUsageFlags::COLOR_ATTACHMENT }
                 | graal::vk::ImageUsageFlags::SAMPLED
                 | graal::vk::ImageUsageFlags::TRANSFER_DST,
-            format: graal::vk::Format::R8G8B8A8_SRGB,
+            format: if is_depth { graal::vk::Format::D32_SFLOAT } else { graal::vk::Format::R8G8B8A8_SRGB },
             extent: graal::vk::Extent3D {
                 width: 1280,
                 height: 720,
@@ -747,16 +738,14 @@ fn load_mesh(batch: &graal::Frame, obj_file_path: &Path) -> MeshData {
 
     // upload
     let mut upload_pass = batch.add_transfer_pass("upload mesh", false, |pass| {
-        pass.register_buffer_access(
+        pass.register_buffer_access_2(
             staging_buffer.id,
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
         );
-        pass.register_buffer_access(
+        pass.register_buffer_access_2(
             vertex_buffer_id,
             vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
             vk::PipelineStageFlags::TRANSFER,
         );
         pass.set_commands(move |context, command_buffer| unsafe {
@@ -792,9 +781,27 @@ fn test_pass(
 ) {
     batch.add_graphics_pass(name, |pass| {
         for &(img, access_mask, input_stage, output_stage, layout) in images {
-            pass.add_image_usage(img, access_mask, input_stage, output_stage, layout);
+            pass.register_image_access_2(img, access_mask, input_stage, layout);
         }
     });
+}
+
+fn depth_attachment(
+    img: graal::ImageId,
+) -> (
+    graal::ImageId,
+    vk::AccessFlags,
+    vk::PipelineStageFlags,
+    vk::PipelineStageFlags,
+    vk::ImageLayout,
+) {
+    (
+        img,
+        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
+        vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    )
 }
 
 fn color_attachment_output(
@@ -808,7 +815,7 @@ fn color_attachment_output(
 ) {
     (
         img,
-        vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
+        vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
         vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
         vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
         vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
@@ -880,19 +887,23 @@ fn main() {
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
-    let device = graal::Device::new(surface);
+    let device = graal::Device::new(Some(surface));
     let mut context = graal::Context::new(device);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
 
-    let mut init_batch = context.start_frame();
+    let mut init_frame = context.start_frame(&FrameCreateInfo {
+        happens_after: None,
+        collect_debug_info: true
+    });
     let (file_image_id, file_image_width, file_image_height) = load_image(
-        &init_batch,
-        "../data/El4KUGDU0AAW64U.jpg".as_ref(),
+        &init_frame,
+        "data/haniyasushin_keiki.jpg".as_ref(),
         vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
         false,
     );
-    let mesh = load_mesh(&init_batch, "../data/sphere.obj".as_ref());
-    init_batch.finish();
+    let mesh = load_mesh(&init_frame, "data/sphere.obj".as_ref());
+    init_frame.dump(Some("init_frame"));
+    init_frame.finish();
 
     let bkgpp = BackgroundPass::new(&mut context);
 
@@ -917,18 +928,19 @@ fn main() {
             }
 
             Event::RedrawRequested(_) => {
-                let img_a = create_transient_image(&mut context, "A");
-                let img_b = create_transient_image(&mut context, "B");
-                let img_c = create_transient_image(&mut context, "C");
-                let img_d1 = create_transient_image(&mut context, "D1");
-                let img_d2 = create_transient_image(&mut context, "D2");
-                let img_e = create_transient_image(&mut context, "E");
-                let img_f = create_transient_image(&mut context, "F");
-                let img_g = create_transient_image(&mut context, "G");
-                let img_h = create_transient_image(&mut context, "H");
-                let img_i = create_transient_image(&mut context, "I");
-                let img_j = create_transient_image(&mut context, "J");
-                let img_k = create_transient_image(&mut context, "K");
+                let img_a = create_transient_image(&mut context, "A", false);
+                let img_b = create_transient_image(&mut context, "B", false);
+                let img_c = create_transient_image(&mut context, "C", false);
+                let img_d1 = create_transient_image(&mut context, "D1", false);
+                let img_d2 = create_transient_image(&mut context, "D2", false);
+                let img_e = create_transient_image(&mut context, "E", false);
+                let img_f = create_transient_image(&mut context, "F", false);
+                let img_g = create_transient_image(&mut context, "G", false);
+                let img_h = create_transient_image(&mut context, "H", false);
+                let img_i = create_transient_image(&mut context, "I", false);
+                let img_j = create_transient_image(&mut context, "J", false);
+                let img_k = create_transient_image(&mut context, "K", false);
+                let img_depth = create_transient_image(&mut context, "depth", true);
 
                 // each resource has a ref count
                 // - incremented when it's in use by a batch
@@ -937,19 +949,22 @@ fn main() {
                 // transient resources are deleted once the batch is finished, regardless of refcounts
 
                 let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
-                let mut batch = context.start_frame();
+                let mut frame = context.start_frame(&FrameCreateInfo {
+                    happens_after: None,
+                    collect_debug_info: true
+                });
 
                 bkgpp.run(
-                    &batch,
+                    &frame,
                     swapchain_image.image_info,
                     vk::Format::B8G8R8A8_SRGB,
                     swapchain_size,
                 );
 
-                test_pass(&batch, "P0", &[color_attachment_output(img_a)]);
-                test_pass(&batch, "P1", &[color_attachment_output(img_b)]);
+                test_pass(&frame, "P0", &[color_attachment_output(img_a)]);
+                test_pass(&frame, "P1", &[color_attachment_output(img_b)]);
                 test_pass(
-                    &batch,
+                    &frame,
                     "P2",
                     &[
                         compute_read(img_a),
@@ -958,9 +973,9 @@ fn main() {
                         compute_write(img_d2),
                     ],
                 );
-                test_pass(&batch, "P3", &[color_attachment_output(img_c)]);
+                test_pass(&frame, "P3", &[color_attachment_output(img_c), depth_attachment(img_depth)]);
                 test_pass(
-                    &batch,
+                    &frame,
                     "P4",
                     &[
                         compute_read(img_d2),
@@ -968,9 +983,9 @@ fn main() {
                         compute_write(img_e),
                     ],
                 );
-                test_pass(&batch, "P5", &[compute_read(img_d1), compute_write(img_f)]);
+                test_pass(&frame, "P5", &[compute_read(img_d1), compute_write(img_f)]);
                 test_pass(
-                    &batch,
+                    &frame,
                     "P6",
                     &[
                         compute_read(img_e),
@@ -978,10 +993,10 @@ fn main() {
                         compute_write(img_g),
                     ],
                 );
-                test_pass(&batch, "P7", &[compute_read(img_g), compute_write(img_h)]);
-                test_pass(&batch, "P8", &[compute_read(img_h), compute_write(img_i)]);
+                test_pass(&frame, "P7", &[compute_read(img_g), compute_write(img_h)]);
+                test_pass(&frame, "P8", &[compute_read(img_h), compute_write(img_i)]);
                 test_pass(
-                    &batch,
+                    &frame,
                     "P9",
                     &[
                         compute_read(img_i),
@@ -989,85 +1004,84 @@ fn main() {
                         compute_write(img_j),
                     ],
                 );
-                test_pass(&batch, "P10", &[compute_read(img_j), compute_write(img_k)]);
+                test_pass(&frame, "P10", &[compute_read(img_j), compute_write(img_k)]);
 
                 test_pass(
-                    &batch,
+                    &frame,
                     "P11",
                     &[color_attachment_output(swapchain_image.image_info.id)],
                 );
 
                 // blit pass
-                /*let mut blit_pass = batch.build_graphics_pass("blit to screen");
-                blit_pass.add_image_usage(
-                    file_image_id,
-                    vk::AccessFlags::TRANSFER_READ,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::empty(),
-                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                );
-                blit_pass.add_image_usage(
-                    swapchain_image.image_id,
-                    vk::AccessFlags::TRANSFER_WRITE,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::PipelineStageFlags::TRANSFER,
-                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                );
+                frame.add_graphics_pass("blit to screen", |pass| {
+                    pass.register_image_access_2(
+                        file_image_id,
+                        vk::AccessFlags::TRANSFER_READ,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    );
+                    pass.register_image_access_2(
+                        swapchain_image.image_info.id,
+                        vk::AccessFlags::TRANSFER_WRITE,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    );
 
-                let blit_w = file_image_width.min(swapchain_size.0);
-                let blit_h = file_image_height.min(swapchain_size.1);
-                blit_pass.set_commands(|context, command_buffer| {
-                    let dst_image_handle = context.image_handle(swapchain_image.image_id);
-                    let src_image_handle = context.image_handle(file_image_id);
+                    let blit_w = file_image_width.min(swapchain_size.0);
+                    let blit_h = file_image_height.min(swapchain_size.1);
 
-                    let regions = &[vk::ImageBlit {
-                        src_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        src_offsets: [
-                            vk::Offset3D { x: 0, y: 0, z: 0 },
-                            vk::Offset3D {
-                                x: blit_w as i32,
-                                y: blit_h as i32,
-                                z: 1,
+                    pass.set_commands(move |context, command_buffer| {
+                        let dst_image_handle = context.image_handle(swapchain_image.image_info.id);
+                        let src_image_handle = context.image_handle(file_image_id);
+
+                        let regions = &[vk::ImageBlit {
+                            src_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
                             },
-                        ],
-                        dst_subresource: vk::ImageSubresourceLayers {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            mip_level: 0,
-                            base_array_layer: 0,
-                            layer_count: 1,
-                        },
-                        dst_offsets: [
-                            vk::Offset3D { x: 0, y: 0, z: 0 },
-                            vk::Offset3D {
-                                x: blit_w as i32,
-                                y: blit_h as i32,
-                                z: 1,
+                            src_offsets: [
+                                vk::Offset3D { x: 0, y: 0, z: 0 },
+                                vk::Offset3D {
+                                    x: blit_w as i32,
+                                    y: blit_h as i32,
+                                    z: 1,
+                                },
+                            ],
+                            dst_subresource: vk::ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
                             },
-                        ],
-                    }];
+                            dst_offsets: [
+                                vk::Offset3D { x: 0, y: 0, z: 0 },
+                                vk::Offset3D {
+                                    x: blit_w as i32,
+                                    y: blit_h as i32,
+                                    z: 1,
+                                },
+                            ],
+                        }];
 
-                    unsafe {
-                        context.device().cmd_blit_image(
-                            command_buffer,
-                            src_image_handle,
-                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                            dst_image_handle,
-                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                            regions,
-                            vk::Filter::NEAREST,
-                        );
-                    }
+                        unsafe {
+                            context.device().cmd_blit_image(
+                                command_buffer,
+                                src_image_handle,
+                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                                dst_image_handle,
+                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                                regions,
+                                vk::Filter::NEAREST,
+                            );
+                        }
+                    });
                 });
-                blit_pass.finish();*/
 
-                batch.present("P12", &swapchain_image);
-
-                batch.finish();
+                frame.present("P12", &swapchain_image);
+                frame.dump(Some("frame"));
+                frame.finish();
             }
             _ => (),
         }

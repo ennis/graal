@@ -344,8 +344,8 @@ impl BackgroundPass {
                         &[vk::Viewport {
                             x: 0.0,
                             y: 0.0,
-                            width: 1024.0,
-                            height: 768.0,
+                            width: target_size.0 as f32,
+                            height: target_size.1 as f32,
                             min_depth: 0.0,
                             max_depth: 1.0,
                         }],
@@ -356,8 +356,8 @@ impl BackgroundPass {
                         &[vk::Rect2D {
                             offset: Default::default(),
                             extent: vk::Extent2D {
-                                width: 1024,
-                                height: 768,
+                                width: target_size.0,
+                                height: target_size.1,
                             },
                         }],
                     );

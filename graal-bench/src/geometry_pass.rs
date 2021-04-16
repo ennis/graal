@@ -235,19 +235,16 @@ impl GeometryPass {
             ..Default::default()
         };
 
-        let color_blend_attachments = &[vk::PipelineColorBlendAttachmentState {
+        let no_blend = vk::PipelineColorBlendAttachmentState {
             blend_enable: vk::FALSE,
-            src_color_blend_factor: Default::default(),
-            dst_color_blend_factor: Default::default(),
-            color_blend_op: Default::default(),
-            src_alpha_blend_factor: Default::default(),
-            dst_alpha_blend_factor: Default::default(),
-            alpha_blend_op: Default::default(),
             color_write_mask: vk::ColorComponentFlags::R
                 | vk::ColorComponentFlags::G
                 | vk::ColorComponentFlags::B
                 | vk::ColorComponentFlags::A,
-        }];
+            .. Default::default()
+        };
+
+        let color_blend_attachments = &[no_blend, no_blend, no_blend];
 
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo {
             flags: Default::default(),

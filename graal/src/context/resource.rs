@@ -1,12 +1,9 @@
-use crate::{
-    context::{
-        get_vk_sample_count, is_write_access,
-        pass::{Pass, ResourceAccess},
-        resource::ResourceKind::Image,
-        set_debug_object_name, QueueSerialNumbers, SubmissionNumber,
-    },
-    Context, Device,
-};
+use crate::{context::{
+    get_vk_sample_count, is_write_access,
+    pass::{Pass, ResourceAccess},
+    resource::ResourceKind::Image,
+    set_debug_object_name, QueueSerialNumbers, SubmissionNumber,
+}, Context, Device, MAX_QUEUES};
 use ash::{version::DeviceV1_0, vk, vk::Handle};
 use fixedbitset::FixedBitSet;
 use slotmap::{SecondaryMap, SlotMap};
@@ -163,8 +160,7 @@ pub(crate) struct BufferResource {
 pub(crate) struct ResourceAccessDetails {
     pub(crate) layout: vk::ImageLayout,
     pub(crate) access_mask: vk::AccessFlags,
-    pub(crate) input_stage: vk::PipelineStageFlags,
-    pub(crate) output_stage: vk::PipelineStageFlags,
+    pub(crate) stage_mask: vk::PipelineStageFlags,
 }
 
 #[derive(Debug)]
@@ -173,17 +169,21 @@ pub(crate) enum ResourceKind {
     Image(ImageResource),
 }
 
-#[derive(Debug)]
+#[derive(Copy,Clone,Debug)]
 pub(crate) struct ResourceTrackingInfo {
     pub(crate) owner_queue_family: u32,
     pub(crate) readers: QueueSerialNumbers,
     pub(crate) writer: SubmissionNumber,
     pub(crate) layout: vk::ImageLayout,
     /// Access types for the last write to this resource that have yet to be made available.
-    /// (FIXME usually there's only one WRITE flag, no?)
+    /// This is only relevant for the writer queue, as accesses from concurrent queues are synchronized
+    /// with a semaphore that automatically makes all writes visible.
     pub(crate) availability_mask: vk::AccessFlags,
     /// Which access types can see the last write to the resource.
+    /// This is only relevant for the writer queue, as accesses from concurrent queues are synchronized
+    /// with a semaphore that automatically makes all writes visible.
     pub(crate) visibility_mask: vk::AccessFlags,
+    /// The stages that last accessed the resource. Valid only on the writer queue.
     pub(crate) stages: vk::PipelineStageFlags,
     pub(crate) wait_binary_semaphore: vk::Semaphore,
 }
@@ -291,6 +291,29 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     }
 }
 
+
+#[derive(Copy, Clone, Debug)]
+pub struct BufferInfo {
+    pub id: BufferId,
+    pub handle: vk::Buffer,
+    pub mapped_ptr: *mut u8,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct TypedBufferInfo<T> {
+    pub id: BufferId,
+    pub handle: vk::Buffer,
+    pub mapped_ptr: *mut T,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct ImageInfo {
+    pub id: ImageId,
+    pub handle: vk::Image,
+}
+
+
+// --- Reachability matrix -------------------------------------------------------------------------
 struct Reachability {
     m: Vec<FixedBitSet>,
 }
@@ -325,26 +348,6 @@ fn compute_reachability(passes: &[Pass]) -> Reachability {
     }
 
     Reachability { m }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct BufferInfo {
-    pub id: BufferId,
-    pub handle: vk::Buffer,
-    pub mapped_ptr: *mut u8,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct TypedBufferInfo<T> {
-    pub id: BufferId,
-    pub handle: vk::Buffer,
-    pub mapped_ptr: *mut T,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct ImageInfo {
-    pub id: ImageId,
-    pub handle: vk::Image,
 }
 
 impl Context {

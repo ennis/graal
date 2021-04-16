@@ -108,6 +108,8 @@ impl Scene {
 
     /// Imports objects from an obj file.
     /// Vertex data will be uploaded to the GPU as a part of the specified frame.
+    ///
+    ///
     pub fn import_obj(&mut self, frame: &graal::Frame, obj_file_path: &Path) {
         let (models, materials) = match tobj::load_obj(obj_file_path, true) {
             Ok(x) => x,
@@ -129,6 +131,10 @@ impl Scene {
                 mesh: mesh_id,
             });
         }
+
+
+
+        // problem: if we want to access the mesh data now, we must wait for when they have finished to upload
     }
 }
 
