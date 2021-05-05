@@ -3,12 +3,11 @@ use crate::{
     DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo,
 };
 use ash::version::{DeviceV1_0, DeviceV1_1};
-use slotmap::{SecondaryMap, SlotMap};
-use std::{collections::HashMap, mem};
+use std::mem;
 
 const DESCRIPTOR_POOL_PER_TYPE_COUNT: u32 = 1024;
 const DESCRIPTOR_POOL_SET_COUNT: u32 = DESCRIPTOR_POOL_PER_TYPE_COUNT;
-const MAX_DESCRIPTOR_SET_LAYOUTS: usize = 8;
+//const MAX_DESCRIPTOR_SET_LAYOUTS: usize = 8;
 
 slotmap::new_key_type! {
     pub struct DescriptorSetAllocatorId;
@@ -278,7 +277,7 @@ impl Context {
         layout: &[DescriptorSetLayoutBindingInfo],
     ) -> DescriptorSetAllocatorId {
         let device = &self.device.device;
-        let mut set_allocators = &mut self.set_allocators;
+        let set_allocators = &mut self.set_allocators;
         *self
             .cache
             .entry(DescriptorSetLayoutInfo::from(layout))

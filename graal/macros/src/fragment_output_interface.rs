@@ -1,7 +1,7 @@
 use crate::{FieldList, G};
 use darling::{
     util::{Flag, SpannedValue},
-    FromDeriveInput, FromField, FromMeta,
+    FromDeriveInput, FromField,
 };
 use proc_macro::{Diagnostic, Level};
 use proc_macro2::{Span, TokenStream};
@@ -51,18 +51,18 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
 
     // TODO reject tuple structs
 
-    eprintln!("num fields: {}", fields.len());
+    //eprintln!("num fields: {}", fields.len());
 
     for field in fields.iter() {
         let field_name = field.ident.as_ref().unwrap();
         field_names.push(field_name);
 
         if let Ok(attr) = <AttachmentAttr as FromField>::from_field(field) {
-            eprintln!("valid attachment attr");
+            //eprintln!("valid attachment attr");
             let attr: AttachmentAttr = attr;
             let i_attachment = attachments.len() as u32;
 
-            dbg!(&attr);
+            //dbg!(&attr);
 
             let format = attr.format;
             let layout = attr.layout;
@@ -146,11 +146,11 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                 quote! { #G::vk::ImageUsageFlags::COLOR_ATTACHMENT }
             };
 
-            let aspect_mask = if is_depth {
+            /*let aspect_mask = if is_depth {
                 quote! { #G::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT }
             } else {
                 quote! { #G::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT }
-            };
+            };*/
 
             create_transient_image_statements.push(quote! {
                 let #field_name = frame.context().create_image(

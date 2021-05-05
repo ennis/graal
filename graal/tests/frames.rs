@@ -1,7 +1,9 @@
-use winit::window::{WindowBuilder, Window};
-use raw_window_handle::HasRawWindowHandle;
-use winit::event_loop::EventLoop;
 use graal::{vk, ImageId};
+use raw_window_handle::HasRawWindowHandle;
+use winit::{
+    event_loop::EventLoop,
+    window::{Window, WindowBuilder},
+};
 
 struct Fixture {
     context: graal::Context,
@@ -10,11 +12,9 @@ struct Fixture {
 impl Fixture {
     pub fn new() -> Fixture {
         let device = graal::Device::new(None);
-        let mut context = graal::Context::new(device);
+        let mut context = graal::Context::with_device(device);
 
-        Fixture {
-            context,
-        }
+        Fixture { context }
     }
 }
 
@@ -24,7 +24,7 @@ fn frame_test(name: &str, f: impl FnOnce(&graal::Frame)) {
     let mut fixture = Fixture::new();
     let frame = fixture.context.start_frame(&graal::FrameCreateInfo {
         happens_after: None,
-        collect_debug_info: true
+        collect_debug_info: true,
     });
     f(&frame);
 
@@ -33,14 +33,20 @@ fn frame_test(name: &str, f: impl FnOnce(&graal::Frame)) {
 }
 
 /// Creates a dummy graphics pass. For testing automatic synchronization.
-fn add_dummy_graphics_pass(frame: &graal::Frame,
-                           name: &str,
-                           image_accesses: &[(graal::ImageId, vk::AccessFlags, vk::PipelineStageFlags, vk::ImageLayout)],
-                           buffer_accesses: &[(graal::BufferId, vk::AccessFlags, vk::PipelineStageFlags)])
-{
+fn add_dummy_graphics_pass(
+    frame: &graal::Frame,
+    name: &str,
+    image_accesses: &[(
+        graal::ImageId,
+        vk::AccessFlags,
+        vk::PipelineStageFlags,
+        vk::ImageLayout,
+    )],
+    buffer_accesses: &[(graal::BufferId, vk::AccessFlags, vk::PipelineStageFlags)],
+) {
     frame.add_graphics_pass(name, |pass| {
         for &(img, access_mask, stage_mask, layout) in image_accesses {
-            pass.register_image_access_2(img, access_mask, stage_mask,  layout);
+            pass.register_image_access_2(img, access_mask, stage_mask, layout);
         }
         for &(buf, access_mask, stage_mask) in buffer_accesses {
             pass.register_buffer_access_2(buf, access_mask, stage_mask);
@@ -74,7 +80,9 @@ fn create_dummy_transient_image(frame: &graal::Frame, name: &str) -> ImageId {
 }
 
 macro_rules! test_image {
-    ($f:expr, $n:ident) => { let $n = create_dummy_transient_image($f, stringify!($n)); };
+    ($f:expr, $n:ident) => {
+        let $n = create_dummy_transient_image($f, stringify!($n));
+    };
 }
 
 macro_rules! test_graphics_pass {
@@ -92,11 +100,9 @@ macro_rules! test_graphics_pass {
     };
 }
 
-
 #[test]
 fn test_pipeline_barrier() {
     frame_test("pipeline_barrier", |frame| {
-
         test_image!(frame, a);
         test_image!(frame, b);
         test_image!(frame, c);

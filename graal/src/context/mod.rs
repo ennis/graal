@@ -1,20 +1,12 @@
 use std::{
-    alloc::Layout,
     collections::{HashMap, VecDeque},
     ffi::CString,
-    fmt, mem,
-    mem::MaybeUninit,
+    fmt,
     os::raw::c_void,
-    ptr, slice,
 };
 
-use ash::{
-    version::{DeviceV1_0, DeviceV1_1, DeviceV1_2},
-    vk,
-    vk::BufferUsageFlags,
-};
-use fixedbitset::FixedBitSet;
-use slotmap::{Key, SecondaryMap, SlotMap};
+use ash::{version::DeviceV1_0, vk};
+use slotmap::{Key, SlotMap};
 
 use crate::{
     context::{
@@ -27,32 +19,25 @@ use crate::{
     },
     device::Device,
     swapchain::Swapchain,
-    vk::Handle,
-    DescriptorSetInterface, DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo,
-    FragmentOutputInterface, FragmentOutputInterfaceExt, ImageInfo, MAX_QUEUES,
+    DescriptorSetLayoutInfo, FragmentOutputInterface, FragmentOutputInterfaceExt, ImageInfo,
+    MAX_QUEUES,
 };
-use std::{
-    cmp::Ordering,
-    ops::{Index, IndexMut},
-};
+use std::cmp::Ordering;
+use tracing::{trace, trace_span};
 
-pub(crate) mod frame;
 pub(crate) mod descriptor;
+pub(crate) mod frame;
 pub(crate) mod pass;
 pub(crate) mod resource;
 pub(crate) mod submission;
 mod sync_table;
+pub(crate) mod external_memory_handle;
 
-use crate::{
-    context::resource::{BufferId, ImageId},
-    vk::RenderPass,
-};
-pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
+use crate::context::resource::{BufferId, ImageId};
 pub use descriptor::DescriptorSetAllocatorId;
+pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
+use std::ops::{Deref, DerefMut};
 pub use submission::CommandContext;
-use std::sync::Arc;
-use std::ops::{Sub, Deref, DerefMut};
-use crate::context::frame::FrameCreateInfo;
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
 pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -103,9 +88,22 @@ impl fmt::Debug for SubmissionNumber {
 pub struct QueueSerialNumbers(pub [u64; MAX_QUEUES]);
 
 impl QueueSerialNumbers {
+    //
     pub const fn new() -> QueueSerialNumbers {
         QueueSerialNumbers([0; MAX_QUEUES])
     }
+
+    // TODO better name?
+    /*pub const fn has_nonzero_serial(&self) -> bool {
+        let mut i = 0;
+        while i < MAX_QUEUES {
+            if self.0[i] != 0 {
+                return true;
+            }
+            i += 1;
+        }
+        false
+    }*/
 
     pub fn from_submission_number(snn: SubmissionNumber) -> QueueSerialNumbers {
         Self::from_queue_serial(snn.queue(), snn.serial())
@@ -121,23 +119,31 @@ impl QueueSerialNumbers {
         self.0[queue]
     }
 
-    pub fn assign_max(&mut self, other: &QueueSerialNumbers) {
+    pub fn join(&self, other: QueueSerialNumbers) -> QueueSerialNumbers {
+        let mut r = *self;
+        r.join_assign(other);
+        r
+    }
+
+    pub fn join_assign(&mut self, other: QueueSerialNumbers) {
         for i in 0..MAX_QUEUES {
-            self.0[i] = self.0[i].max(other.0[i]);
+            self[i] = self[i].max(other[i]);
         }
     }
 
-    pub fn assign_max_serial(&mut self, queue: usize, other: u64) {
-        self.0[queue as usize] = self.0[queue as usize].max(other);
+    pub fn join_serial(&self, snn: SubmissionNumber) -> QueueSerialNumbers {
+        let mut r = *self;
+        r[snn.queue()] = r[snn.queue()].max(snn.serial());
+        r
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &'_ u64> {
         self.0.iter()
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = &'_ mut u64> {
-        self.0.iter_mut()
-    }
+    //pub fn iter_mut(&mut self) -> impl Iterator<Item = &'_ mut u64> {
+    //    self.0.iter_mut()
+    //}
 }
 
 impl Deref for QueueSerialNumbers {
@@ -153,7 +159,6 @@ impl DerefMut for QueueSerialNumbers {
         &mut self.0
     }
 }
-
 
 impl PartialOrd for QueueSerialNumbers {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -194,7 +199,7 @@ fn set_debug_object_name(
 ) {
     unsafe {
         let name = if let Some(serial) = serial {
-            format!("{}.{}", name, serial)
+            format!("{}@{}", name, serial)
         } else {
             name.to_string()
         };
@@ -214,7 +219,7 @@ fn set_debug_object_name(
     }
 }
 
-pub unsafe fn place_aligned(layout: &Layout, ptr: &mut *mut u8, space: &mut usize) -> *mut u8 {
+/*pub unsafe fn place_aligned(layout: &Layout, ptr: &mut *mut u8, space: &mut usize) -> *mut u8 {
     let ptr_usize = *ptr as usize;
 
     let mut off = ptr_usize & (layout.align() - 1);
@@ -316,7 +321,7 @@ fn is_read_access(mask: vk::AccessFlags) -> bool {
             | vk::AccessFlags::FRAGMENT_DENSITY_MAP_READ_EXT
             | vk::AccessFlags::COMMAND_PREPROCESS_READ_NV,
     )
-}
+}*/
 
 fn is_write_access(mask: vk::AccessFlags) -> bool {
     mask.intersects(
@@ -370,10 +375,25 @@ pub fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
     }
 }
 
+/// Information about a swapchain.
+#[derive(Copy, Clone, Debug)]
+pub struct SwapchainInfo {
+    /// ID of the swapchain.
+    pub id: SwapchainId,
+    /// Handle of the swapchain.
+    pub handle: vk::SwapchainKHR,
+    /// Format of the images in the swapchain.
+    pub format: vk::Format,
+}
+
+/// Contains information about an image in a swapchain.
 #[derive(Copy, Clone, Debug)]
 pub struct SwapchainImage {
+    /// ID of the swapchain that owns this image.
     pub swapchain_id: SwapchainId,
+    /// Handle of the swapchain that owns this image.
     pub swapchain_handle: vk::SwapchainKHR,
+    /// Index of the image in the swap chain.
     pub image_index: u32,
     pub image_info: ImageInfo,
 }
@@ -386,9 +406,10 @@ slotmap::new_key_type! {
 
 type SwapchainMap = SlotMap<SwapchainId, Swapchain>;
 type RenderPassMap = SlotMap<RenderPassId, vk::RenderPass>;
-type PipelineLayoutMap = SlotMap<PipelineLayoutId, vk::PipelineLayout>;
+//type PipelineLayoutMap = SlotMap<PipelineLayoutId, vk::PipelineLayout>;
 
 /// Stores the set of resources owned by a currently executing frame.
+#[derive(Debug)]
 struct FrameInFlight {
     signalled_serials: QueueSerialNumbers,
     transient_allocations: Vec<vk_mem::Allocation>,
@@ -401,24 +422,37 @@ struct FrameInFlight {
     semaphores: Vec<vk::Semaphore>,
 }
 
-/// Represents a point in the future where a given GPU operation has completed.
-#[derive(Copy,Clone,Debug)]
+/// Represents a GPU operation that may have not finished yet.
+#[derive(Copy, Clone, Debug)]
 pub struct GpuFuture {
-    serials: QueueSerialNumbers,
+    pub(crate) serials: QueueSerialNumbers,
+}
+
+impl Default for GpuFuture {
+    fn default() -> Self {
+        GpuFuture::new()
+    }
 }
 
 impl GpuFuture {
+    /// Returns an "empty" GPU future that represents an already completed operation.
+    /// Waiting on this future always returns immediately.
+    pub const fn new() -> GpuFuture {
+        GpuFuture {
+            serials: QueueSerialNumbers::new(),
+        }
+    }
+
     /// Returns a future representing the moment when the operations represented
     /// by both `self` and `other` have completed.
-    pub fn and(&self, other: &GpuFuture) -> GpuFuture {
-        let mut serials = self.serials;
-        serials.assign_max(&other.serials);
+    pub fn join(&self, other: GpuFuture) -> GpuFuture {
         GpuFuture {
-            serials
+            serials: self.serials.join(other.serials),
         }
     }
 }
 
+/// Represents the
 pub struct Context {
     device: Device,
 
@@ -454,14 +488,25 @@ pub struct Context {
     /// is dropped.
     render_passes: RenderPassMap,
     /// ID-mapped pipeline layout associated to `PipelineInterface` types.
-    pipeline_layouts: PipelineLayoutMap,
+    //pipeline_layouts: PipelineLayoutMap,
     /// Frames that are currently executing on the GPU.
     in_flight: VecDeque<FrameInFlight>,
 }
 
 impl Context {
-    /// Creates a new context.
-    pub fn new(device: Device) -> Context {
+    /// Creates a new context with a default device.
+    pub fn new() -> Context {
+        Self::with_device(Device::new(None))
+    }
+
+    /// Creates a new context. A vulkan device that can present to the specified surface will be created.
+    pub fn with_surface(surface: vk::SurfaceKHR) -> Context {
+        let device = Device::new(Some(surface));
+        Self::with_device(device)
+    }
+
+    /// Creates a new context with the given device.
+    pub fn with_device(device: Device) -> Context {
         let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
 
         let mut timeline_create_info = vk::SemaphoreTypeCreateInfo {
@@ -497,15 +542,21 @@ impl Context {
             resources: SlotMap::with_key(),
             swapchains: SlotMap::with_key(),
             render_passes: SlotMap::with_key(),
-            pipeline_layouts: SlotMap::with_key(),
+            //pipeline_layouts: SlotMap::with_key(),
             in_flight: VecDeque::new(),
             cache: Default::default(),
             semaphore_pool: vec![],
         }
     }
 
-    /// Returns the `ash::Device` associated with this context.
-    pub fn device(&self) -> &ash::Device {
+    /// Returns the `graal::Device` owned by this context.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Returns the `ash::Device` owned by this context.
+    /// Shorthand for `self.device().device`.
+    pub fn vulkan_device(&self) -> &ash::Device {
         &self.device.device
     }
 
@@ -589,43 +640,50 @@ impl Context {
     /// Waits for all but the last submitted frame to finish and then recycles their resources.
     /// Calls `cleanup_resources` internally.
     fn wait_for_frames_in_flight(&mut self) {
+        let _span = trace_span!("wait_for_frames_in_flight").entered();
+
         // pacing
         while self.in_flight.len() >= 2 {
             // two frames in flight already, must wait for the oldest one
-            let mut b = self.in_flight.pop_front().unwrap();
-            self.wait(&b.signalled_serials);
+            let f = self.in_flight.pop_front().unwrap();
+
+            let _span = trace_span!("waiting for frame", serials = ?f.signalled_serials, frames_in_flight = self.in_flight.len()).entered();
+            self.wait(&f.signalled_serials);
 
             // update completed serials
             // we just waited on those serials, so we know they are completed
-            self.completed_serials = b.signalled_serials;
+            self.completed_serials = f.signalled_serials;
 
             // Recycle the command pools allocated for the frame. The allocated command buffers
             // can then be reused for future submissions.
-            self.recycle_command_pools(b.command_pools);
+            self.recycle_command_pools(f.command_pools);
 
             // Recycle the semaphores. They are guaranteed to be unsignalled since the frame must have
             // waited on them.
-            self.recycle_semaphores(b.semaphores);
+            self.recycle_semaphores(f.semaphores);
 
             // We can recycle the memory allocated for descriptor sets.
             unsafe {
-                self.recycle_descriptor_sets(b.descriptor_sets);
+                self.recycle_descriptor_sets(f.descriptor_sets);
             }
 
             // Destroy all other frame-bound objects (framebuffers, image views, descriptor sets)
-            for fb in b.framebuffers {
+            for fb in f.framebuffers {
+                trace!(?fb, "destroy_framebuffer");
                 unsafe {
                     self.device.device.destroy_framebuffer(fb, None);
                 }
             }
-            for img in b.image_views {
+            for img in f.image_views {
+                trace!(?img, "destroy_image_view");
                 unsafe {
                     self.device.device.destroy_image_view(img, None);
                 }
             }
 
             // free transient allocations
-            for alloc in b.transient_allocations.iter() {
+            for alloc in f.transient_allocations.iter() {
+                trace!(?alloc, "free_memory");
                 self.device.allocator.free_memory(alloc).unwrap();
             }
 
@@ -676,15 +734,25 @@ impl Context {
         self.submitted_frame_count
     }
 
+    /// Creates a swapchain for the given surface.
+    /// This function will automatically choose a "best" format among those supported for the
+    /// surface.
     pub unsafe fn create_swapchain(
         &mut self,
         surface: vk::SurfaceKHR,
         initial_size: (u32, u32),
-    ) -> SwapchainId {
-        self.swapchains
-            .insert(Swapchain::new(&self.device, surface, initial_size))
+    ) -> SwapchainInfo {
+        let swapchain = Swapchain::new(&self.device, surface, initial_size);
+        let handle = swapchain.handle;
+        let format = swapchain.format;
+
+        let id = self.swapchains.insert(swapchain);
+
+        SwapchainInfo { id, handle, format }
     }
 
+    /// Acquires the next image in the swapchain.
+    /// See `vkAcquireNextImageKHR`.
     pub unsafe fn acquire_next_image(&mut self, swapchain_id: SwapchainId) -> SwapchainImage {
         let image_available = self.create_semaphore();
         let swapchain = self.swapchains.get_mut(swapchain_id).unwrap();
@@ -727,7 +795,7 @@ impl Context {
     }
 
     //
-    pub unsafe fn destroy_swapchain(&mut self, swapchain: SwapchainId) {
+    pub unsafe fn destroy_swapchain(&mut self, _swapchain: SwapchainId) {
         // TODO wait for the device to finish, then destroy swapchain
         unimplemented!()
     }
@@ -742,16 +810,6 @@ impl Context {
         });
 
         *self.render_passes.get(id).unwrap()
-    }
-
-    /// Starts recording of a new frame. The execution of the frame can optionally be synchronized
-    /// with the given future in `happens_after`.
-    ///
-    /// If `happens_after` is `None`, the frame won't be synchronized and may start executing immediately.
-    /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
-    /// because of resource dependencies.
-    pub fn start_frame(&mut self, create_info: &FrameCreateInfo) -> Frame {
-        Frame::new(self, create_info)
     }
 
     pub fn wait_for(&mut self, future: GpuFuture) {

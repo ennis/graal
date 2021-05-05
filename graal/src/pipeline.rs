@@ -1,6 +1,6 @@
-use crate::{context::PipelineLayoutId, VertexInputInterface};
+use crate::context::PipelineLayoutId;
 use ash::vk;
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 pub trait PipelineInterface {
     const VERTEX_INPUT_BINDINGS: &'static [vk::VertexInputBindingDescription];

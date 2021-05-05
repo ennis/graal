@@ -1,13 +1,7 @@
-use crate::{internal::OnceCell, DescriptorSetAllocatorId, Device, TypedBufferInfo};
-use ash::{version::DeviceV1_0, vk};
+use crate::{DescriptorSetAllocatorId, TypedBufferInfo};
+use ash::vk;
 use graal_spirv as spirv;
-use slotmap::SlotMap;
-use std::{
-    collections::{BTreeMap, HashMap},
-    ffi::CString,
-    marker::PhantomData,
-    mem, ptr,
-};
+use std::{collections::BTreeMap, marker::PhantomData};
 
 //const MAX_DESCRIPTOR_SET_LAYOUT_BINDING_DESCRIPTORS: usize = 16;
 pub const MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS: usize = 16;
@@ -36,14 +30,14 @@ impl<'a> From<&'a [DescriptorSetLayoutBindingInfo]> for DescriptorSetLayoutInfo 
     }
 }
 
-pub struct OutputAttachment {
+/*pub struct OutputAttachment {
     // TODO
-}
+}*/
 
-pub struct PushConstantLayout {
+/*pub struct PushConstantLayout {
     pub offset: usize,
     pub size: usize,
-}
+}*/
 
 /// Trait implemented by types that describe a _descriptor set interface_: they are types that contain
 /// the descriptors needed to build a descriptor set.
@@ -75,9 +69,9 @@ pub trait DescriptorSetInterface {
     );
 }
 
-pub trait PushConstantInterface {
+/*pub trait PushConstantInterface {
     const LAYOUT: &'static [PushConstantLayout];
-}
+}*/
 
 ///
 pub enum DescriptorWriteKind {
@@ -157,20 +151,20 @@ pub struct PipelineShaderStage<'a> {
     pub spirv: &'a [u32],
 }
 
-struct VertexInputVariable {
+/*struct VertexInputVariable {
     location: u32,
-}
+}*/
 
-struct FragmentOutputVariable {
+/*struct FragmentOutputVariable {
     location: u32,
-}
+}*/
 
-struct ShaderInterfaces {
+/*struct ShaderInterfaces {
     vertex_input: BTreeMap<u32, VertexInputVariable>,
     fragment_output: BTreeMap<u32, FragmentOutputVariable>,
     resource: BTreeMap<u32, DescriptorSetLayoutInfo>,
     // push_constant:
-}
+}*/
 
 pub fn extract_descriptor_set_layouts_from_shader_stages(
     stages: &[PipelineShaderStage],
@@ -187,7 +181,7 @@ pub fn extract_descriptor_set_layouts_from_shader_stages(
                     use crate::typedesc::{ImageType, StructType, TypeDesc::*};
                     use spirv::spv::StorageClass;
 
-                    let (descriptor_type, unbounded_descriptor_array) =
+                    let (descriptor_type, _unbounded_descriptor_array) =
                         match (v.storage_class, v.ty) {
                             // According to https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#interfaces-resources-descset
                             // for SampledImages, the descriptor type could be either VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE or VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
@@ -214,7 +208,7 @@ pub fn extract_descriptor_set_layouts_from_shader_stages(
                             }
 
                             // --- sampler1D,sampler2D ----
-                            (StorageClass::UniformConstant, &Pointer(&SampledImage(img))) => {
+                            (StorageClass::UniformConstant, &Pointer(&SampledImage(_img))) => {
                                 (vk::DescriptorType::COMBINED_IMAGE_SAMPLER, false)
                             }
 

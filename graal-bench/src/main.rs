@@ -15,12 +15,12 @@ use crate::{
     camera::{CameraControl, CameraControlInput, CameraControlMouseButton},
     geometry_pass::GeometryPass,
     scene::Scene,
-    shader::create_shader_module,
 };
-use graal::{ash::version::DeviceV1_0, vk, FragmentOutputInterface, TypedBufferInfo, VertexInputInterfaceExt, FrameCreateInfo};
+use graal::vk;
 use raw_window_handle::HasRawWindowHandle;
+use tracing_subscriber;
 use winit::{
-    event::{ElementState, Event, MouseButton, WindowEvent},
+    event::{Event, MouseButton, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
@@ -51,22 +51,29 @@ use winit::{
 }*/
 
 fn main() {
-    // Ancient mantra of window and device creation
+    tracing_subscriber::fmt()
+        .with_target(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
+        .init();
+
+    // Ancient mantra of window and context creation
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
-    let device = graal::Device::new(Some(surface));
-    let mut context = graal::Context::new(device);
+    let mut context = graal::Context::with_surface(surface);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
 
-    // Initial frame to upload static resources (meshes and textures)
-    let mut init_frame = context.start_frame(&graal::FrameCreateInfo {
-        happens_after: None,
-        collect_debug_info: true
-    });
+    // Create a scene that will hold our objects and buffers.
     let mut scene = Scene::new();
-    scene.import_obj(&init_frame, "data/reimu.obj".as_ref());
-    let mut prev_frame_future = Some(init_frame.finish());
+
+    // Upload new objects and mesh data to the scene.
+    {
+        let mut scene_uploader = scene.start_upload(&mut context);
+        scene_uploader.import_obj("data/reimu.obj");
+        scene_uploader.finish();
+    }
+
     let bkg_pass = BackgroundPass::new(&mut context);
     let geom_pass = GeometryPass::new(&mut context);
     let mut swapchain_size: (u32, u32) = window.inner_size().into();
@@ -74,7 +81,8 @@ fn main() {
         swapchain_size.0 as f64,
         swapchain_size.1 as f64,
     ));
-    //camera_control.center_on_bounds(&mesh.bounds, std::f64::consts::FRAC_PI_2);
+
+    camera_control.center_on_bounds(&scene.bounds(), std::f64::consts::FRAC_PI_2);
     let mut dump_next_frame = false;
 
     event_loop.run(move |event, _, control_flow| {
@@ -127,11 +135,7 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
                 let camera = camera_control.camera();
-                let mut frame = context.start_frame(&FrameCreateInfo {
-                    happens_after: prev_frame_future,
-                    collect_debug_info: true
-                });
-                prev_frame_future = None;
+                let mut frame = context.start_frame(Default::default());
 
                 // draw background
                 bkg_pass.run(
@@ -142,13 +146,7 @@ fn main() {
                 );
 
                 // draw our mesh to G-buffers
-                /*let gbuffers = geom_pass.run(
-                    &frame,
-                    mesh.vertex_buffer,
-                    mesh.vertex_count,
-                    swapchain_size,
-                    &camera,
-                );
+                let gbuffers = geom_pass.run(&frame, &scene, swapchain_size, &camera);
 
                 // blit?
                 blit::blit_images(
@@ -157,7 +155,7 @@ fn main() {
                     swapchain_image.image_info,
                     swapchain_size,
                     vk::ImageAspectFlags::COLOR,
-                );*/
+                );
 
                 frame.present("present", &swapchain_image);
 

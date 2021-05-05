@@ -1,37 +1,29 @@
 use crate::{
     context::{
-        descriptor::DescriptorSet,
-        format_aspect_mask, is_read_access, is_write_access,
-        pass::{Pass, PassKind, ResourceAccess},
+        is_write_access,
+        pass::{Pass, PassCommands, ResourceAccess},
         resource::{
-            BufferId, BufferInfo, ImageId, Resource, ResourceAccessDetails, ResourceId,
-            ResourceKind, ResourceMemory, TypedBufferInfo,
+            BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
+            ResourceMemory, ResourceTrackingInfo, TypedBufferInfo,
         },
         CommandContext, FrameInFlight, FrameSerialNumber, GpuFuture, QueueSerialNumbers,
         SubmissionNumber, SwapchainImage,
     },
-    descriptor::BufferDescriptor,
-    device::QueuesInfo,
-    vk, BufferData, BufferResourceCreateInfo, Context, DescriptorSetInterface, Device, ImageInfo,
+    vk,
     vk::Handle,
-    ImageResourceCreateInfo, ResourceMemoryInfo, MAX_QUEUES,
+    BufferResourceCreateInfo, Context, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo,
+    MAX_QUEUES,
 };
-use ash::version::DeviceV1_0;
-use bitflags::bitflags;
-use fixedbitset::FixedBitSet;
 use slotmap::Key;
 use std::{
-    cell::{Ref, RefCell, RefMut},
-    marker::PhantomData,
-    mem,
-    mem::MaybeUninit,
-    ptr, slice,
+    cell::{RefCell, RefMut},
+    mem, ptr,
 };
-use crate::context::resource::ResourceTrackingInfo;
-use serde_json::Value;
+use tracing::trace_span;
 
 type TemporarySet = std::collections::BTreeSet<ResourceId>;
 
+// TODO this is here only for convenience, could be removed
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum AccessType {
     /// Vertex attribute read in the vertex input stage
@@ -371,7 +363,7 @@ fn add_execution_dependency(
     }
 }*/
 
-/// Helper to find the pass given a submission number.
+/*/// Helper to find the pass given a submission number.
 fn get_pass_mut<'a, 'b>(
     start_serial: u64,
     passes: &'a mut [Pass<'b>],
@@ -383,12 +375,13 @@ fn get_pass_mut<'a, 'b>(
         let pass_index = (snn.serial() - start_serial - 1) as usize;
         Some(&mut passes[pass_index])
     }
-}
+}*/
 
 /// Builder object for passes.
 pub struct PassBuilder<'a, 'frame> {
     frame: &'frame mut FrameInner<'a>,
     pass: Pass<'a>,
+    _span: tracing::span::EnteredSpan,
 }
 
 impl<'a, 'frame> PassBuilder<'a, 'frame> {
@@ -398,7 +391,7 @@ impl<'a, 'frame> PassBuilder<'a, 'frame> {
             stage_mask,
             layout,
         } = access_type.to_access_info();
-        self.register_image_access_2(id, access_mask, stage_mask, layout);
+        self.register_image_access_2(id, access_mask, stage_mask, layout, layout);
     }
 
     /// Registers an image access made by this pass.
@@ -407,13 +400,15 @@ impl<'a, 'frame> PassBuilder<'a, 'frame> {
         id: ImageId,
         access_mask: vk::AccessFlags,
         stage_mask: vk::PipelineStageFlags,
-        layout: vk::ImageLayout,
+        initial_layout: vk::ImageLayout,
+        final_layout: vk::ImageLayout,
     ) {
         self.frame.add_resource_dependency(
             &mut self.pass,
             id.0,
             &ResourceAccessDetails {
-                layout,
+                initial_layout,
+                final_layout,
                 access_mask,
                 stage_mask,
             },
@@ -439,7 +434,8 @@ impl<'a, 'frame> PassBuilder<'a, 'frame> {
             &mut self.pass,
             id.0,
             &ResourceAccessDetails {
-                layout: vk::ImageLayout::UNDEFINED,
+                initial_layout: vk::ImageLayout::UNDEFINED,
+                final_layout: vk::ImageLayout::UNDEFINED,
                 access_mask,
                 stage_mask,
             },
@@ -452,13 +448,20 @@ impl<'a, 'frame> PassBuilder<'a, 'frame> {
         &mut self,
         commands: impl FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a,
     ) {
-        self.pass.commands = Some(Box::new(commands));
+        self.pass.commands = Some(PassCommands::CommandBuffer(Box::new(commands)));
+    }
+
+    pub fn set_queue_commands(
+        &mut self,
+        commands: impl FnOnce(&mut CommandContext, vk::Queue) + 'a,
+    ) {
+        self.pass.commands = Some(PassCommands::Queue(Box::new(commands)));
     }
 }
 
 struct SyncDebugInfo {
     tracking: slotmap::SecondaryMap<ResourceId, ResourceTrackingInfo>,
-    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES]
+    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
 }
 
 impl SyncDebugInfo {
@@ -480,7 +483,10 @@ struct FrameInner<'a> {
     temporary_set: TemporarySet,
     /// List of passes
     passes: Vec<Pass<'a>>,
+    /// Serials to wait for before executing the frame.
+    wait_init: QueueSerialNumbers,
     /// Cross-queue synchronization table
+    /// TODO detailed description
     xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
 
     collect_sync_debug_info: bool,
@@ -500,12 +506,10 @@ impl<'a> FrameInner<'a> {
     /// and updates the state of the resources.
     fn add_resource_dependency(
         &mut self,
-        dst_pass: &mut Pass,
+        dst_pass: &mut Pass<'a>,
         id: ResourceId,
         access: &ResourceAccessDetails,
     ) {
-        dst_pass.availability_mask |= access.access_mask;
-
         //------------------------
         // first, add the resource into the set of temporaries used within this frame
         let resource = self.context.resources.get_mut(id).unwrap();
@@ -540,21 +544,16 @@ impl<'a> FrameInner<'a> {
         //      -> If all of this is true, then skip to X
         // 2. Get or create the barrier
         //      The resulting barrier might be associated to the pass, or an existing one that comes before
-        //
-        // Problem: availability barrier:
-        // - first read
-        // - second read: overwrites the tracked first reader
 
         // handle external semaphore dependency
         let semaphore = mem::take(&mut resource.tracking.wait_binary_semaphore);
         let has_external_semaphore = semaphore != vk::Semaphore::null();
         if has_external_semaphore {
             dst_pass.wait_binary_semaphores.push(semaphore);
-            dst_pass.wait_before = true;
         }
 
         //------------------------
-        let need_layout_transition = resource.tracking.layout != access.layout;
+        let need_layout_transition = resource.tracking.layout != access.initial_layout;
 
         // is the access a write? for synchronization purposes, layout transitions are the same thing as a write
         let is_write = is_write_access(access.access_mask) || need_layout_transition;
@@ -577,6 +576,16 @@ impl<'a> FrameInner<'a> {
 
         if (!has_external_semaphore && !writes_visible) || need_layout_transition {
             let q = dst_pass.snn.queue() as usize;
+
+            // Determine the "sources" of the dependency: i.e. the passes (identified by serials),
+            // that we must synchronize with.
+            //
+            // If we're writing to the resource, and the resource is being read, we must wait for
+            // all reads to complete, and thus synchronize with the readers.
+            // Otherwise, if we're only reading from the resource, or if we're writing but there are no readers,
+            // we must synchronize with the last writer (we can have multiple concurrent readers).
+            //
+            // Note that a resource can't have both a reader and a writer at the same time.
             let sync_sources = if is_write && resource.tracking.has_readers() {
                 // Write-after-read dependency
                 resource.tracking.readers
@@ -592,27 +601,37 @@ impl<'a> FrameInner<'a> {
             // -> if the source is just before, then use a pipeline barrier
             // -> if there's a gap, use an event?
             let base_serial = self.base_serial;
+
+            // whether `sync_sources` identifies a single source pass in the queue that one we're
+            // submitting on, and that points
             let single_local_source_in_same_queue = sync_sources
                 .iter()
                 .enumerate()
                 .all(|(i, &sn)| (i != q && sn == 0) || (i == q && (sn == 0 || sn > base_serial)));
 
             if !single_local_source_in_same_queue {
-                // use a semaphore
+                // Either:
+                // - there are multiple sources across several queues
+                // - the source is in a different queue
+                // - the source is in an older frame
+                // In those cases, a semaphore wait is necessary to synchronize.
+
+                // go through each non-zero source
                 for (iq, &sn) in sync_sources.iter().enumerate() {
                     if sn == 0 {
                         continue;
                     }
 
+                    // look in the cross-queue sync table to see if there's already an execution dependency
+                    // between the source (sn) and us.
                     if self.xq_sync_table[q].0[iq] >= sn {
                         // already synced
                         continue;
                     }
 
-                    // update sync table
+                    // we're adding a semaphore wait: update sync table
                     self.xq_sync_table[q].0[iq] = sn;
 
-                    dst_pass.wait_before = true;
                     dst_pass.wait_serials.0[iq] = sn;
                     dst_pass.wait_dst_stages[iq] |= access.stage_mask;
 
@@ -620,7 +639,7 @@ impl<'a> FrameInner<'a> {
                         // furthermore, if source and destination are in the same frame, add
                         // an edge to the depgraph (regardless of whether we added a semaphore or not)
                         let src_pass_index = local_pass_index(sn, self.base_serial);
-                        let dst_pass_index = dst_pass.frame_index;
+                        //let dst_pass_index = dst_pass.frame_index;
                         let src_pass = &mut self.passes[src_pass_index];
                         //src_pass.succs.push(dst_pass_index);
                         //dst_pass.preds.push(src_pass_index);
@@ -628,7 +647,10 @@ impl<'a> FrameInner<'a> {
                     }
                 }
             } else {
-                // pipeline barrier
+                // There's only one source pass, which furthermore is on the same queue, and in the
+                // same frame as the destination. In this case, we can use a pipeline barrier for
+                // synchronization.
+
                 let src_sn = sync_sources[q];
                 let src_stage_mask = resource.tracking.stages;
                 let dst_stage_mask = access.stage_mask;
@@ -660,24 +682,28 @@ impl<'a> FrameInner<'a> {
                     // The impact of this approximation is currently unknown.
 
                     // find a pipeline barrier that already takes care of our execution dependency
-                    let barrier = self.passes[local_src_index+1..].iter_mut().find_map(|p| {
-                        if p.snn.queue() == q
-                            && p.pre_execution_barrier.src_stage_mask.contains(src_stage_mask)
-                            && p.pre_execution_barrier.dst_stage_mask.contains(dst_stage_mask) {
-                            Some(&mut p.pre_execution_barrier)
-                        } else {
-                            None
-                        }
-                    }).unwrap_or(&mut dst_pass.pre_execution_barrier);
+                    let barrier_pass = self.passes[local_src_index + 1..]
+                        .iter_mut()
+                        .find_map(|p| {
+                            if p.snn.queue() == q
+                                && p.src_stage_mask.contains(src_stage_mask)
+                                && p.dst_stage_mask.contains(dst_stage_mask)
+                            {
+                                Some(p)
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or(dst_pass);
 
                     // add our stages to the execution dependency
-                    barrier.src_stage_mask |= src_stage_mask;
-                    barrier.dst_stage_mask |= dst_stage_mask;
+                    barrier_pass.src_stage_mask |= src_stage_mask;
+                    barrier_pass.dst_stage_mask |= dst_stage_mask;
 
                     // now deal with the memory dependency
                     match &resource.kind {
                         ResourceKind::Image(img) => {
-                            let mb = barrier
+                            let mb = barrier_pass
                                 .get_or_create_image_memory_barrier(img.handle, img.format);
                             mb.src_access_mask |= resource.tracking.availability_mask;
                             mb.dst_access_mask |= access.access_mask;
@@ -686,11 +712,10 @@ impl<'a> FrameInner<'a> {
                             // but we might not always go through here when a layout transition is necessary.
                             // With Sync2, just set these to UNDEFINED.
                             mb.old_layout = resource.tracking.layout;
-                            mb.new_layout = access.layout;
+                            mb.new_layout = access.initial_layout;
                         }
                         ResourceKind::Buffer(buf) => {
-                            let mb =
-                                barrier.get_or_create_buffer_memory_barrier(buf.handle);
+                            let mb = barrier_pass.get_or_create_buffer_memory_barrier(buf.handle);
                             mb.src_access_mask |= resource.tracking.availability_mask;
                             mb.dst_access_mask |= access.access_mask;
                         }
@@ -706,12 +731,10 @@ impl<'a> FrameInner<'a> {
             // layout transitions
             if need_layout_transition {
                 let image = resource.image();
-                let mb = dst_pass
-                    .pre_execution_barrier
-                    .get_or_create_image_memory_barrier(image.handle, image.format);
+                let mb = dst_pass.get_or_create_image_memory_barrier(image.handle, image.format);
                 mb.old_layout = resource.tracking.layout;
-                mb.new_layout = access.layout;
-                resource.tracking.layout = access.layout;
+                mb.new_layout = access.initial_layout;
+                resource.tracking.layout = access.final_layout;
             }
         }
 
@@ -730,12 +753,10 @@ impl<'a> FrameInner<'a> {
             resource.tracking.writer = dst_pass.snn;
         } else {
             // update the resource readers
-            resource
-                .tracking
-                .readers
-                .assign_max_serial(dst_pass.snn.queue(), dst_pass.snn.serial());
+            resource.tracking.readers = resource.tracking.readers.join_serial(dst_pass.snn);
         }
 
+        // record the access in the pass
         dst_pass.accesses.push(ResourceAccess {
             id,
             access_mask: access.access_mask,
@@ -744,10 +765,11 @@ impl<'a> FrameInner<'a> {
 
     fn push_pass(&mut self, pass: Pass<'a>) {
         self.passes.push(pass);
+
         if self.collect_sync_debug_info {
             let mut info = SyncDebugInfo::new();
             // current resource tracking info
-            for (id,r) in self.context.resources.iter() {
+            for (id, r) in self.context.resources.iter() {
                 info.tracking.insert(id, r.tracking);
             }
             // current sync table
@@ -759,45 +781,40 @@ impl<'a> FrameInner<'a> {
 
 #[derive(Copy, Clone, Debug)]
 pub struct FrameCreateInfo {
-    pub happens_after: Option<GpuFuture>,
+    pub happens_after: GpuFuture,
     pub collect_debug_info: bool,
 }
 
 impl Default for FrameCreateInfo {
     fn default() -> Self {
         FrameCreateInfo {
-            happens_after: None,
-            collect_debug_info: false
+            happens_after: Default::default(),
+            collect_debug_info: false,
         }
     }
+}
+
+/// Determines on which queue a pass will be scheduled.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub enum PassType {
+    Graphics,
+    Compute,
+    Transfer,
+    Present {
+        swapchain: vk::SwapchainKHR,
+        image_index: u32,
+    },
 }
 
 pub struct Frame<'a> {
     base_serial: u64,
     frame_serial: FrameSerialNumber,
     inner: RefCell<FrameInner<'a>>,
+    span: tracing::span::EnteredSpan,
+    build_span: tracing::span::EnteredSpan,
 }
 
 impl<'a> Frame<'a> {
-    pub(crate) fn new(context: &'a mut Context, create_info: &FrameCreateInfo) -> Frame<'a> {
-        let base_serial = context.next_serial;
-        Frame {
-            base_serial,
-            frame_serial: FrameSerialNumber(context.submitted_frame_count + 1),
-            inner: RefCell::new(FrameInner {
-                base_serial,
-                context,
-                temporaries: vec![],
-                temporary_set: TemporarySet::new(),
-                passes: vec![],
-                xq_sync_table: Default::default(),
-                collect_sync_debug_info: create_info.collect_debug_info,
-                sync_debug_info: Vec::new()
-            }),
-        }
-    }
-
-
     /// Returns the context from which this frame was started
     pub fn context(&self) -> RefMut<Context> {
         RefMut::map(self.inner.borrow_mut(), |inner| inner.context)
@@ -806,6 +823,14 @@ impl<'a> Frame<'a> {
     /// Returns this frame's serial
     pub fn serial(&self) -> FrameSerialNumber {
         self.frame_serial
+    }
+
+    /// Adds a dependency on a GPU future object.
+    ///
+    /// Execution of the *whole* frame will wait for the operation represented by the future to complete.
+    pub fn add_frame_dependency(&self, future: GpuFuture) {
+        let mut inner = self.inner.borrow_mut();
+        inner.wait_init = inner.wait_init.join(future.serials);
     }
 
     /// Creates a transient image.
@@ -854,7 +879,7 @@ impl<'a> Frame<'a> {
     }
 
     pub fn add_graphics_pass(&self, name: &str, handler: impl FnOnce(&mut PassBuilder<'a, '_>)) {
-        self.add_pass(name, PassKind::Render, false, handler)
+        self.add_pass(name, PassType::Graphics, false, handler)
     }
 
     /// Starts building a compute pass
@@ -864,7 +889,7 @@ impl<'a> Frame<'a> {
         async_compute: bool,
         handler: impl FnOnce(&mut PassBuilder),
     ) {
-        self.add_pass(name, PassKind::Compute, async_compute, handler)
+        self.add_pass(name, PassType::Compute, async_compute, handler)
     }
 
     /// Starts building a transfer pass
@@ -874,14 +899,14 @@ impl<'a> Frame<'a> {
         async_transfer: bool,
         handler: impl FnOnce(&mut PassBuilder),
     ) {
-        self.add_pass(name, PassKind::Transfer, async_transfer, handler)
+        self.add_pass(name, PassType::Transfer, async_transfer, handler)
     }
 
     /// Presents a swapchain image to the associated swapchain.
     pub fn present(&self, name: &str, image: &SwapchainImage) {
         self.add_pass(
             name,
-            PassKind::Present {
+            PassType::Present {
                 swapchain: image.swapchain_handle,
                 image_index: image.image_index,
             },
@@ -892,6 +917,7 @@ impl<'a> Frame<'a> {
                     vk::AccessFlags::MEMORY_READ,
                     vk::PipelineStageFlags::ALL_COMMANDS, // ?
                     vk::ImageLayout::PRESENT_SRC_KHR,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
                 );
             },
         );
@@ -901,31 +927,50 @@ impl<'a> Frame<'a> {
     fn add_pass(
         &self,
         name: &str,
-        kind: PassKind,
+        ty: PassType,
         async_pass: bool,
         handler: impl FnOnce(&mut PassBuilder<'a, '_>),
     ) {
         let mut inner = self.inner.borrow_mut();
         // max 65K passes per frame, because of the implementation of automatic barriers
+        // TODO remove
         let frame_index = inner.passes.len();
         assert!(frame_index <= u16::MAX as usize);
         let serial = inner.context.get_next_serial();
-        let queue_index = match kind {
-            PassKind::Compute if async_pass => inner.context.device.queues_info.indices.compute,
-            PassKind::Transfer if async_pass => inner.context.device.queues_info.indices.transfer,
-            PassKind::Present { .. } => inner.context.device.queues_info.indices.present,
+
+        let q = match ty {
+            PassType::Compute if async_pass => inner.context.device.queues_info.indices.compute,
+            PassType::Transfer if async_pass => inner.context.device.queues_info.indices.transfer,
+            PassType::Present { .. } => inner.context.device.queues_info.indices.present,
             _ => inner.context.device.queues_info.indices.graphics,
         } as usize;
-        let snn = SubmissionNumber::new(queue_index, serial);
+
+        let snn = SubmissionNumber::new(q, serial);
+
+        let pass = Pass::new(name, frame_index, snn);
 
         let mut builder = PassBuilder {
             frame: &mut *inner,
-            pass: Pass::new(name, frame_index, snn, kind),
+            pass,
+            _span: trace_span!("add_pass", ?snn).entered(),
         };
 
         handler(&mut builder);
 
-        let pass = builder.pass;
+        let mut pass = builder.pass;
+
+        // pass the swapchain and image index if this is a present pass
+        // TODO: use a queue operation callback instead
+        if let PassType::Present {
+            swapchain,
+            image_index,
+        } = ty
+        {
+            pass.commands = Some(PassCommands::Present {
+                swapchain,
+                image_index,
+            })
+        }
 
         inner.push_pass(pass);
     }
@@ -1067,27 +1112,30 @@ impl<'a> Frame<'a> {
 
         // passes
         let mut passes_json = Vec::new();
-        for (pass_index,p) in inner.passes.iter().enumerate() {
-
-            let barrier = &p.pre_execution_barrier;
-
-            let image_memory_barriers_json : Vec<_> = barrier.image_memory_barriers.iter().map(|imb| {
-                let id = inner.context.image_resource_by_handle(imb.image);
-                let name = &inner.context.resources.get(id).unwrap().name;
-                json!({
-                    "type": "image",
-                    "srcAccessMask": format!("{:?}", imb.src_access_mask),
-                    "dstAccessMask": format!("{:?}", imb.dst_access_mask),
-                    "oldLayout": format!("{:?}", imb.old_layout),
-                    "newLayout": format!("{:?}", imb.new_layout),
-                    "handle": format!("{:#x}", imb.image.as_raw()),
-                    "id": format!("{:?}", id.data()),
-                    "name": name
+        for (pass_index, p) in inner.passes.iter().enumerate() {
+            let image_memory_barriers_json: Vec<_> = p
+                .image_memory_barriers
+                .iter()
+                .map(|imb| {
+                    let id = inner.context.image_resource_by_handle(imb.image);
+                    let name = &inner.context.resources.get(id).unwrap().name;
+                    json!({
+                        "type": "image",
+                        "srcAccessMask": format!("{:?}", imb.src_access_mask),
+                        "dstAccessMask": format!("{:?}", imb.dst_access_mask),
+                        "oldLayout": format!("{:?}", imb.old_layout),
+                        "newLayout": format!("{:?}", imb.new_layout),
+                        "handle": format!("{:#x}", imb.image.as_raw()),
+                        "id": format!("{:?}", id.data()),
+                        "name": name
+                    })
                 })
-            }).collect();
+                .collect();
 
-            let buffer_memory_barriers_json : Vec<_> =
-                barrier.buffer_memory_barriers.iter().map(|bmb| {
+            let buffer_memory_barriers_json: Vec<_> = p
+                .buffer_memory_barriers
+                .iter()
+                .map(|bmb| {
                     let id = inner.context.buffer_resource_by_handle(bmb.buffer);
                     let name = &inner.context.resources.get(id).unwrap().name;
                     json!({
@@ -1098,14 +1146,18 @@ impl<'a> Frame<'a> {
                         "id": format!("{:?}", id.data()),
                         "name": name
                     })
-                }).collect();
+                })
+                .collect();
 
-            let accesses_json: Vec<_> = p.accesses.iter().map(|a| {
+            let accesses_json: Vec<_> = p
+                .accesses
+                .iter()
+                .map(|a| {
                     let r = inner.context.resources.get(a.id).unwrap();
                     let name = &r.name;
-                    let (ty,handle) = match r.kind {
+                    let (ty, handle) = match r.kind {
                         ResourceKind::Buffer(ref buf) => ("buffer", buf.handle.as_raw()),
-                        ResourceKind::Image(ref img) => ("image", img.handle.as_raw())
+                        ResourceKind::Image(ref img) => ("image", img.handle.as_raw()),
                     };
 
                     json!({
@@ -1115,8 +1167,8 @@ impl<'a> Frame<'a> {
                         "type": ty,
                         "accessMask": format!("{:?}", a.access_mask),
                     })
-
-                }).collect();
+                })
+                .collect();
 
             let mut pass_json = json!({
                 "name": p.name,
@@ -1124,8 +1176,8 @@ impl<'a> Frame<'a> {
                 "serial": p.snn.serial(),
                 "accesses": accesses_json,
                 "barriers": {
-                    "srcStageMask": format!("{:?}", barrier.src_stage_mask),
-                    "dstStageMask": format!("{:?}", barrier.dst_stage_mask),
+                    "srcStageMask": format!("{:?}", p.src_stage_mask),
+                    "dstStageMask": format!("{:?}", p.dst_stage_mask),
                     "imageMemoryBarriers": image_memory_barriers_json,
                     "bufferMemoryBarriers": buffer_memory_barriers_json,
                 },
@@ -1141,7 +1193,7 @@ impl<'a> Frame<'a> {
                 let sync_debug_info = &inner.sync_debug_info[pass_index];
 
                 let mut resource_tracking_json = Vec::new();
-                for (id,tracking) in sync_debug_info.tracking.iter() {
+                for (id, tracking) in sync_debug_info.tracking.iter() {
                     let name = &inner.context.resources.get(id).unwrap().name;
                     resource_tracking_json.push(json!({
                         "id": format!("{:?}", id.data()),
@@ -1157,12 +1209,16 @@ impl<'a> Frame<'a> {
                     }));
                 }
 
-                let xq_sync_json : Vec<_> = sync_debug_info.xq_sync_table.iter().map(|v| v.0).collect();
+                let xq_sync_json: Vec<_> =
+                    sync_debug_info.xq_sync_table.iter().map(|v| v.0).collect();
 
-                pass_json.as_object_mut().unwrap().insert("syncDebugInfo".to_string(), json!({
-                    "resourceTrackingInfo": resource_tracking_json,
-                    "crossQueueSyncTable": xq_sync_json,
-                }));
+                pass_json.as_object_mut().unwrap().insert(
+                    "syncDebugInfo".to_string(),
+                    json!({
+                        "resourceTrackingInfo": resource_tracking_json,
+                        "crossQueueSyncTable": xq_sync_json,
+                    }),
+                );
             }
 
             passes_json.push(pass_json);
@@ -1180,12 +1236,13 @@ impl<'a> Frame<'a> {
             self.frame_serial.0
         ))
         .expect("could not open file for dumping JSON frame information");
-        serde_json::to_writer_pretty(file, &frame_json);
+        serde_json::to_writer_pretty(file, &frame_json).unwrap();
     }
 
     /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn finish(mut self) -> GpuFuture {
-        //println!("====== Batch #{} ======", self.batch_serial.0);
+    pub fn finish(self) -> GpuFuture {
+        // end build span
+        self.build_span.exit();
 
         let mut inner = self.inner.into_inner();
         let context = inner.context;
@@ -1292,10 +1349,13 @@ impl<'a> Frame<'a> {
             &inner.temporaries,
             &inner.passes,
         );
+
         // All resources now have a block of device memory assigned. We're ready to
         // build the command buffers and submit them to the device queues.
-        let submission_result = context.submit_frame(&mut inner.passes);
+        let submission_result = context.submit_frame(&mut inner.passes, inner.wait_init);
+
         let serials = submission_result.signalled_serials;
+
         // Add this frame to the list of "frames in flight": frames that might be executing on the device.
         // When this frame is completed, all resources of the frame will be automatically recycled.
         // This includes:
@@ -1316,6 +1376,43 @@ impl<'a> Frame<'a> {
 
         context.submitted_frame_count += 1;
         context.dump_state();
+
         GpuFuture { serials }
+    }
+}
+
+impl Context {
+    /// Starts a new frame. The execution of the frame can optionally be synchronized
+    /// with the given future in `happens_after`.
+    ///
+    /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
+    /// because of resource dependencies.
+    pub fn start_frame(&mut self, create_info: FrameCreateInfo) -> Frame {
+        let base_serial = self.next_serial;
+
+        let wait_init = create_info.happens_after.serials;
+
+        // Full CPU-side frame processing
+        let span = trace_span!("frame", base_serial).entered();
+        // DAG build only
+        let build_span = trace_span!("DAG build").entered();
+
+        Frame {
+            base_serial,
+            frame_serial: FrameSerialNumber(self.submitted_frame_count + 1),
+            inner: RefCell::new(FrameInner {
+                base_serial,
+                context: self,
+                wait_init,
+                temporaries: vec![],
+                temporary_set: TemporarySet::new(),
+                passes: vec![],
+                xq_sync_table: Default::default(),
+                collect_sync_debug_info: create_info.collect_debug_info,
+                sync_debug_info: Vec::new(),
+            }),
+            span,
+            build_span,
+        }
     }
 }

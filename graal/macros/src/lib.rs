@@ -38,7 +38,7 @@ mod struct_layout;
 mod vertex_input_interface;
 //mod pipeline_interface;
 
-pub(crate) use struct_layout::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr};
+pub(crate) use struct_layout::{ensure_repr_c, generate_field_offsets_and_sizes};
 
 fn derive_struct(
     name: &str,

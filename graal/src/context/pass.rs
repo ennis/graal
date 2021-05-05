@@ -1,12 +1,8 @@
-use crate::{context::{
-    descriptor::DescriptorSet, submission::CommandContext, QueueSerialNumbers, SubmissionNumber,
-}, Context, DescriptorSetInterface, ResourceId, MAX_QUEUES, format_aspect_mask};
-use ash::{version::DeviceV1_0, vk};
-use std::{
-    cmp::Ordering,
-    fmt,
-    ops::{Index, IndexMut},
+use crate::{
+    context::{submission::CommandContext, QueueSerialNumbers, SubmissionNumber},
+    format_aspect_mask, ResourceId, MAX_QUEUES,
 };
+use ash::vk;
 
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct ResourceAccess {
@@ -14,32 +10,60 @@ pub(crate) struct ResourceAccess {
     pub(crate) access_mask: vk::AccessFlags,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub(crate) enum PassKind {
-    Compute,
-    Render,
-    Transfer,
+pub(crate) enum PassCommands<'a> {
     Present {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
     },
+    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue) + 'a>),
+    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>),
 }
 
-#[derive(Default)]
-pub(crate) struct PipelineBarrier {
+pub(crate) struct Pass<'a> {
+    pub(crate) name: String,
+
+    /// Submission number of the pass.
+    pub(crate) snn: SubmissionNumber,
+
+    /// Index of the pass in the frame.
+    pub(crate) frame_index: usize,
+
+    /// Predecessors of the pass (all passes that must happen before this one).
+    pub(crate) preds: Vec<usize>,
+
+    /// Successors of the pass (all passes for which this task is a predecessor).
+    //pub(crate) succs: Vec<usize>,
+
+    /// List of accesses made by the pass to resources.
+    // FIXME Right now, this is used only for debugging purposes, and when allocating memory for the resources.
+    // It probably could be removed.
+    pub(crate) accesses: Vec<ResourceAccess>,
+
+    /// Whether a signal operation must be performed on the queue after the pass.
+    pub(crate) signal_after: bool,
+
     pub(crate) src_stage_mask: vk::PipelineStageFlags,
     pub(crate) dst_stage_mask: vk::PipelineStageFlags,
     pub(crate) image_memory_barriers: Vec<vk::ImageMemoryBarrier>,
-    pub(crate) buffer_memory_barriers: Vec<vk::BufferMemoryBarrier>
+    pub(crate) buffer_memory_barriers: Vec<vk::BufferMemoryBarrier>,
+
+    pub(crate) wait_serials: QueueSerialNumbers,
+    pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
+    pub(crate) wait_binary_semaphores: Vec<vk::Semaphore>,
+    pub(crate) commands: Option<PassCommands<'a>>,
 }
 
-impl PipelineBarrier {
+impl<'a> Pass<'a> {
     pub(crate) fn get_or_create_image_memory_barrier(
         &mut self,
         handle: vk::Image,
-        format: vk::Format) -> &mut vk::ImageMemoryBarrier
-    {
-        if let Some(b) = self.image_memory_barriers.iter_mut().position(|b| b.image == handle) {
+        format: vk::Format,
+    ) -> &mut vk::ImageMemoryBarrier {
+        if let Some(b) = self
+            .image_memory_barriers
+            .iter_mut()
+            .position(|b| b.image == handle)
+        {
             &mut self.image_memory_barriers[b]
         } else {
             let subresource_range = vk::ImageSubresourceRange {
@@ -64,8 +88,15 @@ impl PipelineBarrier {
         }
     }
 
-    pub(crate) fn get_or_create_buffer_memory_barrier(&mut self, handle: vk::Buffer) -> &mut vk::BufferMemoryBarrier {
-        if let Some(b) = self.buffer_memory_barriers.iter_mut().position(|b| b.buffer == handle) {
+    pub(crate) fn get_or_create_buffer_memory_barrier(
+        &mut self,
+        handle: vk::Buffer,
+    ) -> &mut vk::BufferMemoryBarrier {
+        if let Some(b) = self
+            .buffer_memory_barriers
+            .iter_mut()
+            .position(|b| b.buffer == handle)
+        {
             &mut self.buffer_memory_barriers[b]
         } else {
             self.buffer_memory_barriers.push(vk::BufferMemoryBarrier {
@@ -81,73 +112,22 @@ impl PipelineBarrier {
             self.buffer_memory_barriers.last_mut().unwrap()
         }
     }
-}
 
-pub(crate) struct Pass<'a> {
-    pub(crate) name: String,
-
-    /// Submission number of the pass.
-    pub(crate) snn: SubmissionNumber,
-
-    /// Index of the pass in the frame.
-    pub(crate) frame_index: usize,
-
-    /// @brief Predecessors of the pass (all passes that must happen before this one).
-    pub(crate) preds: Vec<usize>,
-
-    /// @brief Successors of the pass (all passes for which this task is a predecessor).
-    pub(crate) succs: Vec<usize>,
-
-    /// List of accesses made by the pass to resources.
-    // FIXME Right now, this is used only for debugging purposes, and when allocating memory for the resources.
-    // It probably could be removed.
-    pub(crate) accesses: Vec<ResourceAccess>,
-
-    pub(crate) pre_execution_barrier: PipelineBarrier,
-
-    /// Access types that should be flushed (made available)
-    pub(crate) availability_mask: vk::AccessFlags,
-
-    /// Whether a signal operation must be performed on the queue after the pass.
-    pub(crate) signal_after: bool,
-
-    /// Whether the task should wait on semaphores.
-    pub(crate) wait_before: bool,
-    pub(crate) wait_serials: QueueSerialNumbers,
-    pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
-    pub(crate) wait_binary_semaphores: Vec<vk::Semaphore>,
-    pub(crate) kind: PassKind,
-    pub(crate) commands: Option<Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>>,
-}
-
-impl<'a> Pass<'a> {
-    pub(crate) fn is_present(&self) -> bool {
-        match self.kind {
-            PassKind::Present { .. } => true,
-            _ => false,
-        }
-    }
-
-    pub(crate) fn new(
-        name: &str,
-        frame_index: usize,
-        snn: SubmissionNumber,
-        kind: PassKind,
-    ) -> Pass<'a> {
+    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass<'a> {
         Pass {
             name: name.to_string(),
             snn,
             preds: vec![],
-            succs: vec![],
+            //succs: vec![],
             accesses: vec![],
-            pre_execution_barrier: Default::default(),
-            availability_mask: Default::default(),
             signal_after: false,
-            wait_before: false,
+            src_stage_mask: Default::default(),
+            dst_stage_mask: Default::default(),
+            image_memory_barriers: vec![],
+            buffer_memory_barriers: vec![],
             wait_serials: Default::default(),
             wait_dst_stages: Default::default(),
             wait_binary_semaphores: Vec::new(),
-            kind,
             frame_index,
             commands: None,
         }

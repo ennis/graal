@@ -312,6 +312,13 @@
                 `
             ).join('');
 
+            // TODO display passes and pre-exec barriers on the same level:
+            //  <barrier>
+            //  <pass>
+            //  <barrier>
+            //  <barrier>
+            // Might not need a table for that
+
             // Pass table entry
             const q = passData.queue;
             const s = passData.serial;

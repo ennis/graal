@@ -1,9 +1,7 @@
 use crate::{
     layout::{ArrayLayout, InnerLayout, Layout},
     typedesc::{PrimitiveType, TypeDesc},
-    vk, ResourceId,
 };
-use std::{marker::PhantomData, mem::MaybeUninit};
 
 //--------------------------------------------------------------------------------------------------
 

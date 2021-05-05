@@ -1,10 +1,9 @@
 //! Generic geometry (G-buffer) generation pass
-use crate::{camera::Camera, mesh::Vertex3D, shader::create_shader_module};
+use crate::{camera::Camera, mesh::Vertex3D, scene::Scene, shader::create_shader_module};
 use glam::{Mat4, Vec4};
 use graal::{ash::version::DeviceV1_0, vk, FragmentOutputInterface, VertexInputInterfaceExt};
 use inline_spirv::include_spirv;
 use std::ptr;
-use crate::scene::Scene;
 
 static GEOMETRY_PASS_SHADER_VERT: &[u32] = include_spirv!("shaders/mesh_vis.vert", vert);
 static GEOMETRY_PASS_SHADER_FRAG: &[u32] = include_spirv!("shaders/mesh_vis.frag", frag);
@@ -115,8 +114,6 @@ pub struct GBuffers {
 // Solution: also derive PassResources on the group of resources?
 //
 // Problem: resources can be accessed in different ways depending on the pass
-//
-// Bigger problem: must register access of ALL VERTEX BUFFERS in the scene
 /*#[derive(PassResources)]
 pub struct GeometryPassResources {
     #[access("ColorAttachmentReadWrite")]
@@ -136,6 +133,17 @@ pub struct GeometryPass {
     render_pass: vk::RenderPass,
 }
 
+// let's say I want to add a texture pass:
+// - modify the Shader
+// - modify the MaterialsInterface to take an image descriptor
+// - register the use of the texture in the pass
+// - create the image view
+// - put the image view in the descriptor set
+
+// With bindless:
+// - modify the shader
+// - register the use of the texture in the pass
+// -
 
 impl GeometryPass {
     //
@@ -241,7 +249,7 @@ impl GeometryPass {
                 | vk::ColorComponentFlags::G
                 | vk::ColorComponentFlags::B
                 | vk::ColorComponentFlags::A,
-            .. Default::default()
+            ..Default::default()
         };
 
         let color_blend_attachments = &[no_blend, no_blend, no_blend];
@@ -341,8 +349,7 @@ impl GeometryPass {
         scene: &'a Scene,
         target_size: (u32, u32),
         camera: &Camera,
-    ) -> GBuffers
-    {
+    ) -> GBuffers {
         // allocate the G-buffers of the frame
         let g: GBuffers = GBuffers::new(
             frame,
@@ -381,7 +388,7 @@ impl GeometryPass {
 
         // setup the pass
         frame.add_graphics_pass("gbuffers", |pass| {
-            // we don't really need to register those because
+            // we don't really need to register those
             pass.register_buffer_access(
                 global_uniforms.id,
                 graal::AccessType::AnyShaderReadUniformBuffer,
@@ -394,6 +401,7 @@ impl GeometryPass {
                 per_object_uniforms.id,
                 graal::AccessType::AnyShaderReadUniformBuffer,
             );
+
             //pass.register_buffer_access(vertex_buffer.id, graal::AccessType::VertexAttributeRead);
             pass.register_image_access(g.color.id, graal::AccessType::ColorAttachmentReadWrite);
             pass.register_image_access(g.normal.id, graal::AccessType::ColorAttachmentReadWrite);
@@ -489,8 +497,11 @@ impl GeometryPass {
 
                 // loop over all objects in the scene
                 for obj in scene.objects().values() {
-
-                    let mesh = if let Some(m) = scene.mesh(obj.mesh) { m } else { continue };
+                    let mesh = if let Some(m) = scene.mesh(obj.mesh) {
+                        m
+                    } else {
+                        continue;
+                    };
 
                     let materials_set = context.create_descriptor_set(&MaterialsInterface {
                         material: material_uniforms.into(),
@@ -499,7 +510,6 @@ impl GeometryPass {
                     let per_object_set = context.create_descriptor_set(&PerObjectInterface {
                         per_object: per_object_uniforms.into(),
                     });
-
 
                     context.device().cmd_bind_descriptor_sets(
                         cb,
@@ -510,11 +520,16 @@ impl GeometryPass {
                         &[],
                     );
 
+                    context.device().cmd_bind_vertex_buffers(
+                        cb,
+                        0,
+                        &[mesh.vertex_buffer.handle],
+                        &[0],
+                    );
+
                     context
                         .device()
-                        .cmd_bind_vertex_buffers(cb, 0, &[mesh.vertex_buffer.handle], &[0]);
-
-                    context.device().cmd_draw(cb, mesh.vertex_count as u32, 1, 0, 0);
+                        .cmd_draw(cb, mesh.vertex_count as u32, 1, 0, 0);
                 }
 
                 context.device().cmd_end_render_pass(cb);

@@ -1,27 +1,50 @@
-use crate::{context::{
-    get_vk_sample_count, is_write_access,
-    pass::{Pass, ResourceAccess},
-    resource::ResourceKind::Image,
-    set_debug_object_name, QueueSerialNumbers, SubmissionNumber,
-}, Context, Device, MAX_QUEUES};
+use crate::{
+    context::{
+        external_memory_handle::ExternalMemoryHandle, get_vk_sample_count, pass::Pass,
+        set_debug_object_name, QueueSerialNumbers, SubmissionNumber,
+    },
+    platform_impl, Context, Device,
+};
 use ash::{version::DeviceV1_0, vk, vk::Handle};
 use fixedbitset::FixedBitSet;
 use slotmap::{SecondaryMap, SlotMap};
-use std::{mem, ptr};
+use std::{
+    ffi::{OsStr, OsString},
+    mem, ptr,
+};
+use tracing::{trace, trace_span};
 
 slotmap::new_key_type! {
     pub struct ResourceId;
 }
 
+/// TODO docs
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BufferId(pub(crate) ResourceId);
 
+/// TODO docs
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ImageId(pub(crate) ResourceId);
 
 pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
 
 /// Information about the memory to be allocated for a resource.
+//
+// NOTE: we don't put the "transient" flag here, because it's not _strictly_ a property of the memory
+// we're allocating, but a property of the resource itself (its lifetime).
+//
+// NOTE: this would be the logical place to put an optional "ExternalMemoryHandle", but then all
+// functions using `ResourceMemoryInfo` would have to be unsafe, since it's the responsibility of
+// the caller to ensure that the external handle is valid.
+// Instead, we decided to split resource creation into two functions: one in which we allocate the
+// memory for the resource ourselves, for which we can guarantee its safety, and one in which the
+// user provides the memory handle, which is unsafe.
+// TODO: considering that we do very minimal checks on the createInfos passed to vulkan, it might
+// make sense to just make most resource creation functions unsafe.
+//
+// TODO: "ResourceMemoryInfo" seems like information about already allocated memory, but it's more
+// like a request: maybe something in the lines of "ResourceMemoryAllocationInfo" or
+// "ResourceMemoryRequirements"?
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ResourceMemoryInfo {
     /// Required memory property flags. Panics if those cannot be honored (no memory type with those properties).
@@ -31,6 +54,7 @@ pub struct ResourceMemoryInfo {
 }
 
 impl ResourceMemoryInfo {
+    /// TODO docs
     pub const fn new() -> ResourceMemoryInfo {
         ResourceMemoryInfo {
             required_flags: vk::MemoryPropertyFlags::empty(),
@@ -158,7 +182,8 @@ pub(crate) struct BufferResource {
 /// Represents a resource access in a pass.
 #[derive(Debug)]
 pub(crate) struct ResourceAccessDetails {
-    pub(crate) layout: vk::ImageLayout,
+    pub(crate) initial_layout: vk::ImageLayout,
+    pub(crate) final_layout: vk::ImageLayout,
     pub(crate) access_mask: vk::AccessFlags,
     pub(crate) stage_mask: vk::PipelineStageFlags,
 }
@@ -169,7 +194,7 @@ pub(crate) enum ResourceKind {
     Image(ImageResource),
 }
 
-#[derive(Copy,Clone,Debug)]
+#[derive(Copy, Clone, Debug)]
 pub(crate) struct ResourceTrackingInfo {
     pub(crate) owner_queue_family: u32,
     pub(crate) readers: QueueSerialNumbers,
@@ -226,6 +251,8 @@ pub(crate) enum ResourceMemory {
     Exclusive(vk_mem::Allocation),
     /// The memory for the resource is managed externally (e.g. swapchain images)
     External,
+    /// The memory for this resource was imported from an external handle.
+    Imported { device_memory: vk::DeviceMemory },
 }
 
 #[derive(Debug)]
@@ -252,8 +279,22 @@ impl Resource {
         }
     }
 
+    pub(crate) fn image_mut(&mut self) -> &mut ImageResource {
+        match &mut self.kind {
+            ResourceKind::Image(r) => r,
+            _ => panic!("expected an image resource"),
+        }
+    }
+
     pub(crate) fn buffer(&self) -> &BufferResource {
         match &self.kind {
+            ResourceKind::Buffer(r) => r,
+            _ => panic!("expected a buffer resource"),
+        }
+    }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut BufferResource {
+        match &mut self.kind {
             ResourceKind::Buffer(r) => r,
             _ => panic!("expected a buffer resource"),
         }
@@ -266,7 +307,6 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     // destroy the object, if we're responsible for it (we're not responsible of destroying
     // swapchain images, for example, since they are destroyed with the swapchain).
     if resource.should_delete {
-        //eprintln!("destroying resource: {:?}", resource);
         match &mut resource.kind {
             ResourceKind::Buffer(buf) => {
                 device
@@ -291,27 +331,47 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     }
 }
 
-
+/// Holds information about a buffer resource.
 #[derive(Copy, Clone, Debug)]
 pub struct BufferInfo {
+    /// ID of the buffer resource.
     pub id: BufferId,
+    /// Vulkan handle of the buffer.
     pub handle: vk::Buffer,
+    /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
     pub mapped_ptr: *mut u8,
 }
 
+/// Holds information about a buffer resource containing an array of elements of type T.
 #[derive(Copy, Clone, Debug)]
 pub struct TypedBufferInfo<T> {
+    /// ID of the buffer resource.
     pub id: BufferId,
+    /// Vulkan handle of the buffer.
     pub handle: vk::Buffer,
+    /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
     pub mapped_ptr: *mut T,
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct ImageInfo {
-    pub id: ImageId,
-    pub handle: vk::Image,
+/// `TypedBufferInfo<T>` are convertible into their untyped equivalents.
+impl<T> From<TypedBufferInfo<T>> for BufferInfo {
+    fn from(buf: TypedBufferInfo<T>) -> Self {
+        BufferInfo {
+            id: buf.id,
+            handle: buf.handle,
+            mapped_ptr: buf.mapped_ptr as *mut u8,
+        }
+    }
 }
 
+/// Holds information about an image resource.
+#[derive(Copy, Clone, Debug)]
+pub struct ImageInfo {
+    /// ID of the image resource.
+    pub id: ImageId,
+    /// Vulkan handle of the image.
+    pub handle: vk::Image,
+}
 
 // --- Reachability matrix -------------------------------------------------------------------------
 struct Reachability {
@@ -354,16 +414,18 @@ impl Context {
     /// Frees or recycles resources used by batches that have completed and that have no user
     /// references.
     pub(crate) fn cleanup_resources(&mut self) {
+        let _ = trace_span!("cleanup_resources");
         let device = &self.device;
         let completed_serials = self.completed_serials;
         // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
         // and resources that have reader or writer passes that have not yet completed
-        self.resources.retain(|_id, r| {
+        self.resources.retain(|id, r| {
             // refcount != 0 OR any reader not completed OR writer not completed
             let keep = r.user_ref_count != 0
                 || r.tracking.readers > completed_serials
                 || r.tracking.writer.serial() > completed_serials.serial(r.tracking.writer.queue());
             if !keep {
+                trace!(?id, name = r.name.as_str(), "destroy_resource");
                 unsafe {
                     // Safety: we know that all serials <= `self.completed_serials` have finished
                     destroy_resource(device, r);
@@ -373,18 +435,22 @@ impl Context {
         })
     }
 
-    /// Creates a new image resource.
-    ///
-    /// Transient: whether the resource should live only for the duration of the frame it's used in.
-    /// When the frame that uses the resource completes, the resource is automatically deleted.
-    /// The resource can only be used in one frame.
-    pub fn create_image(
+    // Common logic for create_image and create_image_with_external_memory_handle. These are two
+    // different functions because `create_image_with_external_memory_handle` is unsafe, while
+    // create_image isn't.
+    // In theory, `external_memory_handle` could be put in `ResourceMemoryInfo`, but that would require
+    // the function to be unsafe.
+    unsafe fn create_image_internal(
         &mut self,
         name: &str,
         memory_info: &ResourceMemoryInfo,
         image_info: &ImageResourceCreateInfo,
         transient: bool,
+        external_memory_handle: Option<ExternalMemoryHandle>,
     ) -> ImageInfo {
+        // can't be both transient and have an external memory handle
+        assert!(transient ^ external_memory_handle.is_some());
+
         // for now all resources are CONCURRENT, because that's the only way they can
         // be read across multiple queues.
         // Maybe exclusive ownership will be needed at some point, but then we should prevent
@@ -411,7 +477,24 @@ impl Context {
                 .expect("failed to create image")
         };
         let mem_req = unsafe { self.device.device.get_image_memory_requirements(handle) };
-        let memory = if transient {
+        let memory = if let Some(ref external_memory_handle) = external_memory_handle {
+            // import external memory and bind it to the resource
+            let device_memory = platform_impl::allocate_external_memory(
+                &self.device,
+                &mem_req,
+                memory_info.required_flags,
+                memory_info.preferred_flags,
+                external_memory_handle,
+            );
+            unsafe {
+                self.device
+                    .device
+                    .bind_image_memory(handle, device_memory, 0)
+                    .unwrap();
+            }
+            ResourceMemory::Imported { device_memory }
+        } else if transient {
+            // transient memory
             ResourceMemory::Aliasable(AllocationRequirements {
                 mem_req,
                 required_flags: memory_info.required_flags,
@@ -442,7 +525,7 @@ impl Context {
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
-            user_ref_count: 0, // start at 1 if not transient?
+            user_ref_count: if transient { 0 } else { 1 },
             memory,
             tracking: Default::default(),
             should_delete: true,
@@ -465,14 +548,48 @@ impl Context {
         }
     }
 
-    /// Creates a buffer resource.
-    pub fn create_buffer(
+    /// Creates a new image resource.
+    ///
+    /// Whether the resource should live only for the duration of the frame it's used in.
+    /// When the frame that uses the resource completes, the resource is automatically deleted.
+    /// The resource can only be used in one frame.
+    pub fn create_image(
+        &mut self,
+        name: &str,
+        memory_info: &ResourceMemoryInfo,
+        image_info: &ImageResourceCreateInfo,
+        transient: bool,
+    ) -> ImageInfo {
+        unsafe { self.create_image_internal(name, memory_info, image_info, transient, None) }
+    }
+
+    /// Creates an image from an external handle.
+    pub unsafe fn create_image_with_external_memory_handle(
+        &mut self,
+        name: &str,
+        memory_info: &ResourceMemoryInfo,
+        image_info: &ImageResourceCreateInfo,
+        external_memory_handle: ExternalMemoryHandle,
+    ) -> ImageInfo {
+        self.create_image_internal(
+            name,
+            memory_info,
+            image_info,
+            false,
+            Some(external_memory_handle),
+        )
+    }
+
+    unsafe fn create_buffer_internal(
         &mut self,
         name: &str,
         memory_info: &ResourceMemoryInfo,
         buffer_create_info: &BufferResourceCreateInfo,
         transient: bool,
+        external_memory_handle: Option<ExternalMemoryHandle>,
     ) -> BufferInfo {
+        assert!(transient ^ external_memory_handle.is_some());
+
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
             size: buffer_create_info.byte_size,
@@ -493,7 +610,28 @@ impl Context {
                 .expect("failed to create buffer")
         };
         let mem_req = unsafe { self.device.device.get_buffer_memory_requirements(handle) };
-        let (memory, mapped_ptr) = if transient && !buffer_create_info.map_on_create {
+        let (memory, mapped_ptr) = if let Some(ref external_memory_handle) = external_memory_handle
+        {
+            // import external memory and bind it to the resource
+            let device_memory = platform_impl::allocate_external_memory(
+                &self.device,
+                &mem_req,
+                memory_info.required_flags,
+                memory_info.preferred_flags,
+                external_memory_handle,
+            );
+            unsafe {
+                self.device
+                    .device
+                    .bind_buffer_memory(handle, device_memory, 0)
+                    .unwrap();
+            }
+            let memory = ResourceMemory::Imported { device_memory };
+            (
+                /* memory */ memory,
+                /* mapped_ptr */ ptr::null_mut(),
+            )
+        } else if transient && !buffer_create_info.map_on_create {
             // We can delay allocation only if the user requests a transient resource and
             // if the resource does not need to be mapped immediately.
             let memory = ResourceMemory::Aliasable(AllocationRequirements {
@@ -501,7 +639,10 @@ impl Context {
                 required_flags: memory_info.required_flags,
                 preferred_flags: memory_info.preferred_flags,
             });
-            (memory, ptr::null_mut())
+            (
+                /* memory */ memory,
+                /* mapped_ptr */ ptr::null_mut(),
+            )
         } else {
             let allocation_create_info = vk_mem::AllocationCreateInfo {
                 flags: if buffer_create_info.map_on_create {
@@ -536,11 +677,11 @@ impl Context {
             } else {
                 ptr::null_mut()
             };
-            (memory, mapped_ptr)
+            (/* memory */ memory, /* memory */ mapped_ptr)
         };
         let id = self.resources.insert(Resource {
             name: name.to_string(),
-            user_ref_count: 0,
+            user_ref_count: if transient { 0 } else { 1 },
             memory,
             tracking: Default::default(),
             should_delete: true,
@@ -561,12 +702,43 @@ impl Context {
         }
     }
 
+    /// Creates a buffer resource.
+    pub fn create_buffer(
+        &mut self,
+        name: &str,
+        memory_info: &ResourceMemoryInfo,
+        buffer_create_info: &BufferResourceCreateInfo,
+        transient: bool,
+    ) -> BufferInfo {
+        unsafe {
+            self.create_buffer_internal(name, memory_info, buffer_create_info, transient, None)
+        }
+    }
+
+    pub unsafe fn create_buffer_with_external_memory_handle(
+        &mut self,
+        name: &str,
+        memory_info: &ResourceMemoryInfo,
+        buffer_create_info: &BufferResourceCreateInfo,
+        external_memory_handle: ExternalMemoryHandle,
+    ) -> BufferInfo {
+        self.create_buffer_internal(
+            name,
+            memory_info,
+            buffer_create_info,
+            false,
+            Some(external_memory_handle),
+        )
+    }
+
     pub(crate) fn allocate_memory_for_transients(
         &mut self,
         base_serial: u64,
         temporaries: &[ResourceId],
         passes: &[Pass],
     ) -> Vec<vk_mem::Allocation> {
+        let _span = trace_span!("allocate_memory_for_transients").entered();
+
         #[derive(Copy, Clone, Debug)]
         struct AllocIndex {
             index: usize,
@@ -634,15 +806,17 @@ impl Context {
                     for &read_serial in alias_candidate.tracking.readers.iter() {
                         // Consider the resource to be live if:
                         // 1. the reader is in a previous frame (we don't have info about execution dependencies between passes in different frames)
+                        //      TODO is that really the case?
                         // 2. the reader comes after this pass
-                        // 3. there's no execution dependency chain from the reader to the current task.
+                        // 3. there's no execution dependency chain from the reader to the current task: this is encoded in the reachability matrix.
+                        //      TODO verify that the DAG (and thus the reachability matrix) is properly constructed
 
                         if read_serial != 0
                             && (read_serial <= base_serial
                                 || read_serial >= pass.snn.serial()
                                 || !reachability.is_reachable(
-                            (read_serial - base_serial - 1) as usize,
-                            pass.frame_index,
+                                    (read_serial - base_serial - 1) as usize,
+                                    pass.frame_index,
                                 ))
                         {
                             continue 'alias;
@@ -654,8 +828,8 @@ impl Context {
                         && (write_serial <= base_serial
                             || write_serial >= pass.snn.serial()
                             || !reachability.is_reachable(
-                        (write_serial - base_serial - 1) as usize,
-                        pass.frame_index,
+                                (write_serial - base_serial - 1) as usize,
+                                pass.frame_index,
                             ))
                     {
                         continue;

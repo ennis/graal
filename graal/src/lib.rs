@@ -12,13 +12,14 @@ pub use crate::{
     buffer::{BoolU32, BufferData, StructuredBufferData},
     context::{
         format_aspect_mask,
+        frame::FrameCreateInfo,
+        external_memory_handle::ExternalMemoryHandle,
         resource::{
             get_mip_level_count, BufferId, BufferInfo, BufferResourceCreateInfo, ImageId,
             ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, TypedBufferInfo,
         },
-        frame::FrameCreateInfo,
-        AccessType, AccessTypeInfo, Frame, CommandContext, Context, DescriptorSetAllocatorId,
-        PipelineLayoutId, RenderPassId, SwapchainId,
+        AccessType, AccessTypeInfo, CommandContext, Context, DescriptorSetAllocatorId, Frame,
+        GpuFuture, PipelineLayoutId, RenderPassId, SwapchainId, SwapchainInfo,
     },
     descriptor::{
         extract_descriptor_set_layouts_from_shader_stages, BufferDescriptor,
@@ -33,10 +34,13 @@ pub use crate::{
         VertexInputInterface, VertexInputInterfaceExt,
     },
 };
+
 pub(crate) use crate::{
     device::MAX_QUEUES,
     instance::{VULKAN_ENTRY, VULKAN_INSTANCE},
 };
+
+pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instance};
 
 pub(crate) mod buffer;
 pub mod cache;
@@ -48,7 +52,11 @@ pub(crate) mod instance;
 pub mod pipeline;
 pub mod surface;
 pub(crate) mod swapchain;
+pub mod utils;
 pub(crate) mod vertex;
+mod platform_impl;
+
+pub mod platform;
 
 /// For internal use by `graal_macros`.
 pub mod internal {

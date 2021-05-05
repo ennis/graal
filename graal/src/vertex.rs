@@ -1,6 +1,5 @@
 use crate::{
     typedesc::{PrimitiveType, TypeDesc},
-    vk::PipelineVertexInputStateCreateInfo,
     BufferData,
 };
 use ash::vk;
@@ -71,14 +70,14 @@ impl From<f64> for Norm<u16> {
 }
 
 // Vertex attribute types --------------------------------------------------------------------------
-macro_rules! impl_attrib_type {
+/*macro_rules! impl_attrib_type {
     ($t:ty, $equiv:expr, $fmt:ident) => {
         unsafe impl VertexAttributeType for $t {
             const EQUIVALENT_TYPE: TypeDesc<'static> = $equiv;
             const FORMAT: vk::Format = vk::Format::$fmt;
         }
     };
-}
+}*/
 
 macro_rules! impl_attrib_prim_type {
     ($t:ty, $prim:ident, $fmt:ident) => {

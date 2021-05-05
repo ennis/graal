@@ -3,7 +3,7 @@ use crate::{
     context::{CommandContext, RenderPassId},
     vk,
     vk::RenderPass,
-    Frame, Context,
+    Context, Frame,
 };
 
 /// Types that describe a fragment output interface (a set of images that act as attachments).
@@ -48,7 +48,7 @@ impl<T: FragmentOutputInterface> FragmentOutputInterfaceExt for T {
         // Safety: through the requirements of the implementations FragmentOutputInterface
         unsafe {
             context
-                .device()
+                .vulkan_device()
                 .create_render_pass(Self::RENDER_PASS_CREATE_INFO, None)
                 .unwrap()
         }

@@ -1,9 +1,9 @@
-use crate::{ensure_repr_c, generate_field_offsets_and_sizes, has_repr_c_attr, FieldList, G};
+use crate::{ensure_repr_c, generate_field_offsets_and_sizes, FieldList, G};
 use darling::{
     util::{Flag, SpannedValue},
     FromDeriveInput, FromField, FromMeta,
 };
-use proc_macro2::{Span, TokenStream};
+use proc_macro2::TokenStream;
 use quote::quote;
 use syn::spanned::Spanned;
 
@@ -40,8 +40,8 @@ struct LayoutAttr {
     binding: u32,
     #[darling(default)]
     runtime_array: Option<SpannedValue<RuntimeArrayMeta>>,
-    #[darling(default)]
-    array: SpannedValue<Flag>,
+    //#[darling(default)]
+    //array: SpannedValue<Flag>,
     #[darling(default)]
     stages: Option<SpannedValue<StagesMeta>>,
     #[darling(default)]
@@ -58,12 +58,6 @@ struct LayoutAttr {
     storage_buffer: Flag,
     #[darling(default)]
     storage_buffer_dynamic: Flag,
-}
-
-enum DescriptorClass {
-    Buffer,
-    Image,
-    TexelBufferView,
 }
 
 pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStream {

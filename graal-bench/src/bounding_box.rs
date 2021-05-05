@@ -6,10 +6,21 @@ pub struct BoundingBox {
 }
 
 impl BoundingBox {
+    /// Returns an empty bounding box.
+    pub fn new() -> BoundingBox {
+        BoundingBox {
+            min: Default::default(),
+            max: Default::default(),
+        }
+    }
+
+    /// Returns the size of the bounding box.
     pub fn size(&self) -> glam::Vec3A {
         self.max - self.min
     }
 
+    /// Transforms the bounding box with the provided matrix.
+    ///
     /// Reference:
     /// http://dev.theomader.com/transform-bounding-boxes/
     pub fn transform(&self, tr: &glam::Mat4) -> BoundingBox {
@@ -34,16 +45,17 @@ impl BoundingBox {
         0.5 * (self.min + self.max)
     }
 
-    /*pub fn union_with(&mut self, other: &AABB>) {
-        // This is a tad verbose
-        self.min = Point3::from_coordinates(cw_min3(&self.min.coords, &other.min.coords));
-        self.max = Point3::from_coordinates(cw_max3(&self.max.coords, &other.max.coords));
-    }
-
-    pub fn empty() -> AABB<N> {
-        AABB {
-            max: Point3::new(N::min_value(), N::min_value(), N::min_value()),
-            min: Point3::new(N::max_value(), N::max_value(), N::max_value()),
+    /// Returns the union of this bounding box with another.
+    pub fn union(&self, other: &BoundingBox) -> BoundingBox {
+        BoundingBox {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
         }
-    }*/
+    }
+}
+
+impl Default for BoundingBox {
+    fn default() -> Self {
+        BoundingBox::new()
+    }
 }

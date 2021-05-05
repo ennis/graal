@@ -1,5 +1,4 @@
-use crate::{Arena, PrimitiveType, StructField, StructType, TypeDesc};
-use std::iter;
+use crate::{Arena, PrimitiveType, StructField, TypeDesc};
 
 fn round_up(value: usize, multiple: usize) -> usize {
     if multiple == 0 {

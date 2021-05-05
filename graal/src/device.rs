@@ -1,4 +1,4 @@
-use crate::{VULKAN_ENTRY, VULKAN_INSTANCE};
+use crate::{platform_impl, VULKAN_ENTRY, VULKAN_INSTANCE};
 use ash::{
     version::{DeviceV1_0, InstanceV1_0},
     vk,
@@ -38,25 +38,28 @@ pub(crate) struct QueuesInfo {
     pub queues: [vk::Queue; MAX_QUEUES],
 }
 
+/// Wrapper around a vulkan device and associated queues.
 pub struct Device {
+    /// Underlying vulkan device
     pub device: ash::Device,
+    /// Platform-specific extension functions
+    pub(crate) platform_extensions: platform_impl::PlatformExtensions,
     pub(crate) physical_device: vk::PhysicalDevice,
-    pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
-    pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
-    pub(crate) graphics_queue_family: u32,
-    pub(crate) compute_queue_family: u32,
-    pub(crate) transfer_queue_family: u32,
+    pub(crate) physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    //pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
+    //pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
     pub(crate) queues_info: QueuesInfo,
     pub(crate) allocator: vk_mem::Allocator,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
+    pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
 }
 
 struct PhysicalDeviceAndProperties {
     phy: vk::PhysicalDevice,
     properties: vk::PhysicalDeviceProperties,
-    features: vk::PhysicalDeviceFeatures,
+    //features: vk::PhysicalDeviceFeatures,
 }
 
 unsafe fn select_physical_device(instance: &ash::Instance) -> PhysicalDeviceAndProperties {
@@ -69,14 +72,14 @@ unsafe fn select_physical_device(instance: &ash::Instance) -> PhysicalDeviceAndP
 
     let mut selected_phy = None;
     let mut selected_phy_properties = Default::default();
-    let mut selected_phy_features = Default::default();
+    //let mut selected_phy_features = Default::default();
     for phy in physical_devices {
         let props = instance.get_physical_device_properties(phy);
-        let features = instance.get_physical_device_features(phy);
+        let _features = instance.get_physical_device_features(phy);
         if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
             selected_phy = Some(phy);
             selected_phy_properties = props;
-            selected_phy_features = features;
+            //selected_phy_features = features;
         }
     }
     // TODO fallbacks
@@ -84,7 +87,7 @@ unsafe fn select_physical_device(instance: &ash::Instance) -> PhysicalDeviceAndP
     PhysicalDeviceAndProperties {
         phy: selected_phy.expect("no suitable physical device"),
         properties: selected_phy_properties,
-        features: selected_phy_features,
+        //features: selected_phy_features,
     }
 }
 
@@ -132,7 +135,108 @@ unsafe fn find_queue_family(
     best_queue_family.expect("could not find a compatible queue")
 }
 
+// Vulkan message callback
+unsafe extern "system" fn debug_utils_message_callback(
+    message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
+    _message_types: vk::DebugUtilsMessageTypeFlagsEXT,
+    p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
+    _p_user_data: *mut c_void,
+) -> vk::Bool32 {
+    let message = CStr::from_ptr((*p_callback_data).p_message)
+        .to_str()
+        .unwrap();
+
+    /*let message_id_name = CStr::from_ptr((*p_callback_data).p_message_id_name)
+        .to_str()
+        .unwrap();
+    let objects = slice::from_raw_parts(
+        (*p_callback_data).p_objects,
+        (*p_callback_data).object_count as usize,
+    );
+    let queue_labels = slice::from_raw_parts(
+        (*p_callback_data).p_queue_labels,
+        (*p_callback_data).queue_label_count as usize,
+    );*/
+
+    /*// convert objects into a dumpable form
+    #[derive(Debug)]
+    struct Object<'a> {
+        object_name: &'a str,
+        object_type: vk::ObjectType,
+        object_handle: u64,
+    }
+    let objects: Vec<_> = objects
+        .iter()
+        .map(|obj| Object {
+            object_name: if obj.p_object_name.is_null() {
+                "<unnamed>"
+            } else {
+                CStr::from_ptr(obj.p_object_name).to_str().unwrap()
+            },
+            object_type: obj.object_type,
+            object_handle: obj.object_handle,
+        })
+        .collect();*/
+
+    // translate message severity into tracing's log level
+    match message_severity {
+        vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE => {
+            tracing::event!(tracing::Level::TRACE, "{}", message);
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::INFO => {
+            tracing::event!(tracing::Level::INFO, "{}", message);
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::WARNING => {
+            tracing::event!(tracing::Level::WARN, "{}", message);
+        }
+        vk::DebugUtilsMessageSeverityFlagsEXT::ERROR => {
+            tracing::event!(tracing::Level::ERROR, "{}", message);
+        }
+        _ => {
+            panic!("unexpected message severity flags")
+        }
+    };
+
+    vk::FALSE
+}
+
 impl Device {
+    fn find_compatible_memory_type_internal(
+        &self,
+        memory_type_bits: u32,
+        memory_properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        for i in 0..self.physical_device_memory_properties.memory_type_count {
+            if memory_type_bits & (1 << i) != 0 {
+                if self.physical_device_memory_properties.memory_types[i as usize]
+                    .property_flags
+                    .contains(memory_properties)
+                {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the index of the first memory type compatible with the specified memory type bitmask and additional memory property flags.
+    pub(crate) fn find_compatible_memory_type(
+        &self,
+        memory_type_bits: u32,
+        required_memory_properties: vk::MemoryPropertyFlags,
+        preferred_memory_properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        // first, try required+preferred, otherwise fallback on just required
+        self.find_compatible_memory_type_internal(
+            memory_type_bits,
+            required_memory_properties | preferred_memory_properties,
+        )
+        .or_else(|| {
+            self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties)
+        })
+    }
+
+    /// Creates a new `Device` that can render to the specified `present_surface` if one is specified.
     pub fn new(present_surface: Option<vk::SurfaceKHR>) -> Device {
         unsafe {
             let instance = &*VULKAN_INSTANCE;
@@ -309,23 +413,59 @@ impl Device {
                 .expect("failed to create VMA allocator");
 
             let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
+
+            // FIXME this should be created after the instance.
             let vk_ext_debug_utils =
                 ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
 
+            let debug_utils_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
+                flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
+                message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+                message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+                pfn_user_callback: Some(debug_utils_message_callback),
+                p_user_data: ptr::null_mut(),
+                ..Default::default()
+            };
+
+            let debug_messenger = vk_ext_debug_utils
+                .create_debug_utils_messenger(&debug_utils_messenger_create_info, None)
+                .unwrap();
+
+            let physical_device_memory_properties =
+                VULKAN_INSTANCE.get_physical_device_memory_properties(phy.phy);
+
+            let platform_extensions =
+                platform_impl::PlatformExtensions::load(&*VULKAN_ENTRY, &*VULKAN_INSTANCE, &device);
+
             Device {
                 device,
+                platform_extensions,
                 physical_device: phy.phy,
-                physical_device_properties: phy.properties,
-                physical_device_features: phy.features,
-                graphics_queue_family,
-                compute_queue_family,
-                transfer_queue_family,
+                //physical_device_properties: phy.properties,
+                //physical_device_features: phy.features,
+                physical_device_memory_properties,
                 queues_info,
                 allocator,
                 vk_khr_swapchain,
                 vk_khr_surface,
                 vk_ext_debug_utils,
+                debug_messenger,
             }
         }
+    }
+    /// Returns the physical device that this device was created on.
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.physical_device
+    }
+
+    /// Returns the graphics queue handle and family index.
+    pub fn graphics_queue(&self) -> (vk::Queue, u32) {
+        let q = self.queues_info.indices.graphics as usize;
+        (self.queues_info.queues[q], self.queues_info.families[q])
     }
 }

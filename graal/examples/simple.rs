@@ -2,7 +2,12 @@ use ash::{
     version::DeviceV1_0,
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
-use graal::{ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk, BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, ImageId, ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo, VertexBufferView, VertexData, VertexInputInterface, FrameCreateInfo};
+use graal::{
+    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk,
+    BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId,
+    ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo,
+    VertexBufferView, VertexData, VertexInputInterface,
+};
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -132,7 +137,7 @@ impl BackgroundPass {
     fn new(context: &mut graal::Context) -> BackgroundPass {
         let vert = unsafe {
             context
-                .device()
+                .vk_device()
                 .create_shader_module(
                     &vk::ShaderModuleCreateInfo {
                         flags: Default::default(),
@@ -147,7 +152,7 @@ impl BackgroundPass {
 
         let frag = unsafe {
             context
-                .device()
+                .vk_device()
                 .create_shader_module(
                     &vk::ShaderModuleCreateInfo {
                         flags: Default::default(),
@@ -305,7 +310,7 @@ impl BackgroundPass {
         };
 
         let render_pass =
-            create_single_color_target_render_pass(context.device(), vk::Format::B8G8R8A8_SRGB);
+            create_single_color_target_render_pass(context.vulkan_device(), vk::Format::B8G8R8A8_SRGB);
 
         let gpci = vk::GraphicsPipelineCreateInfo {
             flags: Default::default(),
@@ -376,7 +381,6 @@ impl BackgroundPass {
             Some("background uniforms"),
         );
 
-
         // what's left:
         let render_pass = self.render_pass;
         let pipeline_layout = self.pipeline_layout;
@@ -405,6 +409,7 @@ impl BackgroundPass {
                 vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
                 vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
                 vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
             );
 
             pass.set_commands(move |context, cb| {
@@ -414,7 +419,6 @@ impl BackgroundPass {
                             uniforms: ubo.into(),
                         })
                     };
-
 
                     let output_view = unsafe {
                         context.create_image_view(&vk::ImageViewCreateInfo {
@@ -612,6 +616,7 @@ fn load_image(
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
         pass.register_buffer_access_2(
             staging_buffer.id,
@@ -659,10 +664,17 @@ fn create_transient_image(context: &mut graal::Context, name: &str, is_depth: bo
         &graal::ResourceMemoryInfo::DEVICE_LOCAL,
         &graal::ImageResourceCreateInfo {
             image_type: graal::vk::ImageType::TYPE_2D,
-            usage: if is_depth { graal::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT } else { graal::vk::ImageUsageFlags::COLOR_ATTACHMENT }
-                | graal::vk::ImageUsageFlags::SAMPLED
+            usage: if is_depth {
+                graal::vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+            } else {
+                graal::vk::ImageUsageFlags::COLOR_ATTACHMENT
+            } | graal::vk::ImageUsageFlags::SAMPLED
                 | graal::vk::ImageUsageFlags::TRANSFER_DST,
-            format: if is_depth { graal::vk::Format::D32_SFLOAT } else { graal::vk::Format::R8G8B8A8_SRGB },
+            format: if is_depth {
+                graal::vk::Format::D32_SFLOAT
+            } else {
+                graal::vk::Format::R8G8B8A8_SRGB
+            },
             extent: graal::vk::Extent3D {
                 width: 1280,
                 height: 720,
@@ -781,7 +793,7 @@ fn test_pass(
 ) {
     batch.add_graphics_pass(name, |pass| {
         for &(img, access_mask, input_stage, output_stage, layout) in images {
-            pass.register_image_access_2(img, access_mask, input_stage, layout);
+            pass.register_image_access_2(img, access_mask, input_stage, layout, layout);
         }
     });
 }
@@ -797,7 +809,8 @@ fn depth_attachment(
 ) {
     (
         img,
-        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
+            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -888,12 +901,12 @@ fn main() {
 
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
     let device = graal::Device::new(Some(surface));
-    let mut context = graal::Context::new(device);
+    let mut context = graal::Context::with_device(device);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
 
-    let mut init_frame = context.start_frame(&FrameCreateInfo {
-        happens_after: None,
-        collect_debug_info: true
+    let mut init_frame = context.start_frame(FrameCreateInfo {
+        collect_debug_info: true,
+        .. Default::default()
     });
     let (file_image_id, file_image_width, file_image_height) = load_image(
         &init_frame,
@@ -919,7 +932,7 @@ fn main() {
                 }
                 WindowEvent::Resized(size) => unsafe {
                     swapchain_size = size.into();
-                    context.resize_swapchain(swapchain, swapchain_size);
+                    context.resize_swapchain(swapchain.id, swapchain_size);
                 },
                 _ => {}
             },
@@ -948,10 +961,10 @@ fn main() {
                 // non-transient resources are deleted once refcount is zero
                 // transient resources are deleted once the batch is finished, regardless of refcounts
 
-                let swapchain_image = unsafe { context.acquire_next_image(swapchain) };
-                let mut frame = context.start_frame(&FrameCreateInfo {
-                    happens_after: None,
-                    collect_debug_info: true
+                let swapchain_image = unsafe { context.acquire_next_image(swapchain.id) };
+                let mut frame = context.start_frame(FrameCreateInfo {
+                    collect_debug_info: false,
+                    .. Default::default()
                 });
 
                 bkgpp.run(
@@ -973,7 +986,11 @@ fn main() {
                         compute_write(img_d2),
                     ],
                 );
-                test_pass(&frame, "P3", &[color_attachment_output(img_c), depth_attachment(img_depth)]);
+                test_pass(
+                    &frame,
+                    "P3",
+                    &[color_attachment_output(img_c), depth_attachment(img_depth)],
+                );
                 test_pass(
                     &frame,
                     "P4",
@@ -1019,11 +1036,13 @@ fn main() {
                         vk::AccessFlags::TRANSFER_READ,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     );
                     pass.register_image_access_2(
                         swapchain_image.image_info.id,
                         vk::AccessFlags::TRANSFER_WRITE,
                         vk::PipelineStageFlags::TRANSFER,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     );
 
@@ -1080,7 +1099,7 @@ fn main() {
                 });
 
                 frame.present("P12", &swapchain_image);
-                frame.dump(Some("frame"));
+                //frame.dump(Some("frame"));
                 frame.finish();
             }
             _ => (),

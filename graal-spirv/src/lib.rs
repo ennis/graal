@@ -94,13 +94,13 @@ fn inst_iter<'a>(module: &'a [u32]) -> impl Iterator<Item = (usize, Instruction)
     raw_inst_iter(module).map(|(iptr, inst)| (iptr, inst.decode()))
 }
 
-fn decode_raw_inst_at(module: &[u32], iptr: usize) -> Result<RawInstruction, ParseError> {
+/*fn decode_raw_inst_at(module: &[u32], iptr: usize) -> Result<RawInstruction, ParseError> {
     decode_raw_instruction(&module[iptr..]).map(|(inst, _)| inst)
 }
 
 fn next_inst<'a>(module: &'a [u32], ptr: usize) -> Result<usize, ParseError> {
     Ok(ptr + decode_raw_inst_at(module, ptr)?.word_count as usize)
-}
+}*/
 
 /// Returns an iterator of all decorations on id.
 fn decorations_iter<'a>(
@@ -289,7 +289,7 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                     match d.decoration {
                         spv::Decoration::Block => struct_type.block = true,
                         spv::Decoration::BufferBlock => struct_type.buffer_block = true,
-                        other => {
+                        _other => {
                             // TODO
                         }
                     }
@@ -321,7 +321,7 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
 
 fn parse_object_or_member_decoration(
     decoration: spv::Decoration,
-    params: &[u32],
+    _params: &[u32],
     out_info: &mut ObjectOrMemberInfo,
 ) {
     match decoration {

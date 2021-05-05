@@ -1,9 +1,4 @@
-use crate::MAX_QUEUES;
-use crate::context::{SubmissionNumber, QueueSerialNumbers};
-use ash::vk;
-use std::mem;
-
-#[derive(Copy, Clone, Debug)]
+/*#[derive(Copy, Clone, Debug)]
 #[repr(usize)]
 enum PipelineStageIndex {
     TopOfPipe,
@@ -127,9 +122,8 @@ static LOGICALLY_LATER: &[&[PipelineStageIndex]] = {
         /*TR*/  &[],
         /*CR*/  &[],
     ]
-};
+};*/
 
-/// Expands VkPipelineStageFlags to explicitly include logically earlier stages
 /*fn expand_logically_later_stages(stage: vk::PipelineStageFlags) {
 
     const DI : u32 = vk::PipelineStageFlags::DRAW_INDIRECT.as_raw();
@@ -236,11 +230,10 @@ static LOGICALLY_LATER: &[&[PipelineStageIndex]] = {
     }
 }*/
 
-
-static GRAPHICS_STAGES: &[PipelineStageIndex] = {
+/*static GRAPHICS_STAGES: &[PipelineStageIndex] = {
     use PipelineStageIndex::*;
     &[DI, VI, VS, TCS, TES, GS, TF, FSR, FDP, EFT, FS, LFT, CAO]
-};
+};*/
 
 // COMPUTE -> VERTEX:
 // -> m[VERTEX] |= COMPUTE | m[COMPUTE]
@@ -309,7 +302,6 @@ static GRAPHICS_STAGES: &[PipelineStageIndex] = {
 //   -> we lose all information on the previous sync
 //   now we want to sync VS on SN20+TR: we currently have SN45+CAO, but no information about TR, so must add a barrier, which is unnecessary
 
-
 /*/// Represents the state (last synchronized write) of each stage of the pipeline at a given point in
 /// the frame.
 #[derive(Copy,Clone,Debug)]
@@ -347,7 +339,6 @@ pub(crate) struct SyncTable {
     //
     //
 }*/
-
 
 /*fn for_each_flag(mask: vk::PipelineStageFlags, mut f: impl FnMut(PipelineStageIndex) -> bool) {
     if mask == vk::PipelineStageFlags::ALL_GRAPHICS {

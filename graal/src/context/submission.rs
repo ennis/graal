@@ -1,20 +1,20 @@
 use crate::{
     context::{
-        pass::{Pass, PassKind},
+        pass::{Pass, PassCommands},
         QueueSerialNumbers, SubmissionNumber,
     },
-    vk, Context, DescriptorSetInterface, Device, MAX_QUEUES,
+    vk, Context, DescriptorSetInterface, MAX_QUEUES,
 };
 
-use crate::context::descriptor::DescriptorSet;
+use crate::context::{descriptor::DescriptorSet, SEMAPHORE_WAIT_TIMEOUT_NS};
 use ash::version::{DeviceV1_0, DeviceV1_2};
 use std::{
     ffi::{c_void, CString},
     ops::{Deref, DerefMut},
     ptr,
 };
-use crate::context::SEMAPHORE_WAIT_TIMEOUT_NS;
 
+use tracing::trace_span;
 
 /// Resources created at submission time.
 struct SubmissionTimeResources {
@@ -104,30 +104,29 @@ impl<'a> CommandContext<'a> {
         render_pass: vk::RenderPass,
         attachments: &[vk::ImageView],
     ) -> vk::Framebuffer {
-        unsafe {
-            let framebuffer_create_info = vk::FramebufferCreateInfo {
-                flags: Default::default(),
-                render_pass,
-                attachment_count: attachments.len() as u32,
-                p_attachments: attachments.as_ptr(),
-                width,
-                height,
-                layers,
-                ..Default::default()
-            };
+        let framebuffer_create_info = vk::FramebufferCreateInfo {
+            flags: Default::default(),
+            render_pass,
+            attachment_count: attachments.len() as u32,
+            p_attachments: attachments.as_ptr(),
+            width,
+            height,
+            layers,
+            ..Default::default()
+        };
 
-            let handle = self
-                .context
-                .device
-                .device
-                .create_framebuffer(&framebuffer_create_info, None)
-                .unwrap();
-            self.resources.framebuffers.push(handle);
-            handle
-        }
+        let handle = self
+            .context
+            .device
+            .device
+            .create_framebuffer(&framebuffer_create_info, None)
+            .unwrap();
+        self.resources.framebuffers.push(handle);
+        handle
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct CommandAllocator {
     queue_family: u32,
     command_pool: vk::CommandPool,
@@ -190,7 +189,9 @@ impl CommandBatch {
     /// Even if there are no command buffers, a batch may still submitted if the batch defines
     /// a wait and a signal operation, as a way of sequencing a timeline semaphore wait and a binary semaphore signal, for instance.
     fn is_empty(&self) -> bool {
-        !self.signal_snn.is_valid() && self.command_buffers.is_empty()
+        self.command_buffers.is_empty()
+            && !self.signal_snn.is_valid()
+            && self.signal_binary_semaphores.is_empty()
     }
 
     fn reset(&mut self) {
@@ -214,7 +215,8 @@ impl Default for CommandBatch {
 pub(crate) struct FrameSubmissionResult {
     /// The command pools used in the batch
     pub(crate) command_pools: Vec<CommandAllocator>,
-    /// The last signalled serial numbers for each queue
+    /// The last signalled serial numbers for each queue. They correspond to the last submitted passes
+    /// in each queue.
     pub(crate) signalled_serials: QueueSerialNumbers,
     /// All semaphores used in this batch. When the batch is complete, those
     /// semaphores are guaranteed to be in the unsignalled state.
@@ -229,6 +231,8 @@ pub(crate) struct FrameSubmissionResult {
 
 impl Context {
     pub(crate) fn wait(&mut self, serials: &QueueSerialNumbers) {
+        let _span = trace_span!("wait", ?serials);
+
         let wait_info = vk::SemaphoreWaitInfo {
             semaphore_count: self.timelines.len() as u32,
             p_semaphores: self.timelines.as_ptr(),
@@ -246,9 +250,13 @@ impl Context {
     fn submit_command_batch(
         &mut self,
         q: usize,
-        sb: &CommandBatch,
+        batch: &CommandBatch,
         used_semaphores: &mut Vec<vk::Semaphore>,
     ) {
+        if batch.is_empty() {
+            return;
+        }
+
         let mut signal_semaphores = Vec::new();
         let mut signal_semaphore_values = Vec::new();
         let mut wait_semaphores = Vec::new();
@@ -256,32 +264,34 @@ impl Context {
         let mut wait_semaphore_dst_stages = Vec::new();
 
         // end command buffers
-        for &cb in sb.command_buffers.iter() {
+        for &cb in batch.command_buffers.iter() {
             unsafe { self.device.device.end_command_buffer(cb).unwrap() }
         }
 
-        // setup timeline signal
-        signal_semaphores.push(self.timelines[q as usize]);
-        signal_semaphore_values.push(sb.signal_snn.serial());
-        self.last_signalled_serials[q] = sb.signal_snn.serial();
+        // setup timeline signal if necessary
+        if batch.signal_snn.serial() > 0 {
+            signal_semaphores.push(self.timelines[q as usize]);
+            signal_semaphore_values.push(batch.signal_snn.serial());
+            self.last_signalled_serials[q] = batch.signal_snn.serial();
+        }
 
         // binary semaphore signals
-        for &s in sb.signal_binary_semaphores.iter() {
+        for &s in batch.signal_binary_semaphores.iter() {
             signal_semaphores.push(s);
             signal_semaphore_values.push(0);
         }
 
         // setup timeline waits
-        for (i, &w) in sb.wait_serials.iter().enumerate() {
+        for (i, &w) in batch.wait_serials.iter().enumerate() {
             if w != 0 {
                 wait_semaphores.push(self.timelines[i]);
                 wait_semaphore_values.push(w);
-                wait_semaphore_dst_stages.push(sb.wait_dst_stages[i]);
+                wait_semaphore_dst_stages.push(batch.wait_dst_stages[i]);
             }
         }
 
         // setup binary semaphore waits
-        for &s in sb.wait_binary_semaphores.iter() {
+        for &s in batch.wait_binary_semaphores.iter() {
             wait_semaphores.push(s);
             wait_semaphore_values.push(0);
             // TODO
@@ -308,8 +318,8 @@ impl Context {
             wait_semaphore_count: wait_semaphores.len() as u32,
             p_wait_semaphores: wait_semaphores.as_ptr(),
             p_wait_dst_stage_mask: wait_semaphore_dst_stages.as_ptr(),
-            command_buffer_count: sb.command_buffers.len() as u32,
-            p_command_buffers: sb.command_buffers.as_ptr(),
+            command_buffer_count: batch.command_buffers.len() as u32,
+            p_command_buffers: batch.command_buffers.as_ptr(),
             signal_semaphore_count: signal_semaphores.len() as u32,
             p_signal_semaphores: signal_semaphores.as_ptr(),
             ..Default::default()
@@ -356,7 +366,13 @@ impl Context {
     }
 
     ///
-    pub(crate) fn submit_frame(&mut self, passes: &mut [Pass]) -> FrameSubmissionResult {
+    pub(crate) fn submit_frame(
+        &mut self,
+        passes: &mut [Pass],
+        wait_init: QueueSerialNumbers,
+    ) -> FrameSubmissionResult {
+        let _ = trace_span!("submit_frame").entered();
+
         // current submission batches per queue
         let mut cmd_batches: [CommandBatch; MAX_QUEUES] = Default::default();
         // one command pool per queue (might not be necessary if the queues belong to the same family,
@@ -366,28 +382,42 @@ impl Context {
         let mut used_semaphores = Vec::new();
         let mut submission_time_resources = SubmissionTimeResources::new();
 
+        let mut first_pass_of_queue = [true; MAX_QUEUES];
+
         for p in passes.iter_mut() {
+            // queue index
             let q = p.snn.queue();
-            if p.wait_before {
+
+            let wait_serials = if first_pass_of_queue[q] && wait_init > self.completed_serials {
+                p.wait_serials.join(wait_init)
+            } else {
+                p.wait_serials
+            };
+
+            first_pass_of_queue[q] = false;
+
+            // we need to wait if we have a binary semaphore, or if it's the first pass in this queue
+            // and the user specified an initial wait before starting the frame.
+            let needs_semaphore_wait =
+                wait_serials > self.completed_serials || !p.wait_binary_semaphores.is_empty();
+
+            if needs_semaphore_wait {
                 // the pass needs a semaphore wait, so it needs a separate batch
                 // close the batches on all queues that the pass waits on
                 for i in 0..MAX_QUEUES {
                     if !cmd_batches[i].is_empty() && (i == q || p.wait_serials[i] != 0) {
-                        self.submit_command_batch(
-                            i,
-                            &cmd_batches[i],
-                            &mut used_semaphores,
-                        );
+                        self.submit_command_batch(i, &cmd_batches[i], &mut used_semaphores);
                         cmd_batches[i].reset();
                     }
                 }
             }
 
-            let sb: &mut CommandBatch = &mut cmd_batches[q as usize];
-            if p.wait_before {
-                sb.wait_serials = p.wait_serials;
-                sb.wait_dst_stages = p.wait_dst_stages;
-                sb.wait_binary_semaphores = p.wait_binary_semaphores.clone();
+            let batch: &mut CommandBatch = &mut cmd_batches[q as usize];
+
+            if needs_semaphore_wait {
+                batch.wait_serials = wait_serials;
+                batch.wait_dst_stages = p.wait_dst_stages; // TODO are those OK?
+                batch.wait_binary_semaphores = p.wait_binary_semaphores.clone();
             }
 
             // ensure that a command pool has been allocated for the queue
@@ -395,7 +425,7 @@ impl Context {
                 .get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
             // append to the last command buffer of the batch, otherwise create another one
 
-            if sb.command_buffers.is_empty() {
+            if batch.command_buffers.is_empty() {
                 let cb = command_pool.allocate_command_buffer(&self.device.device);
                 let begin_info = vk::CommandBufferBeginInfo {
                     ..Default::default()
@@ -407,10 +437,10 @@ impl Context {
                         .begin_command_buffer(cb, &begin_info)
                         .unwrap();
                 }
-                sb.command_buffers.push(cb);
+                batch.command_buffers.push(cb);
             };
 
-            let cb = sb.command_buffers.last().unwrap().clone();
+            let cb = batch.command_buffers.last().unwrap().clone();
 
             // cb is a command buffer in the recording state
             let marker_name = CString::new(p.name.as_str()).unwrap();
@@ -426,21 +456,20 @@ impl Context {
             }
 
             // emit barriers if needed
-            let barrier = &p.pre_execution_barrier;
-            if barrier.src_stage_mask != vk::PipelineStageFlags::TOP_OF_PIPE
-                || barrier.dst_stage_mask != vk::PipelineStageFlags::BOTTOM_OF_PIPE
-                || !barrier.buffer_memory_barriers.is_empty()
-                || !barrier.image_memory_barriers.is_empty()
+            if p.src_stage_mask != vk::PipelineStageFlags::TOP_OF_PIPE
+                || p.dst_stage_mask != vk::PipelineStageFlags::BOTTOM_OF_PIPE
+                || !p.buffer_memory_barriers.is_empty()
+                || !p.image_memory_barriers.is_empty()
             {
-                let src_stage_mask = if barrier.src_stage_mask.is_empty() {
+                let src_stage_mask = if p.src_stage_mask.is_empty() {
                     vk::PipelineStageFlags::TOP_OF_PIPE
                 } else {
-                    barrier.src_stage_mask
+                    p.src_stage_mask
                 };
-                let dst_stage_mask = if barrier.dst_stage_mask.is_empty() {
+                let dst_stage_mask = if p.dst_stage_mask.is_empty() {
                     vk::PipelineStageFlags::BOTTOM_OF_PIPE
                 } else {
-                    barrier.dst_stage_mask
+                    p.dst_stage_mask
                 };
                 unsafe {
                     // TODO safety
@@ -450,19 +479,43 @@ impl Context {
                         dst_stage_mask,
                         Default::default(),
                         &[],
-                        &barrier.buffer_memory_barriers,
-                        &barrier.image_memory_barriers,
+                        &p.buffer_memory_barriers,
+                        &p.image_memory_barriers,
                     )
                 }
             }
 
-            match p.kind {
-                PassKind::Present {
+            match p.commands.take() {
+                Some(PassCommands::CommandBuffer(handler)) => {
+                    // perform a command-buffer level operation
+                    let mut cctx = CommandContext {
+                        context: self,
+                        resources: &mut submission_time_resources,
+                    };
+                    handler(&mut cctx, cb);
+
+                    // update signalled serial for the batch (pass serials are guaranteed to be increasing)
+                    batch.signal_snn = p.snn;
+                }
+                Some(PassCommands::Queue(handler)) => {
+                    // perform a queue-level operation:
+                    // this terminates the current batch
+                    self.submit_command_batch(q, batch, &mut used_semaphores);
+                    batch.reset();
+                    // call the handler
+                    let queue = self.device.queues_info.queues[q as usize];
+                    let mut cctx = CommandContext {
+                        context: self,
+                        resources: &mut submission_time_resources,
+                    };
+                    handler(&mut cctx, queue);
+                }
+                Some(PassCommands::Present {
                     swapchain,
                     image_index,
-                } => {
+                }) => {
                     // present operation:
-                    // modify the current batch to signal a semaphore and close it
+                    // modify the current batch to signal a binary semaphore and close it
                     let render_finished_semaphore = self.create_semaphore();
                     // FIXME if the swapchain image is last modified by another queue,
                     // then this batch contains no commands, only one timeline wait
@@ -472,9 +525,11 @@ impl Context {
                     // and maintainability.
                     // Eventually, the presentation engine might support timeline semaphores
                     // directly, which will make this entire problem vanish.
-                    sb.signal_binary_semaphores.push(render_finished_semaphore);
-                    self.submit_command_batch(q, sb, &mut used_semaphores);
-                    sb.reset();
+                    batch
+                        .signal_binary_semaphores
+                        .push(render_finished_semaphore);
+                    self.submit_command_batch(q, batch, &mut used_semaphores);
+                    batch.reset();
                     // build present info that waits on the batch that was just submitted
                     let present_info = vk::PresentInfoKHR {
                         wait_semaphore_count: 1,
@@ -496,36 +551,25 @@ impl Context {
                     // we signalled and waited on the semaphore, it can be reused
                     used_semaphores.push(render_finished_semaphore);
                 }
-                _ => {
-                    if let Some(handler) = p.commands.take() {
-                        let mut cctx = CommandContext {
-                            context: self,
-                            resources: &mut submission_time_resources,
-                        };
-                        handler(&mut cctx, cb);
-                    }
-
-                    // update signalled serial for the batch (pass serials are guaranteed to be increasing)
-                    sb.signal_snn = p.snn;
-                }
+                None => {}
             }
 
             unsafe {
+                // FIXME this can end up in a different command buffer
                 self.device.vk_ext_debug_utils.cmd_end_debug_utils_label(cb);
             }
 
             if p.signal_after {
                 // the pass needs a semaphore signal: this terminates the batch on the queue
-                self.submit_command_batch(q, sb, &mut used_semaphores);
-                sb.reset();
+                // FIXME what does this do if the pass is a queue-level operation?
+                self.submit_command_batch(q, batch, &mut used_semaphores);
+                batch.reset();
             }
         }
 
         // close unfinished batches
-        for sb in cmd_batches.iter() {
-            if !sb.is_empty() {
-                self.submit_command_batch(sb.signal_snn.queue(), sb, &mut used_semaphores)
-            }
+        for batch in cmd_batches.iter() {
+            self.submit_command_batch(batch.signal_snn.queue(), batch, &mut used_semaphores)
         }
 
         let command_pools = cmd_pools
