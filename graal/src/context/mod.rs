@@ -31,7 +31,6 @@ pub(crate) mod pass;
 pub(crate) mod resource;
 pub(crate) mod submission;
 mod sync_table;
-pub(crate) mod external_memory_handle;
 
 use crate::context::resource::{BufferId, ImageId};
 pub use descriptor::DescriptorSetAllocatorId;
@@ -175,7 +174,7 @@ impl PartialOrd for QueueSerialNumbers {
     }
 }
 
-fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
+pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     match count {
         1 => vk::SampleCountFlags::TYPE_1,
         2 => vk::SampleCountFlags::TYPE_2,
@@ -454,7 +453,7 @@ impl GpuFuture {
 
 /// Represents the
 pub struct Context {
-    device: Device,
+    pub(crate) device: Device,
 
     // --- Submission --------------------------------
     /// Timeline semaphores for each queue, used for cross-queue synchronization
@@ -768,7 +767,7 @@ impl Context {
                 wait_binary_semaphore: image_available,
                 ..Default::default()
             },
-            memory: ResourceMemory::External,
+            memory: ResourceMemory::Swapchain,
             // swapchain images are owned by the swapchain so we shouldn't delete them
             should_delete: false,
             kind: ResourceKind::Image(ImageResource {

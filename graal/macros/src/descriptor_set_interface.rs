@@ -220,7 +220,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                             stage_flags       : #stages,
                             descriptor_type   : #descriptor_type_tokens,
                             descriptor_count  : #max_count,
-                            immutable_samplers: [#G::vk::Sampler::null(); 16]
+                            //immutable_samplers: [#G::vk::Sampler::null(); 16]
                         }
                     });
                     let p_image_info = match descriptor_type {
@@ -262,7 +262,7 @@ pub fn generate(derive_input: &syn::DeriveInput, fields: &FieldList) -> TokenStr
                             stage_flags       : #stages,
                             descriptor_type   : #descriptor_type_tokens,
                             descriptor_count  : <#ty as #G::DescriptorSource>::ARRAY_SIZE,
-                            immutable_samplers: [#G::vk::Sampler::null(); 16]
+                            //immutable_samplers: [#G::vk::Sampler::null(); 16]
                         }
                     });
                     let offset_ident = &field_offsets_sizes.offsets[i_field].ident;

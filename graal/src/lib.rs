@@ -13,7 +13,6 @@ pub use crate::{
     context::{
         format_aspect_mask,
         frame::FrameCreateInfo,
-        external_memory_handle::ExternalMemoryHandle,
         resource::{
             get_mip_level_count, BufferId, BufferInfo, BufferResourceCreateInfo, ImageId,
             ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, TypedBufferInfo,

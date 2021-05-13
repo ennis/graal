@@ -19,6 +19,38 @@ pub(crate) enum PassCommands<'a> {
     CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>),
 }
 
+#[derive(Copy,Clone,Debug,Eq,PartialEq)]
+pub enum SemaphoreWaitKind {
+    Binary,
+    Timeline(u64)
+}
+
+#[derive(Copy,Clone,Debug,Eq,PartialEq)]
+pub enum SemaphoreSignalKind {
+    Binary,
+    Timeline(u64)
+}
+
+/// Represents a semaphore wait operation outside of the queue timelines.
+#[derive(Clone,Debug)]
+pub(crate) struct SemaphoreWait {
+    /// The semaphore in question
+    pub(crate) semaphore: vk::Semaphore,
+    /// Whether the semaphore is internally managed (owned by the context).
+    /// If true, the semaphore will be reclaimed by the context after it is consumed (waited on).
+    pub(crate) owned: bool,
+    /// Destination stage
+    pub(crate) dst_stage: vk::PipelineStageFlags,
+    /// The kind of wait operation.
+    pub(crate) wait_kind: SemaphoreWaitKind
+}
+
+#[derive(Clone,Debug)]
+pub(crate) struct SemaphoreSignal {
+    pub(crate) semaphore: vk::Semaphore,
+    pub(crate) signal_kind: SemaphoreSignalKind
+}
+
 pub(crate) struct Pass<'a> {
     pub(crate) name: String,
 
@@ -39,8 +71,8 @@ pub(crate) struct Pass<'a> {
     // It probably could be removed.
     pub(crate) accesses: Vec<ResourceAccess>,
 
-    /// Whether a signal operation must be performed on the queue after the pass.
-    pub(crate) signal_after: bool,
+    /// Whether the queue timeline semaphores must be signalled after the pass.
+    pub(crate) signal_queue_timelines: bool,
 
     pub(crate) src_stage_mask: vk::PipelineStageFlags,
     pub(crate) dst_stage_mask: vk::PipelineStageFlags,
@@ -49,7 +81,10 @@ pub(crate) struct Pass<'a> {
 
     pub(crate) wait_serials: QueueSerialNumbers,
     pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
-    pub(crate) wait_binary_semaphores: Vec<vk::Semaphore>,
+
+    pub(crate) external_semaphore_waits: Vec<SemaphoreWait>,
+    pub(crate) external_semaphore_signals: Vec<SemaphoreSignal>,
+
     pub(crate) commands: Option<PassCommands<'a>>,
 }
 
@@ -120,14 +155,15 @@ impl<'a> Pass<'a> {
             preds: vec![],
             //succs: vec![],
             accesses: vec![],
-            signal_after: false,
+            signal_queue_timelines: false,
             src_stage_mask: Default::default(),
             dst_stage_mask: Default::default(),
             image_memory_barriers: vec![],
             buffer_memory_barriers: vec![],
             wait_serials: Default::default(),
             wait_dst_stages: Default::default(),
-            wait_binary_semaphores: Vec::new(),
+            external_semaphore_waits: vec![],
+            external_semaphore_signals: vec![],
             frame_index,
             commands: None,
         }

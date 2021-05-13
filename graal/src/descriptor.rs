@@ -12,7 +12,7 @@ pub struct DescriptorSetLayoutBindingInfo {
     pub descriptor_type: vk::DescriptorType,
     pub descriptor_count: u32,
     pub stage_flags: vk::ShaderStageFlags,
-    pub immutable_samplers: [vk::Sampler; 16],
+    //pub immutable_samplers: Option<[vk::Sampler; 16]>,  // only there so that
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]

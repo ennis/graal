@@ -4,7 +4,7 @@ use graal::{ash::version::DeviceV1_0, vk};
 pub fn create_shader_module(context: &mut graal::Context, code: &[u32]) -> vk::ShaderModule {
     unsafe {
         context
-            .device()
+            .vulkan_device()
             .create_shader_module(
                 &vk::ShaderModuleCreateInfo {
                     flags: Default::default(),

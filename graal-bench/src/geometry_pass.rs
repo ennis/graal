@@ -180,7 +180,7 @@ impl GeometryPass {
 
         let pipeline_layout = unsafe {
             context
-                .device()
+                .vulkan_device()
                 .create_pipeline_layout(&pipeline_layout_create_info, None)
                 .unwrap()
         };
@@ -296,7 +296,7 @@ impl GeometryPass {
 
         let pipeline = unsafe {
             context
-                .device()
+                .vulkan_device()
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[gpci], None)
                 .unwrap()[0]
         };
@@ -457,13 +457,13 @@ impl GeometryPass {
                     ..Default::default()
                 };
 
-                context.device().cmd_begin_render_pass(
+                context.vulkan_device().cmd_begin_render_pass(
                     cb,
                     &render_pass_begin_info,
                     vk::SubpassContents::INLINE,
                 );
 
-                context.device().cmd_set_viewport(
+                context.vulkan_device().cmd_set_viewport(
                     cb,
                     0,
                     &[vk::Viewport {
@@ -475,7 +475,7 @@ impl GeometryPass {
                         max_depth: 1.0,
                     }],
                 );
-                context.device().cmd_set_scissor(
+                context.vulkan_device().cmd_set_scissor(
                     cb,
                     0,
                     &[vk::Rect2D {
@@ -488,7 +488,7 @@ impl GeometryPass {
                 );
 
                 context
-                    .device()
+                    .vulkan_device()
                     .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
 
                 let globals_set = context.create_descriptor_set(&GlobalsInterface {
@@ -511,7 +511,7 @@ impl GeometryPass {
                         per_object: per_object_uniforms.into(),
                     });
 
-                    context.device().cmd_bind_descriptor_sets(
+                    context.vulkan_device().cmd_bind_descriptor_sets(
                         cb,
                         vk::PipelineBindPoint::GRAPHICS,
                         pipeline_layout,
@@ -520,7 +520,7 @@ impl GeometryPass {
                         &[],
                     );
 
-                    context.device().cmd_bind_vertex_buffers(
+                    context.vulkan_device().cmd_bind_vertex_buffers(
                         cb,
                         0,
                         &[mesh.vertex_buffer.handle],
@@ -528,11 +528,11 @@ impl GeometryPass {
                     );
 
                     context
-                        .device()
+                        .vulkan_device()
                         .cmd_draw(cb, mesh.vertex_count as u32, 1, 0, 0);
                 }
 
-                context.device().cmd_end_render_pass(cb);
+                context.vulkan_device().cmd_end_render_pass(cb);
             });
         });
 

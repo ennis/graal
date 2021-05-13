@@ -4,7 +4,7 @@ use crate::{
     mesh::{MeshData, Vertex3D},
 };
 use glam::{vec2, vec3, Mat4, Vec3, Vec3A, Vec4};
-use graal::{ash::version::DeviceV1_0, vk, BufferId, FrameCreateInfo, GpuFuture, TypedBufferInfo};
+use graal::{ash::version::DeviceV1_0, vk, GpuFuture, TypedBufferInfo};
 use slotmap::{new_key_type, SlotMap};
 use std::{mem, path::Path, ptr};
 
@@ -343,7 +343,7 @@ impl<'a> SceneUploader<'a> {
 
                 pass.set_commands(move |context, command_buffer| unsafe {
                     for item in upload_items {
-                        context.device().cmd_copy_buffer(
+                        context.vulkan_device().cmd_copy_buffer(
                             command_buffer,
                             item.staging_buffer.handle,
                             item.device_buffer.handle,

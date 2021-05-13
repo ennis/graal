@@ -1,7 +1,10 @@
 use crate::{
     context::{
         is_write_access,
-        pass::{Pass, PassCommands, ResourceAccess},
+        pass::{
+            Pass, PassCommands, ResourceAccess, SemaphoreSignal, SemaphoreSignalKind,
+            SemaphoreWait, SemaphoreWaitKind,
+        },
         resource::{
             BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
             ResourceMemory, ResourceTrackingInfo, TypedBufferInfo,
@@ -385,6 +388,34 @@ pub struct PassBuilder<'a, 'frame> {
 }
 
 impl<'a, 'frame> PassBuilder<'a, 'frame> {
+    /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
+    /// before starting.
+    pub fn add_external_semaphore_wait(
+        &mut self,
+        semaphore: vk::Semaphore,
+        dst_stage: vk::PipelineStageFlags,
+        wait_kind: SemaphoreWaitKind,
+    ) {
+        self.pass.external_semaphore_waits.push(SemaphoreWait {
+            semaphore,
+            owned: false,
+            dst_stage,
+            wait_kind,
+        })
+    }
+
+    /// Adds a semaphore signal operation: when finished, the pass will signal the specified semaphore.
+    pub fn add_external_semaphore_signal(
+        &mut self,
+        semaphore: vk::Semaphore,
+        signal_kind: SemaphoreSignalKind,
+    ) {
+        self.pass.external_semaphore_signals.push(SemaphoreSignal {
+            semaphore,
+            signal_kind,
+        })
+    }
+
     pub fn register_image_access(&mut self, id: ImageId, access_type: AccessType) {
         let AccessTypeInfo {
             access_mask,
@@ -545,11 +576,17 @@ impl<'a> FrameInner<'a> {
         // 2. Get or create the barrier
         //      The resulting barrier might be associated to the pass, or an existing one that comes before
 
-        // handle external semaphore dependency
+        // If the resource has an associated semaphore, consume it.
+        // For now, the only resources that have associated semaphores are swapchain images from the presentation engine.
         let semaphore = mem::take(&mut resource.tracking.wait_binary_semaphore);
         let has_external_semaphore = semaphore != vk::Semaphore::null();
         if has_external_semaphore {
-            dst_pass.wait_binary_semaphores.push(semaphore);
+            dst_pass.external_semaphore_waits.push(SemaphoreWait {
+                semaphore,
+                owned: true,
+                dst_stage: vk::PipelineStageFlags::TOP_OF_PIPE, // FIXME maybe?
+                wait_kind: SemaphoreWaitKind::Binary,
+            });
         }
 
         //------------------------
@@ -603,7 +640,7 @@ impl<'a> FrameInner<'a> {
             let base_serial = self.base_serial;
 
             // whether `sync_sources` identifies a single source pass in the queue that one we're
-            // submitting on, and that points
+            // submitting on
             let single_local_source_in_same_queue = sync_sources
                 .iter()
                 .enumerate()
@@ -643,7 +680,7 @@ impl<'a> FrameInner<'a> {
                         let src_pass = &mut self.passes[src_pass_index];
                         //src_pass.succs.push(dst_pass_index);
                         //dst_pass.preds.push(src_pass_index);
-                        src_pass.signal_after = true;
+                        src_pass.signal_queue_timelines = true;
                     }
                 }
             } else {
@@ -746,7 +783,7 @@ impl<'a> FrameInner<'a> {
         }
 
         // update output stage
-        // FIXME doubt
+        // FIXME I have doubts about this code
         if is_write {
             resource.tracking.stages = access.stage_mask;
             resource.tracking.clear_readers();
@@ -933,7 +970,7 @@ impl<'a> Frame<'a> {
     ) {
         let mut inner = self.inner.borrow_mut();
         // max 65K passes per frame, because of the implementation of automatic barriers
-        // TODO remove
+        // TODO remove this limitation
         let frame_index = inner.passes.len();
         assert!(frame_index <= u16::MAX as usize);
         let serial = inner.context.get_next_serial();
@@ -1185,7 +1222,7 @@ impl<'a> Frame<'a> {
                     "serials": p.wait_serials.0,
                     "waitDstStages": format!("{:?}", p.wait_dst_stages),
                 },
-                "waitExternal": !p.wait_binary_semaphores.is_empty(),
+                "waitExternal": !p.external_semaphore_waits.is_empty(),
             });
 
             // additional debug information

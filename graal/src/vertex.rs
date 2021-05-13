@@ -70,14 +70,14 @@ impl From<f64> for Norm<u16> {
 }
 
 // Vertex attribute types --------------------------------------------------------------------------
-/*macro_rules! impl_attrib_type {
+macro_rules! impl_attrib_type {
     ($t:ty, $equiv:expr, $fmt:ident) => {
         unsafe impl VertexAttributeType for $t {
             const EQUIVALENT_TYPE: TypeDesc<'static> = $equiv;
             const FORMAT: vk::Format = vk::Format::$fmt;
         }
     };
-}*/
+}
 
 macro_rules! impl_attrib_prim_type {
     ($t:ty, $prim:ident, $fmt:ident) => {
@@ -145,6 +145,11 @@ impl_attrib_prim_type!(u8, UnsignedInt, R8_UINT);
 impl_attrib_vector_type!([u8; 2], UnsignedInt, R8G8_UINT);
 impl_attrib_vector_type!([u8; 3], UnsignedInt, R8G8B8_UINT);
 impl_attrib_vector_type!([u8; 4], UnsignedInt, R8G8B8A8_UINT);
+
+impl_attrib_prim_type!(Norm<u8>, UnsignedInt, R8_UNORM);
+impl_attrib_vector_type!([Norm<u8>; 2], UnsignedInt, R8G8_UNORM);
+impl_attrib_vector_type!([Norm<u8>; 3], UnsignedInt, R8G8B8_UNORM);
+impl_attrib_vector_type!([Norm<u8>; 4], UnsignedInt, R8G8B8A8_UNORM);
 
 impl_attrib_prim_type!(i8, Int, R8_SINT);
 impl_attrib_vector_type!([i8; 2], Int, R8G8_SINT);

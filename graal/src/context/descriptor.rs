@@ -3,7 +3,7 @@ use crate::{
     DescriptorSetLayoutBindingInfo, DescriptorSetLayoutInfo,
 };
 use ash::version::{DeviceV1_0, DeviceV1_1};
-use std::mem;
+use std::{mem, ptr};
 
 const DESCRIPTOR_POOL_PER_TYPE_COUNT: u32 = 1024;
 const DESCRIPTOR_POOL_SET_COUNT: u32 = DESCRIPTOR_POOL_PER_TYPE_COUNT;
@@ -37,8 +37,7 @@ impl DescriptorSetAllocator {
             descriptor_set_layout_bindings[i].descriptor_type = layout[i].descriptor_type;
             descriptor_set_layout_bindings[i].descriptor_count = layout[i].descriptor_count;
             descriptor_set_layout_bindings[i].stage_flags = layout[i].stage_flags;
-            descriptor_set_layout_bindings[i].p_immutable_samplers =
-                layout[i].immutable_samplers.as_ptr();
+            descriptor_set_layout_bindings[i].p_immutable_samplers = ptr::null();
         }
 
         let descriptor_set_layout_create_info = vk::DescriptorSetLayoutCreateInfo {

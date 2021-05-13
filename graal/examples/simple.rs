@@ -137,7 +137,7 @@ impl BackgroundPass {
     fn new(context: &mut graal::Context) -> BackgroundPass {
         let vert = unsafe {
             context
-                .vk_device()
+                .vulkan_device()
                 .create_shader_module(
                     &vk::ShaderModuleCreateInfo {
                         flags: Default::default(),
@@ -152,7 +152,7 @@ impl BackgroundPass {
 
         let frag = unsafe {
             context
-                .vk_device()
+                .vulkan_device()
                 .create_shader_module(
                     &vk::ShaderModuleCreateInfo {
                         flags: Default::default(),
@@ -200,7 +200,7 @@ impl BackgroundPass {
 
         let pipeline_layout = unsafe {
             context
-                .device()
+                .vulkan_device()
                 .create_pipeline_layout(&pipeline_layout_create_info, None)
                 .unwrap()
         };
@@ -335,7 +335,7 @@ impl BackgroundPass {
 
         let pipeline = unsafe {
             context
-                .device()
+                .vulkan_device()
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[gpci], None)
                 .unwrap()[0]
         };
@@ -462,15 +462,15 @@ impl BackgroundPass {
                         p_clear_values: ptr::null(),
                         ..Default::default()
                     };
-                    context.device().cmd_begin_render_pass(
+                    context.vulkan_device().cmd_begin_render_pass(
                         cb,
                         &render_pass_begin_info,
                         vk::SubpassContents::INLINE,
                     );
                     context
-                        .device()
+                        .vulkan_device()
                         .cmd_bind_vertex_buffers(cb, 0, &[vbo.handle], &[0]);
-                    context.device().cmd_bind_descriptor_sets(
+                    context.vulkan_device().cmd_bind_descriptor_sets(
                         cb,
                         vk::PipelineBindPoint::GRAPHICS,
                         pipeline_layout,
@@ -478,7 +478,7 @@ impl BackgroundPass {
                         &[descriptor_set],
                         &[],
                     );
-                    context.device().cmd_set_viewport(
+                    context.vulkan_device().cmd_set_viewport(
                         cb,
                         0,
                         &[vk::Viewport {
@@ -490,7 +490,7 @@ impl BackgroundPass {
                             max_depth: 1.0,
                         }],
                     );
-                    context.device().cmd_set_scissor(
+                    context.vulkan_device().cmd_set_scissor(
                         cb,
                         0,
                         &[vk::Rect2D {
@@ -501,13 +501,13 @@ impl BackgroundPass {
                             },
                         }],
                     );
-                    context.device().cmd_bind_pipeline(
+                    context.vulkan_device().cmd_bind_pipeline(
                         cb,
                         vk::PipelineBindPoint::GRAPHICS,
                         pipeline,
                     );
-                    context.device().cmd_draw(cb, 6, 1, 0, 0);
-                    context.device().cmd_end_render_pass(cb);
+                    context.vulkan_device().cmd_draw(cb, 6, 1, 0, 0);
+                    context.vulkan_device().cmd_end_render_pass(cb);
                 }
             });
         });
@@ -625,7 +625,7 @@ fn load_image(
         );
 
         pass.set_commands(move |context, command_buffer| unsafe {
-            let device = context.device();
+            let device = context.vulkan_device();
 
             let regions = &[vk::BufferImageCopy {
                 buffer_offset: 0,
@@ -761,7 +761,7 @@ fn load_mesh(batch: &graal::Frame, obj_file_path: &Path) -> MeshData {
             vk::PipelineStageFlags::TRANSFER,
         );
         pass.set_commands(move |context, command_buffer| unsafe {
-            context.device().cmd_copy_buffer(
+            context.vulkan_device().cmd_copy_buffer(
                 command_buffer,
                 staging_buffer_handle,
                 vertex_buffer_handle,
@@ -1085,7 +1085,7 @@ fn main() {
                         }];
 
                         unsafe {
-                            context.device().cmd_blit_image(
+                            context.vulkan_device().cmd_blit_image(
                                 command_buffer,
                                 src_image_handle,
                                 vk::ImageLayout::TRANSFER_SRC_OPTIMAL,

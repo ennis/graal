@@ -112,7 +112,7 @@ pub fn load_image(
         pass.register_buffer_access(staging_buffer.id, graal::AccessType::TransferRead);
 
         pass.set_commands(move |context, command_buffer| unsafe {
-            let device = context.device();
+            let device = context.vulkan_device();
 
             let regions = &[vk::BufferImageCopy {
                 buffer_offset: 0,

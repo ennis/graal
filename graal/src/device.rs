@@ -5,9 +5,10 @@ use ash::{
 };
 use std::{
     ffi::CStr,
-    os::raw::{c_char, c_void},
+    os::raw::c_void,
     ptr,
 };
+use std::ffi::CString;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
@@ -200,6 +201,8 @@ unsafe extern "system" fn debug_utils_message_callback(
     vk::FALSE
 }
 
+const DEVICE_EXTENSIONS : &[&str] = &["VK_KHR_swapchain"];
+
 impl Device {
     fn find_compatible_memory_type_internal(
         &self,
@@ -329,7 +332,14 @@ impl Device {
                 ..Default::default()
             };
 
-            let device_extensions = [b"VK_KHR_swapchain\0".as_ptr() as *const c_char];
+            // Convert extension strings into C-strings
+            let c_device_extensions: Vec<_> = DEVICE_EXTENSIONS
+                .iter().chain(platform_impl::PlatformExtensions::names().iter())
+                .map(|&s| CString::new(s).unwrap())
+                .collect();
+
+            let device_extensions: Vec<_> =
+                c_device_extensions.iter().map(|s| s.as_ptr()).collect();
 
             let device_create_info = vk::DeviceCreateInfo {
                 p_next: &mut features2 as *mut _ as *mut c_void,
@@ -338,7 +348,7 @@ impl Device {
                 p_queue_create_infos: device_queue_create_infos.as_ptr(),
                 enabled_layer_count: 0,
                 pp_enabled_layer_names: ptr::null(),
-                enabled_extension_count: 1,
+                enabled_extension_count: device_extensions.len() as u32,
                 pp_enabled_extension_names: device_extensions.as_ptr(),
                 p_enabled_features: ptr::null(),
                 ..Default::default()

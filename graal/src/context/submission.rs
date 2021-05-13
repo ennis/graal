@@ -15,6 +15,7 @@ use std::{
 };
 
 use tracing::trace_span;
+use crate::context::pass::{SemaphoreSignal, SemaphoreWait, SemaphoreSignalKind, SemaphoreWaitKind};
 
 /// Resources created at submission time.
 struct SubmissionTimeResources {
@@ -167,8 +168,8 @@ struct CommandBatch {
     wait_serials: QueueSerialNumbers,
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
     signal_snn: SubmissionNumber,
-    wait_binary_semaphores: Vec<vk::Semaphore>, // TODO arrayvec
-    signal_binary_semaphores: Vec<vk::Semaphore>, // TODO arrayvec
+    external_semaphore_waits: Vec<SemaphoreWait>, // TODO arrayvec
+    external_semaphore_signals: Vec<SemaphoreSignal>, // TODO arrayvec
     command_buffers: Vec<vk::CommandBuffer>,
 }
 
@@ -178,8 +179,8 @@ impl CommandBatch {
             wait_serials: Default::default(),
             wait_dst_stages: Default::default(),
             signal_snn: Default::default(),
-            wait_binary_semaphores: vec![],
-            signal_binary_semaphores: vec![],
+            external_semaphore_waits: vec![],
+            external_semaphore_signals: vec![],
             command_buffers: Vec::new(),
         }
     }
@@ -191,7 +192,7 @@ impl CommandBatch {
     fn is_empty(&self) -> bool {
         self.command_buffers.is_empty()
             && !self.signal_snn.is_valid()
-            && self.signal_binary_semaphores.is_empty()
+            && self.external_semaphore_signals.is_empty()
     }
 
     fn reset(&mut self) {
@@ -199,8 +200,8 @@ impl CommandBatch {
         self.wait_dst_stages = Default::default();
         self.wait_serials = Default::default();
         self.signal_snn = Default::default();
-        self.wait_binary_semaphores.clear();
-        self.signal_binary_semaphores.clear();
+        self.external_semaphore_waits.clear();
+        self.external_semaphore_signals.clear();
         self.command_buffers.clear();
     }
 }
@@ -268,20 +269,27 @@ impl Context {
             unsafe { self.device.device.end_command_buffer(cb).unwrap() }
         }
 
-        // setup timeline signal if necessary
+        // setup queue timeline signals if necessary
         if batch.signal_snn.serial() > 0 {
             signal_semaphores.push(self.timelines[q as usize]);
             signal_semaphore_values.push(batch.signal_snn.serial());
             self.last_signalled_serials[q] = batch.signal_snn.serial();
         }
 
-        // binary semaphore signals
-        for &s in batch.signal_binary_semaphores.iter() {
-            signal_semaphores.push(s);
-            signal_semaphore_values.push(0);
+        // external semaphore signals
+        for signal in batch.external_semaphore_signals.iter() {
+            signal_semaphores.push(signal.semaphore);
+            match signal.signal_kind {
+                SemaphoreSignalKind::Binary => {
+                    signal_semaphore_values.push(0);
+                }
+                SemaphoreSignalKind::Timeline(value) => {
+                    signal_semaphore_values.push(value);
+                }
+            }
         }
 
-        // setup timeline waits
+        // setup queue timeline waits
         for (i, &w) in batch.wait_serials.iter().enumerate() {
             if w != 0 {
                 wait_semaphores.push(self.timelines[i]);
@@ -290,19 +298,25 @@ impl Context {
             }
         }
 
-        // setup binary semaphore waits
-        for &s in batch.wait_binary_semaphores.iter() {
-            wait_semaphores.push(s);
-            wait_semaphore_values.push(0);
-            // TODO
-            wait_semaphore_dst_stages.push(vk::PipelineStageFlags::TOP_OF_PIPE);
-            // FIXME: this is incorrect. We immediately allow re-use of the semaphore, but there's
+        // external semaphore waits
+        for wait in batch.external_semaphore_waits.iter() {
+            wait_semaphores.push(wait.semaphore);
+            wait_semaphore_dst_stages.push(wait.dst_stage);
+            match wait.wait_kind {
+                SemaphoreWaitKind::Binary => {
+                    wait_semaphore_values.push(0);
+
+                }
+                SemaphoreWaitKind::Timeline(value) => {
+                    wait_semaphore_values.push(value);
+                }
+            }
+
+            // Every semaphore that is waited on (except queue timelines) is put in `used_semaphores`.
+            // We don't immediately allow re-use of the semaphore, since there's
             // no guarantee that the next signal of the semaphore will happen after the wait that
             // we just queued. For instance, it could be signalled on another queue.
-            //self.available_semaphores.push(s);
-
-            // Every semaphore that is waited on is put in `used_semaphores`
-            used_semaphores.push(s);
+            used_semaphores.push(wait.semaphore);
         }
 
         let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
@@ -399,7 +413,7 @@ impl Context {
             // we need to wait if we have a binary semaphore, or if it's the first pass in this queue
             // and the user specified an initial wait before starting the frame.
             let needs_semaphore_wait =
-                wait_serials > self.completed_serials || !p.wait_binary_semaphores.is_empty();
+                wait_serials > self.completed_serials || !p.external_semaphore_waits.is_empty();
 
             if needs_semaphore_wait {
                 // the pass needs a semaphore wait, so it needs a separate batch
@@ -416,8 +430,9 @@ impl Context {
 
             if needs_semaphore_wait {
                 batch.wait_serials = wait_serials;
-                batch.wait_dst_stages = p.wait_dst_stages; // TODO are those OK?
-                batch.wait_binary_semaphores = p.wait_binary_semaphores.clone();
+                batch.wait_dst_stages = p.wait_dst_stages; // FIXME are those OK?
+                // the current batch shouldn't have any pending waits because we just flushed them
+                batch.external_semaphore_waits = p.external_semaphore_waits.clone();
             }
 
             // ensure that a command pool has been allocated for the queue
@@ -526,8 +541,11 @@ impl Context {
                     // Eventually, the presentation engine might support timeline semaphores
                     // directly, which will make this entire problem vanish.
                     batch
-                        .signal_binary_semaphores
-                        .push(render_finished_semaphore);
+                        .external_semaphore_signals
+                        .push(SemaphoreSignal {
+                            semaphore: render_finished_semaphore,
+                            signal_kind: SemaphoreSignalKind::Binary
+                        });
                     self.submit_command_batch(q, batch, &mut used_semaphores);
                     batch.reset();
                     // build present info that waits on the batch that was just submitted
@@ -548,7 +566,7 @@ impl Context {
                             .queue_present(queue, &present_info)
                             .expect("present failed");
                     }
-                    // we signalled and waited on the semaphore, it can be reused
+                    // we signalled and waited on the semaphore, consider it consumed
                     used_semaphores.push(render_finished_semaphore);
                 }
                 None => {}
@@ -559,9 +577,9 @@ impl Context {
                 self.device.vk_ext_debug_utils.cmd_end_debug_utils_label(cb);
             }
 
-            if p.signal_after {
-                // the pass needs a semaphore signal: this terminates the batch on the queue
-                // FIXME what does this do if the pass is a queue-level operation?
+            // the pass needs a semaphore signal: this terminates the batch on the queue
+            // FIXME what does this do if the pass is a queue-level operation?
+            if p.signal_queue_timelines || !p.external_semaphore_signals.is_empty() {
                 self.submit_command_batch(q, batch, &mut used_semaphores);
                 batch.reset();
             }
