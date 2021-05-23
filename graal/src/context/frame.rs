@@ -5,24 +5,25 @@ use crate::{
             Pass, PassCommands, ResourceAccess, SemaphoreSignal, SemaphoreSignalKind,
             SemaphoreWait, SemaphoreWaitKind,
         },
-        resource::{
-            BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
-            ResourceMemory, ResourceTrackingInfo, TypedBufferInfo,
-        },
+        BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
+        ResourceTrackingInfo, TypedBufferInfo,
         CommandContext, FrameInFlight, FrameSerialNumber, GpuFuture, QueueSerialNumbers,
-        SubmissionNumber, SwapchainImage,
+        SubmissionNumber,
     },
     vk,
     vk::Handle,
     BufferResourceCreateInfo, Context, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo,
     MAX_QUEUES,
 };
-use slotmap::Key;
+use slotmap::{Key, SecondaryMap};
 use std::{
     cell::{RefCell, RefMut},
     mem, ptr,
 };
 use tracing::trace_span;
+use crate::context::{compute_reachability, AllocationRequirements, Resource, ResourceOwnership};
+use crate::ash::version::DeviceV1_0;
+use crate::swapchain::SwapchainImage;
 
 type TemporarySet = std::collections::BTreeSet<ResourceId>;
 
@@ -545,16 +546,6 @@ impl<'a> FrameInner<'a> {
         // first, add the resource into the set of temporaries used within this frame
         let resource = self.context.resources.get_mut(id).unwrap();
         if self.temporary_set.insert(id) {
-            // this is the first time the resource has been used in the frame
-            match resource.memory {
-                ResourceMemory::Aliasable(_) => {
-                    if resource.tracking.has_writer() || resource.tracking.has_readers() {
-                        panic!("transient resource was already used in a previous frame")
-                    }
-                }
-                _ => {}
-            }
-
             self.temporaries.push(id);
         }
 
@@ -814,6 +805,184 @@ impl<'a> FrameInner<'a> {
             self.sync_debug_info.push(info);
         }
     }
+}
+
+
+fn allocate_memory_for_transients(
+    context: &Context,
+    base_serial: u64,
+    passes: &[Pass],
+    temporaries: &[ResourceId]) -> Vec<vk_mem::Allocation>
+{
+    let _span = trace_span!("allocate_memory_for_transients").entered();
+
+    #[derive(Copy, Clone, Debug)]
+    struct AllocIndex {
+        index: usize,
+        dead_and_recycled: bool,
+    }
+
+    let reachability = compute_reachability(&passes);
+
+    // alloc index -> alloc requirements
+    let mut requirements: Vec<AllocationRequirements> = Vec::new();
+    // resource id -> allocation mapping (index+state)
+    let mut alloc_map: SecondaryMap<ResourceId, AllocIndex> = SecondaryMap::new();
+
+    fn get_allocation_requirements(resource: &Resource) -> Option<AllocationRequirements> {
+        match &resource.ownership {
+            ResourceOwnership::Referenced => {
+                // skip non-owned resources
+                None
+            }
+            ResourceOwnership::Owned { requirements, allocation } => {
+                if allocation.is_some() {
+                    // skip already allocated resources
+                    None
+                } else {
+                    Some(*requirements)
+                }
+            }
+        }
+    }
+
+    for &dst_id in temporaries.iter() {
+        // SRC = the resource we want to alias with
+        // DST = the resource we are allocating
+        let dst = context.resources.get(dst_id).unwrap();
+        let dst_req = if let Some(req) = get_allocation_requirements(dst) { req } else { continue };
+
+        // try to find a suitable resource to alias with (the "source")
+        let mut aliased = false;
+        'alias: for (src_id, src) in context.resources.iter() {
+            if src_id == dst_id {
+                // don't alias with the same resource...
+                continue;
+            }
+
+            // skip if not aliasable
+            let _src_req  = if let Some(req) = get_allocation_requirements(src) { req } else { continue };
+
+            let mut alloc_state =
+                if let Some(alloc_state) = alloc_map.get_mut(src_id) {
+                    // skip if the resource is already dead, and its memory was already reused
+                    if alloc_state.dead_and_recycled {
+                        continue;
+                    }
+                    alloc_state
+                } else {
+                    // skip if not allocated yet
+                    continue;
+                };
+
+            let src_first_access = src.tracking.first_access.serial();
+
+            // To re-use the memory of SRC in DST, SRC must be _dead_ before the first use of DST.
+            // A resource is dead from the point of view of a pass if this pass has an execution
+            // dependency on all last readers and writers of the resource.
+            for &reader in src.tracking.readers.iter() {
+                if reader != 0 &&
+                    (reader >= src_first_access
+                        || !reachability.is_reachable(
+                        local_pass_index(reader, base_serial),
+                        local_pass_index(src_first_access, base_serial))) {
+                    continue 'alias;
+                }
+            }
+
+            let writer = src.tracking.writer.serial();
+            if writer != 0
+                && (writer >= src_first_access
+                || !reachability.is_reachable(local_pass_index(writer, base_serial), local_pass_index(src_first_access, base_serial)))
+            {
+                continue;
+            }
+
+            // if we reach here, then SRC is dead, and from a synchronization point of view
+            // the resources may alias. However, we now need to check that the allocation
+            // requirements of the two resources can be made compatible.
+            let dead_alloc = &mut requirements[alloc_state.index];
+            if !dead_alloc.try_adjust(&dst_req) {
+                // the memory requirements of the two resources cannot be made compatible
+                continue;
+            }
+
+            // success: the two resources may alias, and the memory requirements have been adjusted
+            // now update the allocation map
+            let index = alloc_state.index;
+            alloc_state.dead_and_recycled = true;
+            alloc_map.insert(
+                dst_id,
+                AllocIndex {
+                    index,
+                    dead_and_recycled: false,
+                },
+            );
+
+            aliased = true;
+            break;
+        }
+
+        if !aliased {
+            // we could not alias with any existing resource, so create a new allocation for the resource
+            let index = requirements.len();
+            requirements.push(dst_req);
+            alloc_map.insert(
+                dst_id,
+                AllocIndex {
+                    index,
+                    dead_and_recycled: false,
+                },
+            );
+        }
+    }
+
+    // now allocate device memory
+    let mut allocations = Vec::with_capacity(requirements.len());
+    let mut allocation_infos = Vec::with_capacity(requirements.len());
+
+    for alloc_req in requirements.iter() {
+        let allocation_create_info = vk_mem::AllocationCreateInfo {
+            ..Default::default()
+        };
+        let (allocation, allocation_info) = context
+            .device
+            .allocator
+            .allocate_memory(&alloc_req.mem_req, &allocation_create_info)
+            .expect("failed to allocate device memory");
+        allocations.push(allocation);
+        allocation_infos.push(allocation_info);
+    }
+
+    // and bind them to the resources
+    for (id, resource) in context.resources.iter()
+    {
+        if let Some(alloc_index) = alloc_map.get(id) {
+            let alloc_info = &allocation_infos[alloc_index.index];
+            match &resource.kind {
+                ResourceKind::Image(img) => unsafe {
+                    context.device.device
+                        .bind_image_memory(
+                            img.handle,
+                            alloc_info.get_device_memory(),
+                            alloc_info.get_offset() as u64,
+                        )
+                        .unwrap();
+                },
+                ResourceKind::Buffer(buf) => unsafe {
+                    context.device.device
+                        .bind_buffer_memory(
+                            buf.handle,
+                            alloc_info.get_device_memory(),
+                            alloc_info.get_offset() as u64,
+                        )
+                        .unwrap();
+                },
+            }
+        }
+    }
+
+    allocations
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1380,12 +1549,9 @@ impl<'a> Frame<'a> {
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the frames that are not in use anymore.
         context.wait_for_frames_in_flight();
+
         // Allocate and assign memory for all transient resources of this frame.
-        let transient_allocations = context.allocate_memory_for_transients(
-            self.base_serial,
-            &inner.temporaries,
-            &inner.passes,
-        );
+        let transient_allocations = allocate_memory_for_transients(context, inner.base_serial, &inner.passes, &inner.temporaries);
 
         // All resources now have a block of device memory assigned. We're ready to
         // build the command buffers and submit them to the device queues.

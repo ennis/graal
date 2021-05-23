@@ -1,25 +1,16 @@
-use std::{
-    collections::{HashMap, VecDeque},
-    ffi::CString,
-    fmt,
-    os::raw::c_void,
-};
+use std::{collections::{HashMap, VecDeque}, ffi::CString, fmt, os::raw::c_void, mem, ptr};
 
 use ash::{version::DeviceV1_0, vk};
-use slotmap::{Key, SlotMap};
+use slotmap::{Key, SlotMap, SecondaryMap};
 
 use crate::{
     context::{
         descriptor::{DescriptorSet, DescriptorSetAllocator},
-        resource::{
-            ImageResource, Resource, ResourceId, ResourceKind, ResourceMap, ResourceMemory,
-            ResourceTrackingInfo,
-        },
         submission::CommandAllocator,
     },
     device::Device,
     swapchain::Swapchain,
-    DescriptorSetLayoutInfo, FragmentOutputInterface, FragmentOutputInterfaceExt, ImageInfo,
+    DescriptorSetLayoutInfo, FragmentOutputInterface, FragmentOutputInterfaceExt,
     MAX_QUEUES,
 };
 use std::cmp::Ordering;
@@ -32,11 +23,13 @@ pub(crate) mod resource;
 pub(crate) mod submission;
 mod sync_table;
 
-use crate::context::resource::{BufferId, ImageId};
 pub use descriptor::DescriptorSetAllocatorId;
 pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
 use std::ops::{Deref, DerefMut};
 pub use submission::CommandContext;
+use fixedbitset::FixedBitSet;
+use crate::context::pass::{Pass, SemaphoreWait};
+use crate::ash::vk::Handle;
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
 pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -374,36 +367,754 @@ pub fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
     }
 }
 
-/// Information about a swapchain.
+slotmap::new_key_type! {
+    pub struct ResourceId;
+}
+
+/// TODO docs
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct BufferId(pub(crate) ResourceId);
+
+/// TODO docs
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
+pub struct ImageId(pub(crate) ResourceId);
+
+pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
+
+/// Information about the memory to be allocated for a resource.
+//
+// NOTE: we don't put the "transient" flag here, because it's not _strictly_ a property of the memory
+// we're allocating, but a property of the resource itself (its lifetime).
+//
+// NOTE: this would be the logical place to put an optional "ExternalMemoryHandle", but then all
+// functions using `ResourceMemoryInfo` would have to be unsafe, since it's the responsibility of
+// the caller to ensure that the external handle is valid.
+// Instead, we decided to split resource creation into two functions: one in which we allocate the
+// memory for the resource ourselves, for which we can guarantee its safety, and one in which the
+// user provides the memory handle, which is unsafe.
+// TODO: considering that we do very minimal checks on the createInfos passed to vulkan, it might
+// make sense to just make most resource creation functions unsafe.
+//
+// TODO: "ResourceMemoryInfo" seems like information about already allocated memory, but it's more
+// like a request: maybe something in the lines of "ResourceMemoryAllocationInfo" or
+// "ResourceMemoryRequirements"?
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ResourceMemoryInfo {
+    /// Required memory property flags. Panics if those cannot be honored (no memory type with those properties).
+    pub required_flags: vk::MemoryPropertyFlags,
+    /// Preferred memory property flags. The allocator will honor those flags if a memory type with those properties exist, otherwise it will fallback to the required flags.
+    pub preferred_flags: vk::MemoryPropertyFlags,
+}
+
+impl ResourceMemoryInfo {
+    /// TODO docs
+    pub const fn new() -> ResourceMemoryInfo {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::empty(),
+            preferred_flags: vk::MemoryPropertyFlags::empty(),
+        }
+    }
+
+    /// Requires that the resource be allocated in DEVICE_LOCAL memory.
+    pub const fn device_local(self) -> Self {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::from_raw(
+                self.required_flags.as_raw() | vk::MemoryPropertyFlags::DEVICE_LOCAL.as_raw(),
+            ),
+            ..self
+        }
+    }
+
+    /// Requires that the resource be allocated in HOST_VISIBLE memory.
+    pub const fn host_visible(self) -> Self {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::from_raw(
+                self.required_flags.as_raw() | vk::MemoryPropertyFlags::HOST_VISIBLE.as_raw(),
+            ),
+            ..self
+        }
+    }
+
+    /// Requires that the resource be allocated in HOST_COHERENT memory.
+    pub const fn host_coherent(self) -> Self {
+        ResourceMemoryInfo {
+            required_flags: vk::MemoryPropertyFlags::from_raw(
+                self.required_flags.as_raw() | vk::MemoryPropertyFlags::HOST_COHERENT.as_raw(),
+            ),
+            ..self
+        }
+    }
+
+    /// Device-local resource memory. Shorthand for `ResourceMemoryInfo::new().device_local()`.
+    pub const DEVICE_LOCAL: ResourceMemoryInfo = ResourceMemoryInfo::new().device_local();
+
+    /// Host-visible resource memory (upload buffers). Shorthand for `ResourceMemoryInfo::new().host_visible()`.
+    pub const HOST_VISIBLE: ResourceMemoryInfo = ResourceMemoryInfo::new().host_visible();
+
+    /// Host-visible and coherent resource memory (upload buffers without need for flushes).
+    /// Shorthand for `ResourceMemoryInfo::new().host_visible().host_coherent()`.
+    pub const HOST_VISIBLE_COHERENT: ResourceMemoryInfo =
+        ResourceMemoryInfo::new().host_visible().host_coherent();
+
+    /// Staging buffers (host-visible, preferably coherent)
+    pub const STAGING: ResourceMemoryInfo =
+        ResourceMemoryInfo::new().host_visible().host_coherent();
+}
+
+/// Parameters of a newly created image resource.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct ImageResourceCreateInfo {
+    /// Image type.
+    pub image_type: vk::ImageType,
+    /// Usage flags.
+    pub usage: vk::ImageUsageFlags,
+    /// Format of the image.
+    pub format: vk::Format,
+    /// Size of the image.
+    pub extent: vk::Extent3D,
+    /// Number of mipmap levels. Note that the mipmaps contents must still be generated manually.
+    pub mip_levels: u32,
+    /// Number of array layers.
+    pub array_layers: u32,
+    /// Number of samples.
+    pub samples: u32,
+    /// Tiling.
+    pub tiling: vk::ImageTiling,
+}
+
+/// Parameters of a newly created buffer resource.
+#[derive(Copy, Clone, Debug, Default)]
+pub struct BufferResourceCreateInfo {
+    /// Usage flags.
+    pub usage: vk::BufferUsageFlags,
+    /// Size of the buffer in bytes.
+    pub byte_size: u64,
+    /// Whether the memory for the resource should be mapped for host access immediately.
+    /// If this flag is set, `create_buffer_resource` will also return a pointer to the mapped buffer.
+    /// This flag is ignored for resources that can't be mapped.
+    pub map_on_create: bool,
+}
+
+/// Computes the number of mip levels for a 2D image of the given size.
+pub fn get_mip_level_count(width: u32, height: u32) -> u32 {
+    (width.max(height) as f32).log2().floor() as u32
+}
+
 #[derive(Copy, Clone, Debug)]
-pub struct SwapchainInfo {
-    /// ID of the swapchain.
-    pub id: SwapchainId,
-    /// Handle of the swapchain.
-    pub handle: vk::SwapchainKHR,
-    /// Format of the images in the swapchain.
+pub struct AllocationRequirements {
+    pub(crate) mem_req: vk::MemoryRequirements,
+    pub(crate) required_flags: vk::MemoryPropertyFlags,
+    pub(crate) preferred_flags: vk::MemoryPropertyFlags,
+}
+
+impl AllocationRequirements {
+    pub(crate) fn try_adjust(&mut self, other: &AllocationRequirements) -> bool {
+        if self.required_flags != other.required_flags {
+            return false;
+        }
+        if self.mem_req.memory_type_bits != other.mem_req.memory_type_bits {
+            return false;
+        }
+        self.mem_req.alignment = self.mem_req.alignment.max(other.mem_req.alignment);
+        self.mem_req.size = self.mem_req.size.max(other.mem_req.size);
+        true
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ImageResource {
+    pub(crate) handle: vk::Image,
+    pub(crate) format: vk::Format,
+}
+
+#[derive(Debug)]
+pub(crate) struct BufferResource {
+    pub(crate) handle: vk::Buffer,
+}
+
+/// Represents a resource access in a pass.
+#[derive(Debug)]
+pub(crate) struct ResourceAccessDetails {
+    pub(crate) initial_layout: vk::ImageLayout,
+    pub(crate) final_layout: vk::ImageLayout,
+    pub(crate) access_mask: vk::AccessFlags,
+    pub(crate) stage_mask: vk::PipelineStageFlags,
+}
+
+#[derive(Debug)]
+pub(crate) enum ResourceKind {
+    Buffer(BufferResource),
+    Image(ImageResource),
+}
+
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ResourceTrackingInfo {
+    first_access: SubmissionNumber,
+    pub(crate) owner_queue_family: u32,
+    pub(crate) readers: QueueSerialNumbers,
+    pub(crate) writer: SubmissionNumber,
+    pub(crate) layout: vk::ImageLayout,
+    /// Access types for the last write to this resource that have yet to be made available.
+    /// This is only relevant for the writer queue, as accesses from concurrent queues are synchronized
+    /// with a semaphore that automatically makes all writes visible.
+    pub(crate) availability_mask: vk::AccessFlags,
+    /// Which access types can see the last write to the resource.
+    /// This is only relevant for the writer queue, as accesses from concurrent queues are synchronized
+    /// with a semaphore that automatically makes all writes visible.
+    pub(crate) visibility_mask: vk::AccessFlags,
+    /// The stages that last accessed the resource. Valid only on the writer queue.
+    pub(crate) stages: vk::PipelineStageFlags,
+    /// The binary semaphore to wait for before accessing the resource.
+    pub(crate) wait_binary_semaphore: vk::Semaphore,
+}
+
+impl ResourceTrackingInfo {
+    pub(crate) fn has_writer(&self) -> bool {
+        self.writer.is_valid()
+    }
+
+    pub(crate) fn has_readers(&self) -> bool {
+        self.readers.iter().any(|&x| x != 0)
+    }
+
+    pub(crate) fn clear_readers(&mut self) {
+        self.readers = Default::default();
+    }
+}
+
+impl Default for ResourceTrackingInfo {
+    fn default() -> Self {
+        ResourceTrackingInfo {
+            first_access: Default::default(),
+            owner_queue_family: vk::QUEUE_FAMILY_IGNORED,
+            readers: Default::default(),
+            writer: Default::default(),
+            layout: Default::default(),
+            availability_mask: Default::default(),
+            visibility_mask: Default::default(),
+            stages: Default::default(),
+            wait_binary_semaphore: Default::default(),
+        }
+    }
+}
+
+/*/// Describes the kind of memory that is bound to a resource.
+#[derive(Debug)]
+pub(crate) enum ResourceMemory {
+    /// The resource may share a block of memory allocation with other resources.
+    Aliasable(AllocationRequirements),
+    /// The resource has a block of memory allocated exclusively to it.
+    Exclusive(vk_mem::Allocation),
+    /// The memory for the resource is managed externally (e.g. swapchain images)
+    Swapchain,
+    /// The memory for this resource was imported or exported from/to an external handle.
+    External { device_memory: vk::DeviceMemory },
+}*/
+
+/// Describes how a resource got its memory.
+#[derive(Clone,Debug)]
+pub enum ResourceAllocation {
+
+    /// a block of memory exclusively for this resource.
+    Default {
+        allocation: vk_mem::Allocation
+    },
+
+    /// Memory aliasing: allocate a block of memory for the resource, which can possibly be shared
+    /// with other aliasable resources if their lifetimes do not overlap.
+    Transient,
+
+    /// The memory for this resource was imported or exported from/to an external handle.
+    External { device_memory: vk::DeviceMemory },
+
+}
+
+#[derive(Clone,Debug)]
+pub enum ResourceOwnership {
+    Owned {
+        requirements: AllocationRequirements,
+        allocation: Option<ResourceAllocation>,
+    },
+    Referenced,
+}
+
+#[derive(Debug)]
+pub(crate) struct Resource {
+    /// Name, for debugging purposes
+    pub(crate) name: String,
+
+    /// Whether this pass has been discarded during the last frame.
+    pub(crate) discarded: bool,
+
+    /// The memory bound to the resource.
+    pub(crate) ownership: ResourceOwnership,
+
+    /// Details specific to the kind of resource (buffer or image).
+    pub(crate) kind: ResourceKind,
+
+    pub(crate) tracking: ResourceTrackingInfo,
+}
+
+impl Resource {
+    pub(crate) fn image(&self) -> &ImageResource {
+        match &self.kind {
+            ResourceKind::Image(r) => r,
+            _ => panic!("expected an image resource"),
+        }
+    }
+
+    pub(crate) fn image_mut(&mut self) -> &mut ImageResource {
+        match &mut self.kind {
+            ResourceKind::Image(r) => r,
+            _ => panic!("expected an image resource"),
+        }
+    }
+
+    pub(crate) fn buffer(&self) -> &BufferResource {
+        match &self.kind {
+            ResourceKind::Buffer(r) => r,
+            _ => panic!("expected a buffer resource"),
+        }
+    }
+
+    pub(crate) fn buffer_mut(&mut self) -> &mut BufferResource {
+        match &mut self.kind {
+            ResourceKind::Buffer(r) => r,
+            _ => panic!("expected a buffer resource"),
+        }
+    }
+}
+
+/// Destroys a resource and frees its device memory if it was allocated for this resource
+/// exclusively.
+unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
+    // deallocate its memory, if it was allocated for this object exclusively
+    match resource.ownership {
+        ResourceOwnership::Owned { ref allocation, .. } => {
+            // destroy the object, if we're responsible for it (we're not responsible of destroying
+            // swapchain images, for example, since they are destroyed with the swapchain).
+            match &mut resource.kind {
+                ResourceKind::Buffer(buf) => {
+                    device
+                        .device
+                        .destroy_buffer(mem::take(&mut buf.handle), None);
+                }
+                ResourceKind::Image(img) => {
+                    device
+                        .device
+                        .destroy_image(mem::take(&mut img.handle), None);
+                }
+            }
+
+            match allocation {
+                Some(ResourceAllocation::Default {
+                         allocation
+                     }) => {
+                    device.allocator.free_memory(&allocation).unwrap()
+                }
+                _ => {
+                    // External: the memory is freed elsewhere (?)
+                    // Transient: the memory is freed when waiting for a frame to finish
+                    // No allocation: nothing to deallocate
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Holds information about a buffer resource.
+#[derive(Copy, Clone, Debug)]
+pub struct BufferInfo {
+    /// ID of the buffer resource.
+    pub id: BufferId,
+    /// Vulkan handle of the buffer.
+    pub handle: vk::Buffer,
+    /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
+    pub mapped_ptr: *mut u8,
+}
+
+/// Holds information about a buffer resource containing an array of elements of type T.
+#[derive(Copy, Clone, Debug)]
+pub struct TypedBufferInfo<T> {
+    /// ID of the buffer resource.
+    pub id: BufferId,
+    /// Vulkan handle of the buffer.
+    pub handle: vk::Buffer,
+    /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
+    pub mapped_ptr: *mut T,
+}
+
+/// `TypedBufferInfo<T>` are convertible into their untyped equivalents.
+impl<T> From<TypedBufferInfo<T>> for BufferInfo {
+    fn from(buf: TypedBufferInfo<T>) -> Self {
+        BufferInfo {
+            id: buf.id,
+            handle: buf.handle,
+            mapped_ptr: buf.mapped_ptr as *mut u8,
+        }
+    }
+}
+
+impl<T: Copy> TypedBufferInfo<T> {
+    pub unsafe fn byte_cast<U>(&self) -> TypedBufferInfo<U> where T: Sized, U: Sized {
+        // TODO static assert?
+        assert_eq!(mem::size_of::<T>(), mem::size_of::<U>());
+        TypedBufferInfo {
+            id: self.id,
+            handle: self.handle,
+            mapped_ptr: self.mapped_ptr as *mut U
+        }
+    }
+}
+
+/// Holds information about an image resource.
+#[derive(Copy, Clone, Debug)]
+pub struct ImageInfo {
+    /// ID of the image resource.
+    pub id: ImageId,
+    /// Vulkan handle of the image.
+    pub handle: vk::Image,
+}
+
+// --- Reachability matrix -------------------------------------------------------------------------
+struct Reachability {
+    m: Vec<FixedBitSet>,
+}
+
+impl Reachability {
+    fn is_reachable(&self, from: usize, to: usize) -> bool {
+        self.m[to][from]
+    }
+}
+
+fn disjoint_index_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
+    assert!(a != b && a < v.len() && b < v.len());
+    unsafe {
+        (
+            &mut *(v.get_unchecked_mut(a) as *mut _),
+            &mut *(v.get_unchecked_mut(b) as *mut _),
+        )
+    }
+}
+
+fn compute_reachability(passes: &[Pass]) -> Reachability {
+    let len = passes.len();
+    let mut m = Vec::new();
+    m.resize_with(passes.len(), || FixedBitSet::with_capacity(len));
+
+    for i in 0..len {
+        for &p in passes[i].preds.iter() {
+            m[i].set(p, true);
+            let (mi, mp) = disjoint_index_mut(&mut m, i, p);
+            *mi |= &*mp;
+        }
+    }
+
+    Reachability { m }
+}
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+pub struct ResourceRegistrationInfo<'a> {
+    pub name: &'a str,
+    pub ownership: ResourceOwnership,
+    pub initial_wait: Option<SemaphoreWait>
+}
+
+#[derive(Clone, Debug)]
+pub struct ImageRegistrationInfo<'a> {
+    pub resource: ResourceRegistrationInfo<'a>,
+    pub handle: vk::Image,
     pub format: vk::Format,
 }
 
-/// Contains information about an image in a swapchain.
-#[derive(Copy, Clone, Debug)]
-pub struct SwapchainImage {
-    /// ID of the swapchain that owns this image.
-    pub swapchain_id: SwapchainId,
-    /// Handle of the swapchain that owns this image.
-    pub swapchain_handle: vk::SwapchainKHR,
-    /// Index of the image in the swap chain.
-    pub image_index: u32,
-    pub image_info: ImageInfo,
+#[derive(Clone, Debug)]
+pub struct BufferRegistrationInfo<'a> {
+    pub resource: ResourceRegistrationInfo<'a>,
+    pub handle: vk::Buffer,
+}
+
+impl Context {
+    /// Frees or recycles resources used by batches that have completed and that have no user
+    /// references.
+    pub(crate) fn cleanup_resources(&mut self) {
+        let _ = trace_span!("cleanup_resources");
+        let device = &self.device;
+        let completed_serials = self.completed_serials;
+        // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
+        // and resources that have reader or writer passes that have not yet completed
+        self.resources.retain(|id, r| {
+            // refcount != 0 OR any reader not completed OR writer not completed
+            let keep = !r.discarded
+                || r.tracking.readers > completed_serials
+                || r.tracking.writer.serial() > completed_serials.serial(r.tracking.writer.queue());
+            if !keep {
+                trace!(?id, name = r.name.as_str(), "destroy_resource");
+                unsafe {
+                    // Safety: we know that all serials <= `self.completed_serials` have finished
+                    destroy_resource(device, r);
+                }
+            }
+            keep
+        })
+    }
+
+
+
+    unsafe fn register_resource(&mut self,
+                                info: ResourceRegistrationInfo,
+                                kind: ResourceKind) -> ResourceId
+    {
+        let (object_type, object_handle) = match kind {
+            ResourceKind::Buffer(ref buf) => (vk::ObjectType::BUFFER, buf.handle.as_raw()),
+            ResourceKind::Image(ref img) => (vk::ObjectType::IMAGE, img.handle.as_raw()),
+        };
+
+        let id = self.resources.insert(Resource {
+            name: info.name.to_string(),
+            discarded: false,
+            tracking: Default::default(),
+            kind,
+            ownership: info.ownership
+        });
+
+        set_debug_object_name(
+            &self.device,
+            object_type,
+            object_handle,
+            info.name,
+            Some(self.next_serial)
+        );
+
+        id
+    }
+
+    /// Registers an existing buffer resource in the context.
+    pub unsafe fn register_buffer_resource(
+        &mut self,
+        info: BufferRegistrationInfo,
+    ) -> BufferId {
+        let id = self.register_resource( info.resource, ResourceKind::Buffer(BufferResource { handle: info.handle }));
+        BufferId(id)
+    }
+
+    /// Registers an existing image resource in the context.
+    pub unsafe fn register_image_resource(
+        &mut self,
+        info: ImageRegistrationInfo,
+    ) -> ImageId {
+        let id = self.register_resource(info.resource, ResourceKind::Image(ImageResource { handle: info.handle, format: info.format }));
+        ImageId(id)
+    }
+
+    /// Destroys the image once it's not in use.
+    pub fn destroy_image(&mut self, id: ImageId) {
+        self.resources.get_mut(id.0).unwrap().discarded = true;
+    }
+
+    /// Destroys the buffer once it's not in use.
+    pub fn destroy_buffer(&mut self, id: BufferId) {
+        self.resources.get_mut(id.0).unwrap().discarded = true;
+    }
+
+    /// Creates a new image resource.
+    ///
+    /// Whether the resource should live only for the duration of the frame it's used in.
+    /// When the frame that uses the resource completes, the resource is automatically deleted.
+    /// The resource can only be used in one frame.
+    pub fn create_image(
+        &mut self,
+        name: &str,
+        memory_info: &ResourceMemoryInfo,
+        image_info: &ImageResourceCreateInfo,
+        transient: bool,
+    ) -> ImageInfo {
+        // for now all resources are CONCURRENT, because that's the only way they can
+        // be read across multiple queues.
+        // Maybe exclusive ownership will be needed at some point, but then we should prevent
+        // them from being used across multiple queues. I know that there's the possibility of doing
+        // a "queue ownership transfer", but that shit is incomprehensible.
+        let create_info = vk::ImageCreateInfo {
+            image_type: image_info.image_type,
+            format: image_info.format,
+            extent: image_info.extent,
+            mip_levels: image_info.mip_levels,
+            array_layers: image_info.array_layers,
+            samples: get_vk_sample_count(image_info.samples),
+            tiling: image_info.tiling,
+            usage: image_info.usage,
+            sharing_mode: vk::SharingMode::CONCURRENT,
+            queue_family_index_count: self.device.queues_info.queue_count as u32,
+            p_queue_family_indices: self.device.queues_info.families.as_ptr(),
+            ..Default::default()
+        };
+        let handle = unsafe {
+            self.device
+                .device
+                .create_image(&create_info, None)
+                .expect("failed to create image")
+        };
+        let mem_req = unsafe { self.device.device.get_image_memory_requirements(handle) };
+        /*let memory = if transient {
+            // transient memory
+            ResourceMemory::Aliasable(AllocationRequirements {
+                mem_req,
+                required_flags: memory_info.required_flags,
+                preferred_flags: memory_info.preferred_flags,
+            })
+        } else {
+            let allocation_create_info = vk_mem::AllocationCreateInfo {
+                preferred_flags: memory_info.preferred_flags,
+                required_flags: memory_info.required_flags,
+                ..Default::default()
+            };
+            let (alloc, alloc_info) = self
+                .device
+                .allocator
+                .allocate_memory(&mem_req, &allocation_create_info)
+                .expect("failed to allocate device memory");
+            unsafe {
+                self.device
+                    .device
+                    .bind_image_memory(
+                        handle,
+                        alloc_info.get_device_memory(),
+                        alloc_info.get_offset() as u64,
+                    )
+                    .unwrap();
+            }
+            ResourceMemory::Exclusive(alloc)
+        };*/
+        // register the resource in the context
+        let id = unsafe {
+            self.register_image_resource(ImageRegistrationInfo {
+                resource: ResourceRegistrationInfo {
+                    name,
+                    ownership: ResourceOwnership::Owned {
+                        requirements: AllocationRequirements {
+                            mem_req,
+                            required_flags: memory_info.required_flags,
+                            preferred_flags: memory_info.preferred_flags
+                        },
+                        allocation: None
+                    },
+                    initial_wait: None
+                },
+                handle,
+                format: image_info.format
+            })
+        };
+
+        ImageInfo { id, handle }
+    }
+
+    pub fn create_buffer(
+        &mut self,
+        name: &str,
+        memory_info: &ResourceMemoryInfo,
+        buffer_create_info: &BufferResourceCreateInfo,
+        transient: bool,
+    ) -> BufferInfo {
+        let create_info = vk::BufferCreateInfo {
+            flags: Default::default(),
+            size: buffer_create_info.byte_size,
+            usage: buffer_create_info.usage,
+            sharing_mode: if self.device.queues_info.queue_count == 1 {
+                vk::SharingMode::EXCLUSIVE
+            } else {
+                vk::SharingMode::CONCURRENT
+            },
+            queue_family_index_count: self.device.queues_info.queue_count as u32,
+            p_queue_family_indices: self.device.queues_info.families.as_ptr(),
+            ..Default::default()
+        };
+        let handle = unsafe {
+            self.device
+                .device
+                .create_buffer(&create_info, None)
+                .expect("failed to create buffer")
+        };
+        let mem_req = unsafe { self.device.device.get_buffer_memory_requirements(handle) };
+
+        let (ownership, mapped_ptr) = if !buffer_create_info.map_on_create {
+            // We can delay allocation only if the user requests a transient resource and
+            // if the resource does not need to be mapped immediately.
+            let ownership = ResourceOwnership::Owned {
+                requirements: AllocationRequirements {
+                    mem_req,
+                    required_flags: memory_info.required_flags,
+                    preferred_flags: memory_info.preferred_flags
+                },
+                allocation: None
+            };
+            (
+                /* ownership */ ownership,
+                /* mapped_ptr */ ptr::null_mut(),
+            )
+        } else {
+            // caller requested a mapped pointer, must create and allocate immediately
+            let allocation_create_info = vk_mem::AllocationCreateInfo {
+                flags: vk_mem::AllocationCreateFlags::MAPPED,
+                preferred_flags: memory_info.preferred_flags,
+                required_flags: memory_info.required_flags,
+                ..Default::default()
+            };
+            let (alloc, alloc_info) = self
+                .device
+                .allocator
+                .allocate_memory(&mem_req, &allocation_create_info)
+                .expect("failed to allocate device memory");
+            unsafe {
+                self.device
+                    .device
+                    .bind_buffer_memory(
+                        handle,
+                        alloc_info.get_device_memory(),
+                        alloc_info.get_offset() as u64,
+                    )
+                    .unwrap();
+            }
+            let ownership = ResourceOwnership::Owned {
+                requirements: AllocationRequirements {
+                    mem_req,
+                    required_flags: memory_info.required_flags,
+                    preferred_flags: memory_info.preferred_flags
+                },
+                allocation: None
+            };
+            let mapped_ptr = if buffer_create_info.map_on_create {
+                let ptr = alloc_info.get_mapped_data();
+                assert!(!ptr.is_null(), "failed to map buffer");
+                ptr
+            } else {
+                ptr::null_mut()
+            };
+            (/* ownership */ ownership, /* mapped_ptr */ mapped_ptr)
+        };
+
+        let id = unsafe { self.register_buffer_resource(BufferRegistrationInfo {
+            resource: ResourceRegistrationInfo {
+                name,
+                initial_wait: None,
+                ownership
+            },
+            handle})
+        };
+
+        BufferInfo {
+            id,
+            handle,
+            mapped_ptr,
+        }
+    }
 }
 
 slotmap::new_key_type! {
-    pub struct SwapchainId;
     pub struct RenderPassId;
     pub struct PipelineLayoutId;
 }
 
-type SwapchainMap = SlotMap<SwapchainId, Swapchain>;
 type RenderPassMap = SlotMap<RenderPassId, vk::RenderPass>;
 //type PipelineLayoutMap = SlotMap<PipelineLayoutId, vk::PipelineLayout>;
 
@@ -480,8 +1191,7 @@ pub struct Context {
     submitted_frame_count: u64,
     /// Number of completed frames
     completed_frame_count: u64,
-    /// Swapchains.
-    swapchains: SwapchainMap,
+
     /// ID-mapped render passes. These are used mostly to store the render passes for
     /// fragment output interface types, but still be able to delete the objects when the context
     /// is dropped.
@@ -539,7 +1249,6 @@ impl Context {
             submitted_frame_count: 0,
             completed_frame_count: 0,
             resources: SlotMap::with_key(),
-            swapchains: SlotMap::with_key(),
             render_passes: SlotMap::with_key(),
             //pipeline_layouts: SlotMap::with_key(),
             in_flight: VecDeque::new(),
@@ -572,7 +1281,7 @@ impl Context {
     }
 
     /// Creates a binary semaphore (or return a previously used semaphore that is unsignalled).
-    fn create_semaphore(&mut self) -> vk::Semaphore {
+    pub fn create_semaphore(&mut self) -> vk::Semaphore {
         if let Some(semaphore) = self.semaphore_pool.pop() {
             return semaphore;
         }
@@ -731,72 +1440,6 @@ impl Context {
 
     pub fn current_frame_index(&self) -> u64 {
         self.submitted_frame_count
-    }
-
-    /// Creates a swapchain for the given surface.
-    /// This function will automatically choose a "best" format among those supported for the
-    /// surface.
-    pub unsafe fn create_swapchain(
-        &mut self,
-        surface: vk::SurfaceKHR,
-        initial_size: (u32, u32),
-    ) -> SwapchainInfo {
-        let swapchain = Swapchain::new(&self.device, surface, initial_size);
-        let handle = swapchain.handle;
-        let format = swapchain.format;
-
-        let id = self.swapchains.insert(swapchain);
-
-        SwapchainInfo { id, handle, format }
-    }
-
-    /// Acquires the next image in the swapchain.
-    /// See `vkAcquireNextImageKHR`.
-    pub unsafe fn acquire_next_image(&mut self, swapchain_id: SwapchainId) -> SwapchainImage {
-        let image_available = self.create_semaphore();
-        let swapchain = self.swapchains.get_mut(swapchain_id).unwrap();
-        let swapchain_handle = swapchain.handle;
-        let (image_index, _suboptimal) =
-            swapchain.acquire_next_image(&self.device, image_available);
-
-        // create a resource entry so that we can track usages of the swapchain image
-        let image_id = self.resources.insert(Resource {
-            name: format!("swapchain {:?} image #{}", swapchain.handle, image_index),
-            user_ref_count: 0,
-            tracking: ResourceTrackingInfo {
-                wait_binary_semaphore: image_available,
-                ..Default::default()
-            },
-            memory: ResourceMemory::Swapchain,
-            // swapchain images are owned by the swapchain so we shouldn't delete them
-            should_delete: false,
-            kind: ResourceKind::Image(ImageResource {
-                handle: swapchain.images[image_index as usize],
-                format: swapchain.format,
-            }),
-        });
-
-        SwapchainImage {
-            swapchain_id,
-            swapchain_handle,
-            image_info: ImageInfo {
-                id: ImageId(image_id),
-                handle: swapchain.images[image_index as usize],
-            },
-            image_index,
-        }
-    }
-
-    ///
-    pub unsafe fn resize_swapchain(&mut self, swapchain: SwapchainId, size: (u32, u32)) {
-        let swapchain = self.swapchains.get_mut(swapchain).unwrap();
-        swapchain.resize(&self.device, size);
-    }
-
-    //
-    pub unsafe fn destroy_swapchain(&mut self, _swapchain: SwapchainId) {
-        // TODO wait for the device to finish, then destroy swapchain
-        unimplemented!()
     }
 
     /// Gets or creates the associated render pass object for the specified fragment output interface type.

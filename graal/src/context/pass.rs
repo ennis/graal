@@ -33,7 +33,7 @@ pub enum SemaphoreSignalKind {
 
 /// Represents a semaphore wait operation outside of the queue timelines.
 #[derive(Clone,Debug)]
-pub(crate) struct SemaphoreWait {
+pub struct SemaphoreWait {
     /// The semaphore in question
     pub(crate) semaphore: vk::Semaphore,
     /// Whether the semaphore is internally managed (owned by the context).

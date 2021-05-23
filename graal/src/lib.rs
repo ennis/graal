@@ -13,12 +13,10 @@ pub use crate::{
     context::{
         format_aspect_mask,
         frame::FrameCreateInfo,
-        resource::{
-            get_mip_level_count, BufferId, BufferInfo, BufferResourceCreateInfo, ImageId,
-            ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, TypedBufferInfo,
-        },
+        get_mip_level_count, BufferId, BufferInfo, BufferResourceCreateInfo, ImageId,
+        ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, TypedBufferInfo,
         AccessType, AccessTypeInfo, CommandContext, Context, DescriptorSetAllocatorId, Frame,
-        GpuFuture, PipelineLayoutId, RenderPassId, SwapchainId, SwapchainInfo,
+        GpuFuture, PipelineLayoutId, RenderPassId,
     },
     descriptor::{
         extract_descriptor_set_layouts_from_shader_stages, BufferDescriptor,
@@ -50,7 +48,7 @@ pub(crate) mod fragment_output;
 pub(crate) mod instance;
 pub mod pipeline;
 pub mod surface;
-pub(crate) mod swapchain;
+pub mod swapchain;
 pub mod utils;
 pub(crate) mod vertex;
 mod platform_impl;

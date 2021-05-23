@@ -26,6 +26,7 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
+use graal::swapchain::Swapchain;
 
 pub struct WinitInputState {
     pub pointer_pos_in_points: Option<egui::Pos2>,
@@ -316,7 +317,7 @@ fn main() {
     let window = WindowBuilder::new().build(&event_loop).unwrap();
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
     let mut context = graal::Context::with_surface(surface);
-    let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
+    let mut swapchain = unsafe { Swapchain::new(&context, surface, window.inner_size().into()) };
 
     // Create a scene that will hold our objects and buffers.
     let mut scene = Scene::new();
@@ -383,7 +384,7 @@ fn main() {
                     WindowEvent::Resized(size) => unsafe {
                         swapchain_size = size.into();
                         eprintln!("window resized: {},{}", swapchain_size.0, swapchain_size.1);
-                        context.resize_swapchain(swapchain.id, swapchain_size);
+                        swapchain.resize(&context, swapchain_size);
                         camera_control.set_screen_size(glam::dvec2(
                             swapchain_size.0 as f64,
                             swapchain_size.1 as f64,
@@ -397,7 +398,8 @@ fn main() {
             }
 
             Event::RedrawRequested(_) => {
-                let swapchain_image = unsafe { context.acquire_next_image(swapchain.id) };
+                let swapchain_image = unsafe { swapchain.acquire_next_image(&mut context) };
+
                 let camera = camera_control.camera();
                 let mut frame = context.start_frame(Default::default());
 
@@ -457,7 +459,10 @@ fn main() {
                     frame.dump(Some("bench"));
                     dump_next_frame = false;
                 }
+
                 frame.finish();
+
+                context.destroy_image(swapchain_image.image_info.id);
             }
             _ => (),
         }

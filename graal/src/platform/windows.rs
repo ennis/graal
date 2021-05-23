@@ -1,5 +1,5 @@
 use crate::{
-    context::{get_vk_sample_count, resource::ResourceMemory},
+    context::{get_vk_sample_count},
     vk,
     Context, Device, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo,
 };
