@@ -5,25 +5,25 @@ use crate::{
             Pass, PassCommands, ResourceAccess, SemaphoreSignal, SemaphoreSignalKind,
             SemaphoreWait, SemaphoreWaitKind,
         },
-        BufferId, BufferInfo, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
+        BufferId, ImageId, ResourceAccessDetails, ResourceId, ResourceKind,
         ResourceTrackingInfo, TypedBufferInfo,
         CommandContext, FrameInFlight, FrameSerialNumber, GpuFuture, QueueSerialNumbers,
         SubmissionNumber,
     },
     vk,
     vk::Handle,
-    BufferResourceCreateInfo, Context, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo,
+    Context,
     MAX_QUEUES,
 };
-use slotmap::{Key, SecondaryMap};
+use slotmap::Key;
 use std::{
     cell::{RefCell, RefMut},
-    mem, ptr,
+    mem,
 };
 use tracing::trace_span;
-use crate::context::{compute_reachability, AllocationRequirements, Resource, ResourceOwnership};
-use crate::ash::version::DeviceV1_0;
+use crate::context::{ResourceOwnership, ResourceAllocation, local_pass_index};
 use crate::swapchain::SwapchainImage;
+use crate::context::transient::allocate_memory_for_transients;
 
 type TemporarySet = std::collections::BTreeSet<ResourceId>;
 
@@ -525,11 +525,6 @@ struct FrameInner<'a> {
     sync_debug_info: Vec<SyncDebugInfo>,
 }
 
-fn local_pass_index(serial: u64, frame_base_serial: u64) -> usize {
-    assert!(serial > frame_base_serial);
-    (serial - frame_base_serial - 1) as usize
-}
-
 impl<'a> FrameInner<'a> {
     /// Registers an access to a resource within the specified pass and updates the dependency graph.
     ///
@@ -547,6 +542,11 @@ impl<'a> FrameInner<'a> {
         let resource = self.context.resources.get_mut(id).unwrap();
         if self.temporary_set.insert(id) {
             self.temporaries.push(id);
+        }
+
+        // set first use
+        if !resource.tracking.first_access.is_valid() {
+            resource.tracking.first_access = dst_pass.snn;
         }
 
         // First, some definitions:
@@ -805,184 +805,125 @@ impl<'a> FrameInner<'a> {
             self.sync_debug_info.push(info);
         }
     }
+
 }
 
 
-fn allocate_memory_for_transients(
-    context: &Context,
-    base_serial: u64,
-    passes: &[Pass],
-    temporaries: &[ResourceId]) -> Vec<vk_mem::Allocation>
-{
-    let _span = trace_span!("allocate_memory_for_transients").entered();
-
-    #[derive(Copy, Clone, Debug)]
-    struct AllocIndex {
-        index: usize,
-        dead_and_recycled: bool,
-    }
-
-    let reachability = compute_reachability(&passes);
-
-    // alloc index -> alloc requirements
-    let mut requirements: Vec<AllocationRequirements> = Vec::new();
-    // resource id -> allocation mapping (index+state)
-    let mut alloc_map: SecondaryMap<ResourceId, AllocIndex> = SecondaryMap::new();
-
-    fn get_allocation_requirements(resource: &Resource) -> Option<AllocationRequirements> {
-        match &resource.ownership {
-            ResourceOwnership::Referenced => {
-                // skip non-owned resources
-                None
+fn print_frame_info(context: &Context, passes: &[Pass], temporaries: &[ResourceId]) {
+    println!("=============================================================");
+    println!("Passes:");
+    for p in passes.iter() {
+        println!("- `{}` ({:?})", p.name, p.snn);
+        if p.wait_serials != Default::default() {
+            println!("    semaphore wait:");
+            if p.wait_serials[0] != 0 {
+                println!("        0:{}|{:?}", p.wait_serials[0], p.wait_dst_stages[0]);
             }
-            ResourceOwnership::Owned { requirements, allocation } => {
-                if allocation.is_some() {
-                    // skip already allocated resources
-                    None
-                } else {
-                    Some(*requirements)
-                }
+            if p.wait_serials[1] != 0 {
+                println!("        1:{}|{:?}", p.wait_serials[1], p.wait_dst_stages[1]);
             }
+            if p.wait_serials[2] != 0 {
+                println!("        2:{}|{:?}", p.wait_serials[2], p.wait_dst_stages[2]);
+            }
+            if p.wait_serials[3] != 0 {
+                println!("        3:{}|{:?}", p.wait_serials[3], p.wait_dst_stages[3]);
+            }
+        }
+        println!(
+            "    input execution barrier: {:?}->{:?}",
+            p.src_stage_mask, p.dst_stage_mask
+        );
+        println!("    input memory barriers:");
+        for imb in p.image_memory_barriers.iter() {
+            let id = context.image_resource_by_handle(imb.image);
+            print!("        image handle={:?} ", imb.image);
+            if !id.is_null() {
+                print!(
+                    "(id={:?}, name={})",
+                    id,
+                    context.resources.get(id).unwrap().name
+                );
+            } else {
+                print!("(unknown resource)");
+            }
+            println!(
+                " access_mask:{:?}->{:?} layout:{:?}->{:?}",
+                imb.src_access_mask, imb.dst_access_mask, imb.old_layout, imb.new_layout
+            );
+        }
+        for bmb in p.buffer_memory_barriers.iter() {
+            let id = context.buffer_resource_by_handle(bmb.buffer);
+            print!("        buffer handle={:?} ", bmb.buffer);
+            if !id.is_null() {
+                print!(
+                    "(id={:?}, name={})",
+                    id,
+                    context.resources.get(id).unwrap().name
+                );
+            } else {
+                print!("(unknown resource)");
+            }
+            println!(
+                " access_mask:{:?}->{:?}",
+                bmb.src_access_mask, bmb.dst_access_mask
+            );
+        }
+
+        //println!("    output stage: {:?}", p.output_stage_mask);
+        if p.signal_queue_timelines {
+            println!("    semaphore signal: {:?}", p.snn);
         }
     }
 
-    for &dst_id in temporaries.iter() {
-        // SRC = the resource we want to alias with
-        // DST = the resource we are allocating
-        let dst = context.resources.get(dst_id).unwrap();
-        let dst_req = if let Some(req) = get_allocation_requirements(dst) { req } else { continue };
+    println!("Final resource states: ");
+    for &id in temporaries.iter() {
+        let resource = context.resources.get(id).unwrap();
+        println!("`{}`", resource.name);
+        println!("    stages={:?}", resource.tracking.stages);
+        println!("    avail={:?}", resource.tracking.availability_mask);
+        println!("    vis={:?}", resource.tracking.visibility_mask);
+        println!("    layout={:?}", resource.tracking.layout);
 
-        // try to find a suitable resource to alias with (the "source")
-        let mut aliased = false;
-        'alias: for (src_id, src) in context.resources.iter() {
-            if src_id == dst_id {
-                // don't alias with the same resource...
-                continue;
+        if resource.tracking.has_readers() {
+            println!("    readers: ");
+            if resource.tracking.readers[0] != 0 {
+                println!("        0:{}", resource.tracking.readers[0]);
             }
-
-            // skip if not aliasable
-            let _src_req  = if let Some(req) = get_allocation_requirements(src) { req } else { continue };
-
-            let mut alloc_state =
-                if let Some(alloc_state) = alloc_map.get_mut(src_id) {
-                    // skip if the resource is already dead, and its memory was already reused
-                    if alloc_state.dead_and_recycled {
-                        continue;
+            if resource.tracking.readers[1] != 0 {
+                println!("        1:{}", resource.tracking.readers[1]);
+            }
+            if resource.tracking.readers[2] != 0 {
+                println!("        2:{}", resource.tracking.readers[2]);
+            }
+            if resource.tracking.readers[3] != 0 {
+                println!("        3:{}", resource.tracking.readers[3]);
+            }
+        }
+        if resource.tracking.has_writer() {
+            println!("    writer: {:?}", resource.tracking.writer);
+        }
+        match resource.ownership {
+            ResourceOwnership::Referenced => {},
+            ResourceOwnership::Owned {
+                ref allocation, ..
+            } => {
+                match allocation {
+                    Some(ResourceAllocation::Default { allocation }) => {
+                        println!("    allocation: exclusive");
+                    },
+                    Some(ResourceAllocation::External { device_memory }) => {
+                        println!("    allocation: external, device memory {:016x}", device_memory.as_raw());
+                    },
+                    Some(ResourceAllocation::Transient { device_memory, offset }) => {
+                        println!("    allocation: transient, device memory {:016x}@{:016x}", device_memory.as_raw(), offset);
                     }
-                    alloc_state
-                } else {
-                    // skip if not allocated yet
-                    continue;
-                };
-
-            let src_first_access = src.tracking.first_access.serial();
-
-            // To re-use the memory of SRC in DST, SRC must be _dead_ before the first use of DST.
-            // A resource is dead from the point of view of a pass if this pass has an execution
-            // dependency on all last readers and writers of the resource.
-            for &reader in src.tracking.readers.iter() {
-                if reader != 0 &&
-                    (reader >= src_first_access
-                        || !reachability.is_reachable(
-                        local_pass_index(reader, base_serial),
-                        local_pass_index(src_first_access, base_serial))) {
-                    continue 'alias;
+                    None => {
+                        println!("    allocation: none (unallocated)");
+                    }
                 }
             }
-
-            let writer = src.tracking.writer.serial();
-            if writer != 0
-                && (writer >= src_first_access
-                || !reachability.is_reachable(local_pass_index(writer, base_serial), local_pass_index(src_first_access, base_serial)))
-            {
-                continue;
-            }
-
-            // if we reach here, then SRC is dead, and from a synchronization point of view
-            // the resources may alias. However, we now need to check that the allocation
-            // requirements of the two resources can be made compatible.
-            let dead_alloc = &mut requirements[alloc_state.index];
-            if !dead_alloc.try_adjust(&dst_req) {
-                // the memory requirements of the two resources cannot be made compatible
-                continue;
-            }
-
-            // success: the two resources may alias, and the memory requirements have been adjusted
-            // now update the allocation map
-            let index = alloc_state.index;
-            alloc_state.dead_and_recycled = true;
-            alloc_map.insert(
-                dst_id,
-                AllocIndex {
-                    index,
-                    dead_and_recycled: false,
-                },
-            );
-
-            aliased = true;
-            break;
-        }
-
-        if !aliased {
-            // we could not alias with any existing resource, so create a new allocation for the resource
-            let index = requirements.len();
-            requirements.push(dst_req);
-            alloc_map.insert(
-                dst_id,
-                AllocIndex {
-                    index,
-                    dead_and_recycled: false,
-                },
-            );
         }
     }
-
-    // now allocate device memory
-    let mut allocations = Vec::with_capacity(requirements.len());
-    let mut allocation_infos = Vec::with_capacity(requirements.len());
-
-    for alloc_req in requirements.iter() {
-        let allocation_create_info = vk_mem::AllocationCreateInfo {
-            ..Default::default()
-        };
-        let (allocation, allocation_info) = context
-            .device
-            .allocator
-            .allocate_memory(&alloc_req.mem_req, &allocation_create_info)
-            .expect("failed to allocate device memory");
-        allocations.push(allocation);
-        allocation_infos.push(allocation_info);
-    }
-
-    // and bind them to the resources
-    for (id, resource) in context.resources.iter()
-    {
-        if let Some(alloc_index) = alloc_map.get(id) {
-            let alloc_info = &allocation_infos[alloc_index.index];
-            match &resource.kind {
-                ResourceKind::Image(img) => unsafe {
-                    context.device.device
-                        .bind_image_memory(
-                            img.handle,
-                            alloc_info.get_device_memory(),
-                            alloc_info.get_offset() as u64,
-                        )
-                        .unwrap();
-                },
-                ResourceKind::Buffer(buf) => unsafe {
-                    context.device.device
-                        .bind_buffer_memory(
-                            buf.handle,
-                            alloc_info.get_device_memory(),
-                            alloc_info.get_offset() as u64,
-                        )
-                        .unwrap();
-                },
-            }
-        }
-    }
-
-    allocations
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -1039,51 +980,6 @@ impl<'a> Frame<'a> {
         inner.wait_init = inner.wait_init.join(future.serials);
     }
 
-    /// Creates a transient image.
-    pub fn create_transient_image(
-        &self,
-        name: &str,
-        memory_info: &ResourceMemoryInfo,
-        image_create_info: &ImageResourceCreateInfo,
-    ) -> ImageInfo {
-        let mut inner = self.inner.borrow_mut();
-        inner
-            .context
-            .create_image(name, memory_info, image_create_info, true)
-    }
-
-    /// Creates a transient buffer.
-    pub fn create_transient_buffer(
-        &self,
-        name: &str,
-        memory_info: &ResourceMemoryInfo,
-        buffer_create_info: &BufferResourceCreateInfo,
-    ) -> BufferInfo {
-        let mut inner = self.inner.borrow_mut();
-        inner
-            .context
-            .create_buffer(name, memory_info, buffer_create_info, true)
-    }
-
-    /// Creates a transient mapped buffer. The caller must ensure that `memory_info` describes
-    /// a mappable buffer (HOST_VISIBLE).
-    pub fn create_mapped_buffer(
-        &self,
-        name: &str,
-        memory_info: &ResourceMemoryInfo,
-        buffer_create_info: &BufferResourceCreateInfo,
-    ) -> BufferInfo {
-        assert!(memory_info
-            .required_flags
-            .contains(vk::MemoryPropertyFlags::HOST_VISIBLE));
-        let mut inner = self.inner.borrow_mut();
-        let buffer_info = inner
-            .context
-            .create_buffer(name, memory_info, buffer_create_info, true);
-        assert!(!buffer_info.mapped_ptr.is_null());
-        buffer_info
-    }
-
     pub fn add_graphics_pass(&self, name: &str, handler: impl FnOnce(&mut PassBuilder<'a, '_>)) {
         self.add_pass(name, PassType::Graphics, false, handler)
     }
@@ -1138,10 +1034,7 @@ impl<'a> Frame<'a> {
         handler: impl FnOnce(&mut PassBuilder<'a, '_>),
     ) {
         let mut inner = self.inner.borrow_mut();
-        // max 65K passes per frame, because of the implementation of automatic barriers
-        // TODO remove this limitation
         let frame_index = inner.passes.len();
-        assert!(frame_index <= u16::MAX as usize);
         let serial = inner.context.get_next_serial();
 
         let q = match ty {
@@ -1179,134 +1072,6 @@ impl<'a> Frame<'a> {
         }
 
         inner.push_pass(pass);
-    }
-
-    /// Uploads the given object to a transient buffer with the given usage flags and returns the
-    /// created buffer resource.
-    pub fn upload<T: Copy>(
-        &self,
-        usage: vk::BufferUsageFlags,
-        data: &T,
-        name: Option<&str>,
-    ) -> TypedBufferInfo<T> {
-        let byte_size = mem::size_of::<T>();
-        let BufferInfo {
-            id,
-            handle,
-            mapped_ptr,
-        } = self.create_upload_buffer(usage, byte_size, name);
-        unsafe {
-            ptr::write(mapped_ptr as *mut T, *data);
-        }
-        TypedBufferInfo {
-            id,
-            handle,
-            mapped_ptr: mapped_ptr as *mut T,
-        }
-    }
-
-    /// Uploads the given slice to a transient buffer with the given usage flags and returns the created buffer resource.
-    ///
-    /// Example:
-    /// ```
-    /// let vertices : [[f32;2];3] = [[0.0,0.0],[0.0,1.0],[1.0,1.0]];
-    /// batch.upload_slice(graal::vk::BufferUsageFlags::VERTEX_BUFFER, &vertices, "vertices");
-    /// ```
-    pub fn upload_slice<T: Copy>(
-        &self,
-        usage: vk::BufferUsageFlags,
-        data: &[T],
-        name: Option<&str>,
-    ) -> TypedBufferInfo<T> {
-        let byte_size = mem::size_of_val(data);
-        let BufferInfo {
-            id,
-            handle,
-            mapped_ptr,
-        } = self.create_upload_buffer(usage, byte_size, name);
-
-        unsafe {
-            ptr::copy_nonoverlapping(data.as_ptr(), mapped_ptr as *mut T, data.len());
-        }
-
-        TypedBufferInfo {
-            id,
-            handle,
-            mapped_ptr: mapped_ptr as *mut T,
-        }
-    }
-
-    /// Allocates a buffer to hold a value of type `T` and returns a reference to the uninitialized
-    /// value inside the buffer.
-    ///
-    /// Example:
-    /// ```
-    /// let (buf, val) = batch.alloc_upload::<[f32;4]>(graal::vk::BufferUsageFlags::UNIFORM_BUFFER, None);
-    /// unsafe { val.as_mut_ptr().write(Default::default()); }
-    /// ```
-    pub fn alloc_upload<T: Copy>(
-        &self,
-        usage: vk::BufferUsageFlags,
-        name: Option<&str>,
-    ) -> TypedBufferInfo<T> {
-        let byte_size = mem::size_of::<T>();
-        let BufferInfo {
-            id,
-            handle,
-            mapped_ptr,
-        } = self.create_upload_buffer(usage, byte_size, name);
-
-        TypedBufferInfo {
-            id,
-            handle,
-            mapped_ptr: mapped_ptr as *mut T,
-        }
-    }
-
-    /// Allocates a buffer to hold `size` values of type `T` and returns the slice of the uninitialized
-    /// values inside the buffer.
-    ///
-    /// Example:
-    /// ```
-    /// let (buf, val) = batch.alloc_upload::<[f32;4]>(graal::vk::BufferUsageFlags::UNIFORM_BUFFER, None);
-    /// unsafe { val.as_mut_ptr().write(Default::default()); }
-    /// ```
-    pub fn alloc_upload_slice<T: Copy>(
-        &self,
-        usage: vk::BufferUsageFlags,
-        size: usize,
-        name: Option<&str>,
-    ) -> TypedBufferInfo<T> {
-        let byte_size = mem::size_of::<T>() * size;
-        let BufferInfo {
-            id,
-            handle,
-            mapped_ptr,
-        } = self.create_upload_buffer(usage, byte_size, name);
-        TypedBufferInfo {
-            id,
-            handle,
-            mapped_ptr: mapped_ptr as *mut T,
-        }
-    }
-
-    /// Creates a transient buffer mapped in host-coherent memory.
-    fn create_upload_buffer(
-        &self,
-        usage: vk::BufferUsageFlags,
-        byte_size: usize,
-        name: Option<&str>,
-    ) -> BufferInfo {
-        self.inner.borrow_mut().context.create_buffer(
-            name.unwrap_or("upload buffer"),
-            &ResourceMemoryInfo::HOST_VISIBLE_COHERENT,
-            &BufferResourceCreateInfo {
-                usage,
-                byte_size: byte_size as u64,
-                map_on_create: true,
-            },
-            true,
-        )
     }
 
     /// Dumps the frame to a JSON object.
@@ -1445,6 +1210,8 @@ impl<'a> Frame<'a> {
         serde_json::to_writer_pretty(file, &frame_json).unwrap();
     }
 
+
+
     /// Finishes building the frame and submits all the passes to the command queues.
     pub fn finish(self) -> GpuFuture {
         // end build span
@@ -1453,99 +1220,6 @@ impl<'a> Frame<'a> {
         let mut inner = self.inner.into_inner();
         let context = inner.context;
 
-        /*println!("Passes:");
-        for p in inner.passes.iter() {
-            println!("- `{}` ({:?})", p.name, p.snn);
-            if p.wait_before {
-                println!("    semaphore wait:");
-                if p.wait_serials[0] != 0 {
-                    println!("        0:{}|{:?}", p.wait_serials[0], p.wait_dst_stages[0]);
-                }
-                if p.wait_serials[1] != 0 {
-                    println!("        1:{}|{:?}", p.wait_serials[1], p.wait_dst_stages[1]);
-                }
-                if p.wait_serials[2] != 0 {
-                    println!("        2:{}|{:?}", p.wait_serials[2], p.wait_dst_stages[2]);
-                }
-                if p.wait_serials[3] != 0 {
-                    println!("        3:{}|{:?}", p.wait_serials[3], p.wait_dst_stages[3]);
-                }
-            }
-            println!(
-                "    input execution barrier: {:?}->{:?}",
-                p.pre_execution_barrier.src_stage_mask, p.pre_execution_barrier.dst_stage_mask
-            );
-            println!("    input memory barriers:");
-            for imb in p.pre_execution_barrier.image_memory_barriers.iter() {
-                let id = context.image_resource_by_handle(imb.image);
-                print!("        image handle={:?} ", imb.image);
-                if !id.is_null() {
-                    print!(
-                        "(id={:?}, name={})",
-                        id,
-                        context.resources.get(id).unwrap().name
-                    );
-                } else {
-                    print!("(unknown resource)");
-                }
-                println!(
-                    " access_mask:{:?}->{:?} layout:{:?}->{:?}",
-                    imb.src_access_mask, imb.dst_access_mask, imb.old_layout, imb.new_layout
-                );
-            }
-            for bmb in p.pre_execution_barrier.buffer_memory_barriers.iter() {
-                let id = context.buffer_resource_by_handle(bmb.buffer);
-                print!("        buffer handle={:?} ", bmb.buffer);
-                if !id.is_null() {
-                    print!(
-                        "(id={:?}, name={})",
-                        id,
-                        context.resources.get(id).unwrap().name
-                    );
-                } else {
-                    print!("(unknown resource)");
-                }
-                println!(
-                    " access_mask:{:?}->{:?}",
-                    bmb.src_access_mask, bmb.dst_access_mask
-                );
-            }
-
-            //println!("    output stage: {:?}", p.output_stage_mask);
-            if p.signal_after {
-                println!("    semaphore signal: {:?}", p.snn);
-            }
-        }
-
-        println!("Final resource states: ");
-        for &id in inner.temporaries.iter() {
-            let resource = context.resources.get(id).unwrap();
-            println!("`{}`", resource.name);
-            println!("    stages={:?}", resource.tracking.stages);
-            println!("    avail={:?}", resource.tracking.availability_mask);
-            println!("    vis={:?}", resource.tracking.visibility_mask);
-            println!("    layout={:?}", resource.tracking.layout);
-
-            if resource.tracking.has_readers() {
-                println!("    readers: ");
-                if resource.tracking.readers[0] != 0 {
-                    println!("        0:{}", resource.tracking.readers[0]);
-                }
-                if resource.tracking.readers[1] != 0 {
-                    println!("        1:{}", resource.tracking.readers[1]);
-                }
-                if resource.tracking.readers[2] != 0 {
-                    println!("        2:{}", resource.tracking.readers[2]);
-                }
-                if resource.tracking.readers[3] != 0 {
-                    println!("        3:{}", resource.tracking.readers[3]);
-                }
-            }
-            if resource.tracking.has_writer() {
-                println!("    writer: {:?}", resource.tracking.writer);
-            }
-        }*/
-
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the frames that are not in use anymore.
         context.wait_for_frames_in_flight();
@@ -1553,11 +1227,14 @@ impl<'a> Frame<'a> {
         // Allocate and assign memory for all transient resources of this frame.
         let transient_allocations = allocate_memory_for_transients(context, inner.base_serial, &inner.passes, &inner.temporaries);
 
+
         // All resources now have a block of device memory assigned. We're ready to
         // build the command buffers and submit them to the device queues.
         let submission_result = context.submit_frame(&mut inner.passes, inner.wait_init);
 
         let serials = submission_result.signalled_serials;
+
+        print_frame_info(context, &inner.passes, &inner.temporaries);
 
         // Add this frame to the list of "frames in flight": frames that might be executing on the device.
         // When this frame is completed, all resources of the frame will be automatically recycled.

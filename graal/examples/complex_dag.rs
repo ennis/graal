@@ -17,50 +17,6 @@ use winit::{
     window::WindowBuilder,
 };
 
-static BACKGROUND_SHADER_VERT: &[u32] = include_spirv!("shaders/background.vert", vert);
-static BACKGROUND_SHADER_FRAG: &[u32] = include_spirv!("shaders/background.frag", frag);
-
-#[derive(Copy, Clone, Debug)]
-#[repr(C)]
-struct BackgroundUniforms {
-    u_resolution: [f32; 2],
-    u_scroll_offset: [f32; 2],
-    u_zoom: f32,
-}
-
-#[derive(Copy, Clone, Debug)]
-#[repr(C)]
-struct BlurUniforms {}
-
-#[derive(graal::DescriptorSetInterface)]
-#[repr(C)]
-struct BackgroundShaderInterface {
-    #[layout(binding = 0, uniform_buffer, stages(fragment))]
-    uniforms: BufferDescriptor<BackgroundUniforms>,
-}
-
-#[derive(Copy, Clone, Debug, VertexData)]
-#[repr(C)]
-struct Vertex {
-    position: [f32; 2],
-    texcoords: [Norm<u16>; 2],
-}
-
-impl Vertex {
-    pub fn new(position: [f32; 2], texcoords: [f32; 2]) -> Vertex {
-        Vertex {
-            position,
-            texcoords: [texcoords[0].into(), texcoords[1].into()],
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug, VertexInputInterface)]
-struct VertexInput {
-    #[layout(binding = 0, location = 0, per_vertex)]
-    vertices: VertexBufferView<Vertex>,
-}
-
 /// Creates a render pass with a single subpass, writing to a single color target with the specified
 /// format.
 fn create_single_color_target_render_pass(
@@ -116,14 +72,6 @@ fn create_single_color_target_render_pass(
     };
 
     render_pass
-}
-
-struct BlurPass {
-    pipeline: vk::Pipeline,
-    pipeline_layout: vk::PipelineLayout,
-    layout_handle: vk::DescriptorSetLayout,
-    update_template: vk::DescriptorUpdateTemplate,
-    render_pass: vk::RenderPass,
 }
 
 struct BackgroundPass {
@@ -347,175 +295,10 @@ impl BackgroundPass {
             render_pass,
         }
     }
-
-    pub fn run(
-        &self,
-        frame: &graal::Frame,
-        target: graal::ImageInfo,
-        target_format: vk::Format,
-        target_size: (u32, u32),
-    ) {
-        let (left, top, right, bottom) = (-1.0, -1.0, 1.0, 1.0);
-
-        let vertices = &[
-            Vertex::new([left, top], [0.0, 0.0]),
-            Vertex::new([right, top], [1.0, 0.0]),
-            Vertex::new([left, bottom], [0.0, 1.0]),
-            Vertex::new([left, bottom], [0.0, 1.0]),
-            Vertex::new([right, top], [1.0, 0.0]),
-            Vertex::new([right, bottom], [1.0, 1.0]),
-        ];
-
-        let vbo = frame.upload_slice(
-            vk::BufferUsageFlags::VERTEX_BUFFER,
-            vertices,
-            Some("background vertices"),
-        );
-        let ubo = frame.upload(
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            &BackgroundUniforms {
-                u_resolution: [target_size.0 as f32, target_size.1 as f32],
-                u_scroll_offset: [0.0, 0.0],
-                u_zoom: 1.0,
-            },
-            Some("background uniforms"),
-        );
-
-        // what's left:
-        let render_pass = self.render_pass;
-        let pipeline_layout = self.pipeline_layout;
-        let pipeline = self.pipeline;
-
-        frame.add_graphics_pass("background render", |pass| {
-            // access uniforms buffer as SHADER_READ, vertex and fragment stages
-
-            //dbg!(ubo);
-            pass.register_buffer_access_2(
-                ubo.id,
-                vk::AccessFlags::SHADER_READ,
-                vk::PipelineStageFlags::VERTEX_SHADER | vk::PipelineStageFlags::FRAGMENT_SHADER,
-            );
-
-            // access quad VBO as vertex input
-            pass.register_buffer_access_2(
-                vbo.id,
-                vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
-                vk::PipelineStageFlags::VERTEX_INPUT,
-            );
-
-            // write to the target image as a color attachment
-            pass.register_image_access_2(
-                target.id,
-                vk::AccessFlags::COLOR_ATTACHMENT_WRITE,
-                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-            );
-
-            pass.set_commands(move |context, cb| {
-                unsafe {
-                    let descriptor_set = unsafe {
-                        context.create_descriptor_set(&BackgroundShaderInterface {
-                            uniforms: ubo.into(),
-                        })
-                    };
-
-                    let output_view = unsafe {
-                        context.create_image_view(&vk::ImageViewCreateInfo {
-                            flags: vk::ImageViewCreateFlags::empty(),
-                            image: target.handle,
-                            view_type: vk::ImageViewType::TYPE_2D,
-                            format: vk::Format::B8G8R8A8_SRGB,
-                            components: vk::ComponentMapping::default(),
-                            subresource_range: vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                base_mip_level: 0,
-                                level_count: vk::REMAINING_MIP_LEVELS,
-                                base_array_layer: 0,
-                                layer_count: vk::REMAINING_ARRAY_LAYERS,
-                            },
-                            ..Default::default()
-                        })
-                    };
-
-                    let framebuffer = unsafe {
-                        context.create_framebuffer(
-                            target_size.0,
-                            target_size.1,
-                            1,
-                            render_pass,
-                            &[output_view],
-                        )
-                    };
-
-                    let render_pass_begin_info = vk::RenderPassBeginInfo {
-                        render_pass,
-                        framebuffer,
-                        render_area: vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: vk::Extent2D {
-                                width: target_size.0, // FIXME: size
-                                height: target_size.1,
-                            },
-                        },
-                        clear_value_count: 0,
-                        p_clear_values: ptr::null(),
-                        ..Default::default()
-                    };
-                    context.vulkan_device().cmd_begin_render_pass(
-                        cb,
-                        &render_pass_begin_info,
-                        vk::SubpassContents::INLINE,
-                    );
-                    context
-                        .vulkan_device()
-                        .cmd_bind_vertex_buffers(cb, 0, &[vbo.handle], &[0]);
-                    context.vulkan_device().cmd_bind_descriptor_sets(
-                        cb,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        pipeline_layout,
-                        0,
-                        &[descriptor_set],
-                        &[],
-                    );
-                    context.vulkan_device().cmd_set_viewport(
-                        cb,
-                        0,
-                        &[vk::Viewport {
-                            x: 0.0,
-                            y: 0.0,
-                            width: 1024.0,
-                            height: 768.0,
-                            min_depth: 0.0,
-                            max_depth: 1.0,
-                        }],
-                    );
-                    context.vulkan_device().cmd_set_scissor(
-                        cb,
-                        0,
-                        &[vk::Rect2D {
-                            offset: Default::default(),
-                            extent: vk::Extent2D {
-                                width: 1024,
-                                height: 768,
-                            },
-                        }],
-                    );
-                    context.vulkan_device().cmd_bind_pipeline(
-                        cb,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        pipeline,
-                    );
-                    context.vulkan_device().cmd_draw(cb, 6, 1, 0, 0);
-                    context.vulkan_device().cmd_end_render_pass(cb);
-                }
-            });
-        });
-    }
 }
 
 fn load_image(
-    batch: &graal::Frame,
+    frame: &graal::Frame,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
     mipmaps: bool,
@@ -564,7 +347,7 @@ fn load_image(
     let ImageInfo {
         handle: image_handle,
         id: image_id,
-    } = batch.context().create_image(
+    } = frame.context().create_image(
         path.to_str().unwrap(),
         &ResourceMemoryInfo::DEVICE_LOCAL,
         &ImageResourceCreateInfo {
@@ -581,13 +364,12 @@ fn load_image(
             samples: 1,
             tiling: Default::default(),
         },
-        false,
     );
 
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = batch.alloc_upload_slice::<u8>(
+    let mut staging_buffer = frame.alloc_upload_slice::<u8>(
         vk::BufferUsageFlags::TRANSFER_SRC,
         byte_size as usize,
         Some("staging"),
@@ -610,7 +392,7 @@ fn load_image(
     let staging_buffer_handle = staging_buffer.handle;
 
     // build the upload pass
-    batch.add_graphics_pass("image upload", |pass| {
+    frame.add_graphics_pass("image upload", |pass| {
         pass.register_image_access_2(
             image_id,
             vk::AccessFlags::TRANSFER_WRITE,
@@ -685,7 +467,6 @@ fn create_transient_image(context: &mut graal::Context, name: &str, is_depth: bo
             samples: 1,
             tiling: graal::vk::ImageTiling::OPTIMAL,
         },
-        true,
     );
     id
 }
@@ -736,7 +517,6 @@ fn load_mesh(batch: &graal::Frame, obj_file_path: &Path) -> MeshData {
             byte_size,
             map_on_create: false,
         },
-        false,
     );
 
     // staging
@@ -903,23 +683,6 @@ fn main() {
     let device = graal::Device::new(Some(surface));
     let mut context = graal::Context::with_device(device);
     let swapchain = unsafe { context.create_swapchain(surface, window.inner_size().into()) };
-
-    let mut init_frame = context.start_frame(FrameCreateInfo {
-        collect_debug_info: true,
-        .. Default::default()
-    });
-    let (file_image_id, file_image_width, file_image_height) = load_image(
-        &init_frame,
-        "data/haniyasushin_keiki.jpg".as_ref(),
-        vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
-        false,
-    );
-    let mesh = load_mesh(&init_frame, "data/sphere.obj".as_ref());
-    init_frame.dump(Some("init_frame"));
-    init_frame.finish();
-
-    let bkgpp = BackgroundPass::new(&mut context);
-
     let mut swapchain_size = window.inner_size().into();
 
     event_loop.run(move |event, _, control_flow| {
@@ -955,24 +718,10 @@ fn main() {
                 let img_k = create_transient_image(&mut context, "K", false);
                 let img_depth = create_transient_image(&mut context, "depth", true);
 
-                // each resource has a ref count
-                // - incremented when it's in use by a batch
-                // - incremented by the user
-                // non-transient resources are deleted once refcount is zero
-                // transient resources are deleted once the batch is finished, regardless of refcounts
-
-                let swapchain_image = unsafe { context.acquire_next_image(swapchain.id) };
                 let mut frame = context.start_frame(FrameCreateInfo {
                     collect_debug_info: false,
                     .. Default::default()
                 });
-
-                bkgpp.run(
-                    &frame,
-                    swapchain_image.image_info,
-                    vk::Format::B8G8R8A8_SRGB,
-                    swapchain_size,
-                );
 
                 test_pass(&frame, "P0", &[color_attachment_output(img_a)]);
                 test_pass(&frame, "P1", &[color_attachment_output(img_b)]);
@@ -1029,77 +778,7 @@ fn main() {
                     &[color_attachment_output(swapchain_image.image_info.id)],
                 );
 
-                // blit pass
-                frame.add_graphics_pass("blit to screen", |pass| {
-                    pass.register_image_access_2(
-                        file_image_id,
-                        vk::AccessFlags::TRANSFER_READ,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    );
-                    pass.register_image_access_2(
-                        swapchain_image.image_info.id,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    );
-
-                    let blit_w = file_image_width.min(swapchain_size.0);
-                    let blit_h = file_image_height.min(swapchain_size.1);
-
-                    pass.set_commands(move |context, command_buffer| {
-                        let dst_image_handle = context.image_handle(swapchain_image.image_info.id);
-                        let src_image_handle = context.image_handle(file_image_id);
-
-                        let regions = &[vk::ImageBlit {
-                            src_subresource: vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                mip_level: 0,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            },
-                            src_offsets: [
-                                vk::Offset3D { x: 0, y: 0, z: 0 },
-                                vk::Offset3D {
-                                    x: blit_w as i32,
-                                    y: blit_h as i32,
-                                    z: 1,
-                                },
-                            ],
-                            dst_subresource: vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                mip_level: 0,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            },
-                            dst_offsets: [
-                                vk::Offset3D { x: 0, y: 0, z: 0 },
-                                vk::Offset3D {
-                                    x: blit_w as i32,
-                                    y: blit_h as i32,
-                                    z: 1,
-                                },
-                            ],
-                        }];
-
-                        unsafe {
-                            context.vulkan_device().cmd_blit_image(
-                                command_buffer,
-                                src_image_handle,
-                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                                dst_image_handle,
-                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                regions,
-                                vk::Filter::NEAREST,
-                            );
-                        }
-                    });
-                });
-
                 frame.present("P12", &swapchain_image);
-                //frame.dump(Some("frame"));
                 frame.finish();
             }
             _ => (),

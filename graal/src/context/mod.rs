@@ -1,7 +1,7 @@
 use std::{collections::{HashMap, VecDeque}, ffi::CString, fmt, os::raw::c_void, mem, ptr};
 
 use ash::{version::DeviceV1_0, vk};
-use slotmap::{Key, SlotMap, SecondaryMap};
+use slotmap::{Key, SlotMap};
 
 use crate::{
     context::{
@@ -9,7 +9,6 @@ use crate::{
         submission::CommandAllocator,
     },
     device::Device,
-    swapchain::Swapchain,
     DescriptorSetLayoutInfo, FragmentOutputInterface, FragmentOutputInterfaceExt,
     MAX_QUEUES,
 };
@@ -19,16 +18,14 @@ use tracing::{trace, trace_span};
 pub(crate) mod descriptor;
 pub(crate) mod frame;
 pub(crate) mod pass;
-pub(crate) mod resource;
 pub(crate) mod submission;
-mod sync_table;
+pub(crate) mod transient;
 
 pub use descriptor::DescriptorSetAllocatorId;
 pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
 use std::ops::{Deref, DerefMut};
 pub use submission::CommandContext;
-use fixedbitset::FixedBitSet;
-use crate::context::pass::{Pass, SemaphoreWait};
+use crate::context::pass::SemaphoreWait;
 use crate::ash::vk::Handle;
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
@@ -165,6 +162,12 @@ impl PartialOrd for QueueSerialNumbers {
             (false, false) => None,
         }
     }
+}
+
+/// TODO document
+fn local_pass_index(serial: u64, frame_base_serial: u64) -> usize {
+    assert!(serial > frame_base_serial);
+    (serial - frame_base_serial - 1) as usize
 }
 
 pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
@@ -508,16 +511,17 @@ pub struct AllocationRequirements {
 }
 
 impl AllocationRequirements {
-    pub(crate) fn try_adjust(&mut self, other: &AllocationRequirements) -> bool {
+    fn adjusted_requirements(&self, other: &AllocationRequirements) -> Option<AllocationRequirements> {
         if self.required_flags != other.required_flags {
-            return false;
+            return None;
         }
         if self.mem_req.memory_type_bits != other.mem_req.memory_type_bits {
-            return false;
+            return None;
         }
-        self.mem_req.alignment = self.mem_req.alignment.max(other.mem_req.alignment);
-        self.mem_req.size = self.mem_req.size.max(other.mem_req.size);
-        true
+        let mut adjusted = *self;
+        adjusted.mem_req.alignment = adjusted.mem_req.alignment.max(other.mem_req.alignment);
+        adjusted.mem_req.size = adjusted.mem_req.size.max(other.mem_req.size);
+        Some(adjusted)
     }
 }
 
@@ -622,7 +626,10 @@ pub enum ResourceAllocation {
 
     /// Memory aliasing: allocate a block of memory for the resource, which can possibly be shared
     /// with other aliasable resources if their lifetimes do not overlap.
-    Transient,
+    Transient {
+        device_memory: vk::DeviceMemory,
+        offset: vk::DeviceSize
+    },
 
     /// The memory for this resource was imported or exported from/to an external handle.
     External { device_memory: vk::DeviceMemory },
@@ -681,6 +688,20 @@ impl Resource {
         match &mut self.kind {
             ResourceKind::Buffer(r) => r,
             _ => panic!("expected a buffer resource"),
+        }
+    }
+
+    /// Sets the resource allocation for resources with delayed allocations.
+    fn set_allocation(&mut self, alloc: ResourceAllocation) {
+        // set the allocation type on the resource object
+        match self.ownership {
+            ResourceOwnership::Owned {
+                ref mut allocation, ..
+            } => {
+                assert!(allocation.is_none());
+                *allocation = Some(alloc)
+            },
+            _ => panic!("trying to set an allocation on an unowned object")
         }
     }
 }
@@ -777,42 +798,6 @@ pub struct ImageInfo {
     pub handle: vk::Image,
 }
 
-// --- Reachability matrix -------------------------------------------------------------------------
-struct Reachability {
-    m: Vec<FixedBitSet>,
-}
-
-impl Reachability {
-    fn is_reachable(&self, from: usize, to: usize) -> bool {
-        self.m[to][from]
-    }
-}
-
-fn disjoint_index_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
-    assert!(a != b && a < v.len() && b < v.len());
-    unsafe {
-        (
-            &mut *(v.get_unchecked_mut(a) as *mut _),
-            &mut *(v.get_unchecked_mut(b) as *mut _),
-        )
-    }
-}
-
-fn compute_reachability(passes: &[Pass]) -> Reachability {
-    let len = passes.len();
-    let mut m = Vec::new();
-    m.resize_with(passes.len(), || FixedBitSet::with_capacity(len));
-
-    for i in 0..len {
-        for &p in passes[i].preds.iter() {
-            m[i].set(p, true);
-            let (mi, mp) = disjoint_index_mut(&mut m, i, p);
-            *mi |= &*mp;
-        }
-    }
-
-    Reachability { m }
-}
 // ---------------------------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
@@ -928,7 +913,6 @@ impl Context {
         name: &str,
         memory_info: &ResourceMemoryInfo,
         image_info: &ImageResourceCreateInfo,
-        transient: bool,
     ) -> ImageInfo {
         // for now all resources are CONCURRENT, because that's the only way they can
         // be read across multiple queues.
@@ -956,36 +940,6 @@ impl Context {
                 .expect("failed to create image")
         };
         let mem_req = unsafe { self.device.device.get_image_memory_requirements(handle) };
-        /*let memory = if transient {
-            // transient memory
-            ResourceMemory::Aliasable(AllocationRequirements {
-                mem_req,
-                required_flags: memory_info.required_flags,
-                preferred_flags: memory_info.preferred_flags,
-            })
-        } else {
-            let allocation_create_info = vk_mem::AllocationCreateInfo {
-                preferred_flags: memory_info.preferred_flags,
-                required_flags: memory_info.required_flags,
-                ..Default::default()
-            };
-            let (alloc, alloc_info) = self
-                .device
-                .allocator
-                .allocate_memory(&mem_req, &allocation_create_info)
-                .expect("failed to allocate device memory");
-            unsafe {
-                self.device
-                    .device
-                    .bind_image_memory(
-                        handle,
-                        alloc_info.get_device_memory(),
-                        alloc_info.get_offset() as u64,
-                    )
-                    .unwrap();
-            }
-            ResourceMemory::Exclusive(alloc)
-        };*/
         // register the resource in the context
         let id = unsafe {
             self.register_image_resource(ImageRegistrationInfo {
@@ -1009,13 +963,15 @@ impl Context {
         ImageInfo { id, handle }
     }
 
+    /// Creates a new buffer resource.
     pub fn create_buffer(
         &mut self,
         name: &str,
         memory_info: &ResourceMemoryInfo,
         buffer_create_info: &BufferResourceCreateInfo,
-        transient: bool,
     ) -> BufferInfo {
+
+        // create the buffer object first
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
             size: buffer_create_info.byte_size,
@@ -1035,6 +991,8 @@ impl Context {
                 .create_buffer(&create_info, None)
                 .expect("failed to create buffer")
         };
+
+        // get its memory requirements
         let mem_req = unsafe { self.device.device.get_buffer_memory_requirements(handle) };
 
         let (ownership, mapped_ptr) = if !buffer_create_info.map_on_create {
@@ -1060,7 +1018,7 @@ impl Context {
                 required_flags: memory_info.required_flags,
                 ..Default::default()
             };
-            let (alloc, alloc_info) = self
+            let (allocation, alloc_info) = self
                 .device
                 .allocator
                 .allocate_memory(&mem_req, &allocation_create_info)
@@ -1081,7 +1039,9 @@ impl Context {
                     required_flags: memory_info.required_flags,
                     preferred_flags: memory_info.preferred_flags
                 },
-                allocation: None
+                allocation: Some(ResourceAllocation::Default {
+                    allocation
+                })
             };
             let mapped_ptr = if buffer_create_info.map_on_create {
                 let ptr = alloc_info.get_mapped_data();

@@ -40,6 +40,8 @@ winit = "0.24.0"
 obj = "0.10.2"
 inline-spirv = "0.1.2"
 openimageio = { path = "../../openimageio-rs" }
+tracing-subscriber = { version = "0.2.17", features = ["fmt"] }
+
 
 [build-dependencies]
 shaderc = "0.7.1"
