@@ -1,28 +1,24 @@
-use std::{collections::{HashMap, VecDeque}, ffi::CString, fmt, os::raw::c_void, mem, ptr};
+use std::{collections::VecDeque, ffi::CString, fmt, os::raw::c_void, mem, ptr};
 
 use ash::{version::DeviceV1_0, vk};
 use slotmap::{Key, SlotMap};
 
 use crate::{
     context::{
-        descriptor::{DescriptorSet, DescriptorSetAllocator},
         submission::CommandAllocator,
     },
     device::Device,
-    DescriptorSetLayoutInfo, FragmentOutputInterface, FragmentOutputInterfaceExt,
     MAX_QUEUES,
 };
 use std::cmp::Ordering;
 use tracing::{trace, trace_span};
 
-pub(crate) mod descriptor;
 pub(crate) mod frame;
 pub(crate) mod pass;
 pub(crate) mod submission;
 pub(crate) mod transient;
 
-pub use descriptor::DescriptorSetAllocatorId;
-pub use frame::{AccessType, AccessTypeInfo, Frame, PassBuilder};
+pub use frame::{Frame, PassBuilder};
 use std::ops::{Deref, DerefMut};
 pub use submission::CommandContext;
 use crate::context::pass::SemaphoreWait;
@@ -1070,13 +1066,6 @@ impl Context {
     }
 }
 
-slotmap::new_key_type! {
-    pub struct RenderPassId;
-    pub struct PipelineLayoutId;
-}
-
-type RenderPassMap = SlotMap<RenderPassId, vk::RenderPass>;
-//type PipelineLayoutMap = SlotMap<PipelineLayoutId, vk::PipelineLayout>;
 
 /// Stores the set of resources owned by a currently executing frame.
 #[derive(Debug)]
@@ -1084,11 +1073,6 @@ struct FrameInFlight {
     signalled_serials: QueueSerialNumbers,
     transient_allocations: Vec<vk_mem::Allocation>,
     command_pools: Vec<CommandAllocator>,
-    /// Image views allocated for this frame.
-    image_views: Vec<vk::ImageView>,
-    /// Framebuffers allocated for this frame.
-    framebuffers: Vec<vk::Framebuffer>,
-    descriptor_sets: Vec<DescriptorSet>,
     semaphores: Vec<vk::Semaphore>,
 }
 
@@ -1122,42 +1106,37 @@ impl GpuFuture {
     }
 }
 
-/// Represents the
+/// Graphics context
 pub struct Context {
     pub(crate) device: Device,
 
-    // --- Submission --------------------------------
-    /// Timeline semaphores for each queue, used for cross-queue synchronization
+    /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
     timelines: [vk::Semaphore; MAX_QUEUES],
+
     /// Array containing the last submitted pass serials for each queue
     last_signalled_serials: QueueSerialNumbers,
+
     /// Pool of recycled command pools.
     available_command_pools: Vec<CommandAllocator>,
 
-    // --- Descriptors --------------------------------
-    set_allocators: SlotMap<DescriptorSetAllocatorId, DescriptorSetAllocator>,
-    cache: HashMap<DescriptorSetLayoutInfo, DescriptorSetAllocatorId>,
-
-    // --- Resources --------------------------------
     /// Free semaphores guaranteed to be in the unsignalled state.
     semaphore_pool: Vec<vk::Semaphore>,
+
+    /// Resources (images and buffers), mapped by ID
     resources: ResourceMap,
 
     /// The serial to be used for the next pass (used by `Frame`)
     next_serial: u64,
+
     /// Array containing the last completed pass serials for each queue
     completed_serials: QueueSerialNumbers,
+
     /// Number of submitted frames
     submitted_frame_count: u64,
+
     /// Number of completed frames
     completed_frame_count: u64,
 
-    /// ID-mapped render passes. These are used mostly to store the render passes for
-    /// fragment output interface types, but still be able to delete the objects when the context
-    /// is dropped.
-    render_passes: RenderPassMap,
-    /// ID-mapped pipeline layout associated to `PipelineInterface` types.
-    //pipeline_layouts: PipelineLayoutMap,
     /// Frames that are currently executing on the GPU.
     in_flight: VecDeque<FrameInFlight>,
 }
@@ -1203,16 +1182,12 @@ impl Context {
             timelines,
             last_signalled_serials: Default::default(),
             available_command_pools: vec![],
-            set_allocators: Default::default(),
             completed_serials: Default::default(),
             next_serial: 0,
             submitted_frame_count: 0,
             completed_frame_count: 0,
             resources: SlotMap::with_key(),
-            render_passes: SlotMap::with_key(),
-            //pipeline_layouts: SlotMap::with_key(),
             in_flight: VecDeque::new(),
-            cache: Default::default(),
             semaphore_pool: vec![],
         }
     }
@@ -1330,25 +1305,6 @@ impl Context {
             // waited on them.
             self.recycle_semaphores(f.semaphores);
 
-            // We can recycle the memory allocated for descriptor sets.
-            unsafe {
-                self.recycle_descriptor_sets(f.descriptor_sets);
-            }
-
-            // Destroy all other frame-bound objects (framebuffers, image views, descriptor sets)
-            for fb in f.framebuffers {
-                trace!(?fb, "destroy_framebuffer");
-                unsafe {
-                    self.device.device.destroy_framebuffer(fb, None);
-                }
-            }
-            for img in f.image_views {
-                trace!(?img, "destroy_image_view");
-                unsafe {
-                    self.device.device.destroy_image_view(img, None);
-                }
-            }
-
             // free transient allocations
             for alloc in f.transient_allocations.iter() {
                 trace!(?alloc, "free_memory");
@@ -1400,18 +1356,6 @@ impl Context {
 
     pub fn current_frame_index(&self) -> u64 {
         self.submitted_frame_count
-    }
-
-    /// Gets or creates the associated render pass object for the specified fragment output interface type.
-    pub fn get_or_create_render_pass_from_interface<T: FragmentOutputInterface>(
-        &mut self,
-    ) -> vk::RenderPass {
-        let id = T::get_or_init_render_pass(|| {
-            let render_pass = T::create_render_pass(self);
-            self.render_passes.insert(render_pass)
-        });
-
-        *self.render_passes.get(id).unwrap()
     }
 
     pub fn wait_for(&mut self, future: GpuFuture) {

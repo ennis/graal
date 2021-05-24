@@ -1,11 +1,3 @@
-use crate::{
-    ash::version::DeviceV1_0,
-    context::{CommandContext, RenderPassId},
-    vk,
-    vk::RenderPass,
-    Context, Frame,
-};
-
 /// Types that describe a fragment output interface (a set of images that act as attachments).
 /// They contain the images that should be bound as attachments and metadata to create
 /// a compatible single-subpass render pass.

@@ -1,4 +1,3 @@
-use crate::{DescriptorSetAllocatorId, TypedBufferInfo};
 use ash::vk;
 use graal_spirv as spirv;
 use std::{collections::BTreeMap, marker::PhantomData};
@@ -125,8 +124,8 @@ unsafe impl<T: DescriptorSource, const N: usize> DescriptorSource for [T; N] {
 #[repr(transparent)]
 #[derive(Copy, Clone, Debug)]
 pub struct BufferDescriptor<T> {
-    pub(crate) descriptor: vk::DescriptorBufferInfo,
-    pub(crate) _phantom: PhantomData<*const T>,
+    pub descriptor: vk::DescriptorBufferInfo,
+    pub _phantom: PhantomData<*const T>,
 }
 
 unsafe impl<T> DescriptorSource for BufferDescriptor<T> {
@@ -178,7 +177,7 @@ pub fn extract_descriptor_set_layouts_from_shader_stages(
         for v in module.variables {
             if let Some(set) = v.descriptor_set {
                 if let Some(binding) = v.binding {
-                    use crate::typedesc::{ImageType, StructType, TypeDesc::*};
+                    use graal_spirv::typedesc::{ImageType, StructType, TypeDesc::*};
                     use spirv::spv::StorageClass;
 
                     let (descriptor_type, _unbounded_descriptor_array) =

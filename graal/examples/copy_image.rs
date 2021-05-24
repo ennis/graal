@@ -3,10 +3,9 @@ use ash::{
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
 use graal::{
-    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk,
-    BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId,
-    ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo,
-    VertexBufferView, VertexData, VertexInputInterface,
+    ash::version::DeviceV1_1, vk,
+    BufferResourceCreateInfo, FrameCreateInfo, ImageId,
+    ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo,
 };
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
@@ -115,14 +114,14 @@ fn load_image(
 
     // build the upload pass
     frame.add_graphics_pass("image upload", |pass| {
-        pass.register_image_access_2(
+        pass.register_image_access(
             image_id,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
-        pass.register_buffer_access_2(
+        pass.register_buffer_access(
             staging_buffer.id,
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
@@ -208,14 +207,14 @@ fn main() {
                 );
 
                 frame.add_graphics_pass("blit to screen", |pass| {
-                    pass.register_image_access_2(
+                    pass.register_image_access(
                         file_image_id,
                         vk::AccessFlags::TRANSFER_READ,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     );
-                    pass.register_image_access_2(
+                    pass.register_image_access(
                         swapchain_image.image_info.id,
                         vk::AccessFlags::TRANSFER_WRITE,
                         vk::PipelineStageFlags::TRANSFER,

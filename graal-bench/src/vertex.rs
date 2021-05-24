@@ -1,7 +1,3 @@
-use crate::{
-    typedesc::{PrimitiveType, TypeDesc},
-    BufferData,
-};
 use ash::vk;
 use std::{marker::PhantomData, mem};
 
@@ -249,8 +245,6 @@ impl<T: VertexInputInterface> VertexInputInterfaceExt for T {
 }
 
 pub mod vertex_macro_helpers {
-    use crate::{vk, VertexAttribute};
-
     pub const fn append_attributes<const N: usize>(
         head: &'static [vk::VertexInputAttributeDescription],
         binding: u32,

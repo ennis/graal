@@ -1,3 +1,24 @@
+use std::hash::{Hash, Hasher};
+
+use egui::{Key, TouchDeviceId};
+use raw_window_handle::HasRawWindowHandle;
+use tracing_subscriber;
+use winit::{
+    event::{Event, Force, MouseButton, VirtualKeyCode, WindowEvent},
+    event_loop::{ControlFlow, EventLoop},
+    window::WindowBuilder,
+};
+
+use graal::swapchain::Swapchain;
+use graal::vk;
+
+use crate::{
+    background::BackgroundPass,
+    camera::{CameraControl, CameraControlInput, CameraControlMouseButton},
+    geometry_pass::GeometryPass,
+    scene::Scene,
+};
+
 mod background;
 mod bounding_box;
 mod camera;
@@ -9,24 +30,10 @@ mod pipeline;
 mod scene;
 mod shader;
 mod taa;
-
-use crate::{
-    background::BackgroundPass,
-    camera::{CameraControl, CameraControlInput, CameraControlMouseButton},
-    geometry_pass::GeometryPass,
-    scene::Scene,
-};
-use egui::{Key, TouchDeviceId};
-use graal::vk;
-use raw_window_handle::HasRawWindowHandle;
-use std::hash::{Hash, Hasher};
-use tracing_subscriber;
-use winit::{
-    event::{Event, Force, MouseButton, VirtualKeyCode, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
-};
-use graal::swapchain::Swapchain;
+pub mod vertex;
+pub mod fragment_output;
+pub mod descriptor;
+pub mod buffer;
 
 pub struct WinitInputState {
     pub pointer_pos_in_points: Option<egui::Pos2>,

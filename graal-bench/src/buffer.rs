@@ -1,8 +1,3 @@
-use crate::{
-    layout::{ArrayLayout, InnerLayout, Layout},
-    typedesc::{PrimitiveType, TypeDesc},
-};
-
 //--------------------------------------------------------------------------------------------------
 
 /// Marker trait for data that can be uploaded to a GPU buffer

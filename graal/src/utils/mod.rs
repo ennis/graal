@@ -1,4 +1,4 @@
-use crate::{vk, AccessType, Frame, ImageInfo};
+use crate::{vk, Frame, ImageInfo};
 use ash::version::DeviceV1_0;
 
 pub fn blit_images(
@@ -9,8 +9,20 @@ pub fn blit_images(
     aspect_mask: vk::ImageAspectFlags,
 ) {
     frame.add_graphics_pass("blit_images", |pass| {
-        pass.register_image_access(src_image.id, AccessType::TransferRead);
-        pass.register_image_access(dst_image.id, AccessType::TransferWrite);
+        pass.register_image_access(
+            src_image.id,
+            vk::AccessFlags::TRANSFER_READ,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        );
+        pass.register_image_access(
+            dst_image.id,
+            vk::AccessFlags::TRANSFER_WRITE,
+            vk::PipelineStageFlags::TRANSFER,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        );
 
         pass.set_commands(move |context, command_buffer| {
             let regions = &[vk::ImageBlit {
