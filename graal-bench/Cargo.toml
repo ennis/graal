@@ -5,7 +5,7 @@ authors = ["Alexandre Bléron <alex.bleron@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-graal = { path = "../graal", features = ["graal-glam"] }
+graal = { path = "../graal" }
 winit = "0.24.0"
 raw-window-handle = "0.3.3"
 inline-spirv = "0.1.2"

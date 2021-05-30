@@ -68,46 +68,6 @@ struct SharedAllocEntry {
     dead_and_recycled: bool,
 }
 
-/// Used to construct a set of allocation requirements for transient resources.
-///
-/// Allocations are identified by index, and multiple resources can share the same allocation.
-/// Each allocation has "requirements" `AllocationRequirements`, which are updated progressively
-/// as `assign_allocation_to_resource` is called.
-struct SharedAllocationsBuilder {
-    /// For each resource, the assigned allocation index.
-    entries: SecondaryMap<ResourceId, SharedAllocEntry>,
-
-    /// The requirements of each allocation.
-    requirements: Vec<AllocationRequirements>,
-}
-
-impl SharedAllocationsBuilder {
-    fn new() -> SharedAllocationsBuilder {
-        SharedAllocationsBuilder {
-            entries: Default::default(),
-            requirements: vec![],
-        }
-    }
-
-    /// Returns the index of the allocation for the resource.
-    fn get_alloc_requirements(&mut self, id: ResourceId) -> Option<&mut AllocationRequirements> {
-        if let Some(entry) = self.entries.get(id) {
-            if entry.dead_and_recycled {
-                None
-            } else {
-                Some(&mut self.requirements[entry.index])
-            }
-        } else {
-            None
-        }
-    }
-
-    /*/// Marks the foll
-    fn mark_as_reused(&mut self, id: ResourceId) {
-        *self.entries.get_mut(id).unwrap().dead_and_recycled = true;
-    }*/
-}
-
 unsafe fn bind_resource_memory(
     device: &ash::Device,
     resource: &Resource,
