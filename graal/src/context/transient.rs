@@ -1,5 +1,5 @@
 use crate::{
-    ash::{version::DeviceV1_0, vk},
+    ash::vk,
     context::{
         local_pass_index, pass::Pass, AllocationRequirements, Resource, ResourceAllocation,
         ResourceKind, ResourceOwnership,
@@ -95,7 +95,7 @@ pub(crate) fn allocate_memory_for_transients(
     base_serial: u64,
     passes: &[Pass],
     temporaries: &[ResourceId],
-) -> Vec<vk_mem::Allocation> {
+) -> Vec<gpu_allocator::vulkan::Allocation> {
     let _span = trace_span!("allocate_memory_for_transients").entered();
 
     let reachability = compute_reachability(&passes);
@@ -244,23 +244,24 @@ pub(crate) fn allocate_memory_for_transients(
             // The resource is not marked discarded, which means that we must preserve the contents
             // of the resource: don't alias its memory
 
-            let allocation_create_info = vk_mem::AllocationCreateInfo {
-                required_flags: allocation_requirements.required_flags,
-                preferred_flags: allocation_requirements.preferred_flags,
-                ..Default::default()
+            let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+                name: "",
+                requirements: allocation_requirements.mem_req,
+                location: allocation_requirements.location,
+                linear: false,
             };
-            let (allocation, allocation_info) = context
+            let allocation = context
                 .device
                 .allocator
-                .allocate_memory(&allocation_requirements.mem_req, &allocation_create_info)
+                .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
 
             unsafe {
                 bind_resource_memory(
                     context.vulkan_device(),
                     resource,
-                    allocation_info.get_device_memory(),
-                    allocation_info.get_offset() as u64,
+                    allocation.memory(),
+                    allocation.offset(),
                 );
             }
 
@@ -272,21 +273,20 @@ pub(crate) fn allocate_memory_for_transients(
 
     // now allocate each entry in the shared allocation map
     let mut shared_allocations = Vec::with_capacity(shared_alloc_requirements.len());
-    let mut shared_allocation_infos = Vec::with_capacity(shared_alloc_requirements.len());
 
     for req in shared_alloc_requirements.iter() {
-        let allocation_create_info = vk_mem::AllocationCreateInfo {
-            required_flags: req.required_flags,
-            preferred_flags: req.preferred_flags,
-            ..Default::default()
+        let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+            name: "",
+            location: req.location,
+            requirements: req.mem_req,
+            linear: false,  // FIXME
         };
-        let (allocation, allocation_info) = context
+        let allocation = context
             .device
             .allocator
-            .allocate_memory(&req.mem_req, &allocation_create_info)
+            .allocate(&allocation_create_desc)
             .expect("failed to allocate device memory");
         shared_allocations.push(allocation);
-        shared_allocation_infos.push(allocation_info);
     }
 
     // finally, bind the shared allocations to the corresponding resources
@@ -300,20 +300,20 @@ pub(crate) fn allocate_memory_for_transients(
             continue;
         };
 
-        let alloc_info = &shared_allocation_infos[alloc_index];
+        let alloc = &shared_allocations[alloc_index];
 
         unsafe {
             bind_resource_memory(
                 &context.device.device,
                 resource,
-                alloc_info.get_device_memory(),
-                alloc_info.get_offset() as u64,
+                alloc.memory(),
+                alloc.offset(),
             );
         }
 
         resource.set_allocation(ResourceAllocation::Transient {
-            device_memory: alloc_info.get_device_memory(),
-            offset: alloc_info.get_offset() as u64,
+            device_memory: unsafe { alloc.memory() },
+            offset: alloc.offset(),
         })
     }
 

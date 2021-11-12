@@ -1,14 +1,10 @@
 use crate::{platform_impl, VULKAN_ENTRY, VULKAN_INSTANCE};
-use ash::{
-    version::{DeviceV1_0, InstanceV1_0},
-    vk,
-};
+use ash::vk;
 use std::{
-    ffi::CStr,
+    ffi::{CStr, CString},
     os::raw::c_void,
     ptr,
 };
-use std::ffi::CString;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
@@ -50,7 +46,7 @@ pub struct Device {
     //pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     //pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
     pub(crate) queues_info: QueuesInfo,
-    pub(crate) allocator: vk_mem::Allocator,
+    pub(crate) allocator: gpu_allocator::vulkan::Allocator,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
@@ -201,7 +197,7 @@ unsafe extern "system" fn debug_utils_message_callback(
     vk::FALSE
 }
 
-const DEVICE_EXTENSIONS : &[&str] = &["VK_KHR_swapchain"];
+const DEVICE_EXTENSIONS: &[&str] = &["VK_KHR_swapchain"];
 
 impl Device {
     fn find_compatible_memory_type_internal(
@@ -334,7 +330,8 @@ impl Device {
 
             // Convert extension strings into C-strings
             let c_device_extensions: Vec<_> = DEVICE_EXTENSIONS
-                .iter().chain(platform_impl::PlatformExtensions::names().iter())
+                .iter()
+                .chain(platform_impl::PlatformExtensions::names().iter())
                 .map(|&s| CString::new(s).unwrap())
                 .collect();
 
@@ -409,18 +406,19 @@ impl Device {
             .unwrap() as usize
                 + 1;
 
-            let allocator_create_info = vk_mem::AllocatorCreateInfo {
+            let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
                 physical_device: phy.phy,
+                debug_settings: Default::default(),
                 device: device.clone(),     // not cheap!
                 instance: instance.clone(), // not cheap!
-                flags: Default::default(),
-                preferred_large_heap_block_size: 0, // default
-                frame_in_use_count: 2,
-                heap_size_limits: None,
+                buffer_device_address: false, /*flags: Default::default(),
+                                            preferred_large_heap_block_size: 0, // default
+                                            frame_in_use_count: 2,
+                                            heap_size_limits: None,*/
             };
 
-            let allocator = vk_mem::Allocator::new(&allocator_create_info)
-                .expect("failed to create VMA allocator");
+            let allocator = gpu_allocator::vulkan::Allocator::new(&allocator_create_desc)
+                .expect("failed to create GPU allocator");
 
             let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
 

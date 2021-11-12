@@ -1,12 +1,7 @@
 use ash::{
-    version::DeviceV1_0,
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
-use graal::{
-    ash::version::DeviceV1_1, vk,
-    BufferResourceCreateInfo, FrameCreateInfo, ImageId,
-    ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo,
-};
+use graal::{vk, BufferResourceCreateInfo, FrameCreateInfo, ImageId, ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, MemoryLocation};
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -69,7 +64,7 @@ fn load_image(
         id: image_id,
     } = frame.context().create_image(
         path.to_str().unwrap(),
-        &ResourceMemoryInfo::DEVICE_LOCAL,
+         MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
             image_type: vk::ImageType::TYPE_2D,
             usage: usage | vk::ImageUsageFlags::TRANSFER_DST,
@@ -90,7 +85,7 @@ fn load_image(
 
     // create a staging buffer
     let mut staging_buffer = 
-        frame.context().create_buffer("staging", &ResourceMemoryInfo::HOST_VISIBLE_COHERENT, &BufferResourceCreateInfo {
+        frame.context().create_buffer("staging", MemoryLocation::CpuToGpu, &BufferResourceCreateInfo {
             usage: vk::BufferUsageFlags::TRANSFER_SRC,
             byte_size,
             map_on_create: true
@@ -104,7 +99,7 @@ fn load_image(
                 0,
                 0..nchannels,
                 format_typedesc,
-                staging_buffer.mapped_ptr as *mut u8,
+                staging_buffer.mapped_ptr.unwrap().as_ptr() as *mut u8,
                 bpp,
             )
             .expect("failed to read image");

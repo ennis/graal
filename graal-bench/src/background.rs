@@ -1,5 +1,5 @@
 use crate::shader::create_shader_module;
-use graal::{ash::version::DeviceV1_0, vk, VertexInputInterfaceExt};
+use graal::vk;
 use inline_spirv::include_spirv;
 use std::ptr;
 

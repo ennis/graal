@@ -1,15 +1,11 @@
 use std::{collections::VecDeque, ffi::CString, fmt, os::raw::c_void, mem, ptr};
 
-use ash::{version::DeviceV1_0, vk};
+use ash::vk;
 use slotmap::{Key, SlotMap};
 
-use crate::{
-    context::{
-        submission::CommandAllocator,
-    },
-    device::Device,
-    MAX_QUEUES,
-};
+use crate::{context::{
+    submission::CommandAllocator,
+}, device::Device, MAX_QUEUES, MemoryLocation};
 use std::cmp::Ordering;
 use tracing::{trace, trace_span};
 
@@ -20,6 +16,7 @@ pub(crate) mod transient;
 
 pub use frame::{Frame, PassBuilder};
 use std::ops::{Deref, DerefMut};
+use std::ptr::NonNull;
 pub use submission::CommandContext;
 use crate::context::pass::SemaphoreWait;
 use crate::ash::vk::Handle;
@@ -502,13 +499,14 @@ pub fn get_mip_level_count(width: u32, height: u32) -> u32 {
 #[derive(Copy, Clone, Debug)]
 pub struct AllocationRequirements {
     pub(crate) mem_req: vk::MemoryRequirements,
-    pub(crate) required_flags: vk::MemoryPropertyFlags,
-    pub(crate) preferred_flags: vk::MemoryPropertyFlags,
+    pub(crate) location: gpu_allocator::MemoryLocation,
+    //pub(crate) required_flags: vk::MemoryPropertyFlags,
+    //pub(crate) preferred_flags: vk::MemoryPropertyFlags,
 }
 
 impl AllocationRequirements {
     fn adjusted_requirements(&self, other: &AllocationRequirements) -> Option<AllocationRequirements> {
-        if self.required_flags != other.required_flags {
+        if self.location != other.location {
             return None;
         }
         if self.mem_req.memory_type_bits != other.mem_req.memory_type_bits {
@@ -617,7 +615,7 @@ pub enum ResourceAllocation {
 
     /// a block of memory exclusively for this resource.
     Default {
-        allocation: vk_mem::Allocation
+        allocation: gpu_allocator::vulkan::Allocation
     },
 
     /// Memory aliasing: allocate a block of memory for the resource, which can possibly be shared
@@ -704,10 +702,10 @@ impl Resource {
 
 /// Destroys a resource and frees its device memory if it was allocated for this resource
 /// exclusively.
-unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
+unsafe fn destroy_resource(device: &mut Device, resource: &mut Resource) {
     // deallocate its memory, if it was allocated for this object exclusively
     match resource.ownership {
-        ResourceOwnership::Owned { ref allocation, .. } => {
+        ResourceOwnership::Owned { ref mut allocation, .. } => {
             // destroy the object, if we're responsible for it (we're not responsible of destroying
             // swapchain images, for example, since they are destroyed with the swapchain).
             match &mut resource.kind {
@@ -723,11 +721,12 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
                 }
             }
 
-            match allocation {
+            // free the memory associated to the object
+            match allocation.take() {
                 Some(ResourceAllocation::Default {
                          allocation
                      }) => {
-                    device.allocator.free_memory(&allocation).unwrap()
+                    device.allocator.free(allocation).unwrap()
                 }
                 _ => {
                     // External: the memory is freed elsewhere (?)
@@ -748,7 +747,8 @@ pub struct BufferInfo {
     /// Vulkan handle of the buffer.
     pub handle: vk::Buffer,
     /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
-    pub mapped_ptr: *mut u8,
+    // TODO: Option<NonNull>
+    pub mapped_ptr: Option<NonNull<c_void>>,
 }
 
 /// Holds information about a buffer resource containing an array of elements of type T.
@@ -759,7 +759,7 @@ pub struct TypedBufferInfo<T> {
     /// Vulkan handle of the buffer.
     pub handle: vk::Buffer,
     /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
-    pub mapped_ptr: *mut T,
+    pub mapped_ptr: Option<NonNull<T>>,
 }
 
 /// `TypedBufferInfo<T>` are convertible into their untyped equivalents.
@@ -768,7 +768,7 @@ impl<T> From<TypedBufferInfo<T>> for BufferInfo {
         BufferInfo {
             id: buf.id,
             handle: buf.handle,
-            mapped_ptr: buf.mapped_ptr as *mut u8,
+            mapped_ptr: buf.mapped_ptr.map(|ptr| ptr.cast()),
         }
     }
 }
@@ -780,7 +780,7 @@ impl<T: Copy> TypedBufferInfo<T> {
         TypedBufferInfo {
             id: self.id,
             handle: self.handle,
-            mapped_ptr: self.mapped_ptr as *mut U
+            mapped_ptr: self.mapped_ptr.map(|ptr| ptr.cast())
         }
     }
 }
@@ -821,7 +821,7 @@ impl Context {
     /// references.
     pub(crate) fn cleanup_resources(&mut self) {
         let _ = trace_span!("cleanup_resources");
-        let device = &self.device;
+        let device = &mut self.device;
         let completed_serials = self.completed_serials;
         // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
         // and resources that have reader or writer passes that have not yet completed
@@ -907,7 +907,7 @@ impl Context {
     pub fn create_image(
         &mut self,
         name: &str,
-        memory_info: &ResourceMemoryInfo,
+        location: MemoryLocation,
         image_info: &ImageResourceCreateInfo,
     ) -> ImageInfo {
         // for now all resources are CONCURRENT, because that's the only way they can
@@ -944,8 +944,7 @@ impl Context {
                     ownership: ResourceOwnership::Owned {
                         requirements: AllocationRequirements {
                             mem_req,
-                            required_flags: memory_info.required_flags,
-                            preferred_flags: memory_info.preferred_flags
+                            location
                         },
                         allocation: None
                     },
@@ -963,7 +962,7 @@ impl Context {
     pub fn create_buffer(
         &mut self,
         name: &str,
-        memory_info: &ResourceMemoryInfo,
+        location: MemoryLocation,
         buffer_create_info: &BufferResourceCreateInfo,
     ) -> BufferInfo {
 
@@ -997,56 +996,56 @@ impl Context {
             let ownership = ResourceOwnership::Owned {
                 requirements: AllocationRequirements {
                     mem_req,
-                    required_flags: memory_info.required_flags,
-                    preferred_flags: memory_info.preferred_flags
+                    location,
                 },
                 allocation: None
             };
             (
                 /* ownership */ ownership,
-                /* mapped_ptr */ ptr::null_mut(),
+                /* mapped_ptr */ None,
             )
         } else {
             // caller requested a mapped pointer, must create and allocate immediately
-            let allocation_create_info = vk_mem::AllocationCreateInfo {
-                flags: vk_mem::AllocationCreateFlags::MAPPED,
-                preferred_flags: memory_info.preferred_flags,
-                required_flags: memory_info.required_flags,
-                ..Default::default()
+            let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+                name,
+                requirements: mem_req,
+                location,
+                linear: true,
             };
-            let (allocation, alloc_info) = self
+            let allocation = self
                 .device
                 .allocator
-                .allocate_memory(&mem_req, &allocation_create_info)
+                .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
             unsafe {
                 self.device
                     .device
                     .bind_buffer_memory(
                         handle,
-                        alloc_info.get_device_memory(),
-                        alloc_info.get_offset() as u64,
+                        allocation.memory(),
+                        allocation.offset() as u64,
                     )
                     .unwrap();
             }
+            let mapped_ptr = allocation.mapped_ptr();
             let ownership = ResourceOwnership::Owned {
                 requirements: AllocationRequirements {
                     mem_req,
-                    required_flags: memory_info.required_flags,
-                    preferred_flags: memory_info.preferred_flags
+                    location,
                 },
                 allocation: Some(ResourceAllocation::Default {
                     allocation
                 })
             };
-            let mapped_ptr = if buffer_create_info.map_on_create {
-                let ptr = alloc_info.get_mapped_data();
-                assert!(!ptr.is_null(), "failed to map buffer");
-                ptr
+            /*let mapped_ptr = if buffer_create_info.map_on_create {
+                let ptr = allocation.mapped_ptr().expect("failed to map buffer");
+                //assert!(!ptr.is_null(), "failed to map buffer");
+                ptr.as_ptr() as *mut u8
             } else {
                 ptr::null_mut()
-            };
-            (/* ownership */ ownership, /* mapped_ptr */ mapped_ptr)
+            };*/
+
+            (ownership,  mapped_ptr)
         };
 
         let id = unsafe { self.register_buffer_resource(BufferRegistrationInfo {
@@ -1071,7 +1070,7 @@ impl Context {
 #[derive(Debug)]
 struct FrameInFlight {
     signalled_serials: QueueSerialNumbers,
-    transient_allocations: Vec<vk_mem::Allocation>,
+    transient_allocations: Vec<gpu_allocator::vulkan::Allocation>,
     command_pools: Vec<CommandAllocator>,
     semaphores: Vec<vk::Semaphore>,
 }
@@ -1306,9 +1305,9 @@ impl Context {
             self.recycle_semaphores(f.semaphores);
 
             // free transient allocations
-            for alloc in f.transient_allocations.iter() {
+            for alloc in f.transient_allocations {
                 trace!(?alloc, "free_memory");
-                self.device.allocator.free_memory(alloc).unwrap();
+                self.device.allocator.free(alloc).unwrap();
             }
 
             // bump completed frame count

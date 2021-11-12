@@ -2,12 +2,7 @@ use ash::{
     version::DeviceV1_0,
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
-use graal::{
-    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk,
-    BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId,
-    ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo,
-    VertexBufferView, VertexData, VertexInputInterface,
-};
+use graal::{ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk, BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId, ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo, VertexBufferView, VertexData, VertexInputInterface, MemoryLocation};
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -349,7 +344,7 @@ fn load_image(
         id: image_id,
     } = frame.context().create_image(
         path.to_str().unwrap(),
-        &ResourceMemoryInfo::DEVICE_LOCAL,
+        MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
             image_type: vk::ImageType::TYPE_2D,
             usage: usage | vk::ImageUsageFlags::TRANSFER_DST,
@@ -443,7 +438,7 @@ fn load_image(
 fn create_transient_image(context: &mut graal::Context, name: &str, is_depth: bool) -> ImageId {
     let ImageInfo { id, .. } = context.create_image(
         name,
-        &graal::ResourceMemoryInfo::DEVICE_LOCAL,
+        MemoryLocation::GpuOnly,
         &graal::ImageResourceCreateInfo {
             image_type: graal::vk::ImageType::TYPE_2D,
             usage: if is_depth {
@@ -511,7 +506,7 @@ fn load_mesh(batch: &graal::Frame, obj_file_path: &Path) -> MeshData {
         ..
     } = batch.context().create_buffer(
         obj_file_path.to_str().unwrap(),
-        &graal::ResourceMemoryInfo::DEVICE_LOCAL,
+        MemoryLocation::GpuOnly,
         &graal::BufferResourceCreateInfo {
             usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             byte_size,

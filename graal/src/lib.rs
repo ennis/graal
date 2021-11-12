@@ -14,6 +14,7 @@ pub use crate::{
     },
     device::Device,
 };
+pub use gpu_allocator::MemoryLocation;
 
 pub(crate) use crate::{
     device::MAX_QUEUES,

@@ -1,4 +1,4 @@
-use ash::{version::EntryV1_0, vk};
+use ash::vk;
 use core::ptr;
 use lazy_static::lazy_static;
 use std::{

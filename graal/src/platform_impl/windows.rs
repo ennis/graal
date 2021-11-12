@@ -1,5 +1,4 @@
 use ash::{
-    version::InstanceV1_0,
     vk::{KhrExternalMemoryWin32Fn, KhrExternalSemaphoreWin32Fn},
 };
 use std::mem;

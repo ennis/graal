@@ -1,5 +1,4 @@
 use crate::{vk, Frame, ImageInfo};
-use ash::version::DeviceV1_0;
 
 pub fn blit_images(
     frame: &Frame,

@@ -156,7 +156,7 @@ impl Swapchain {
 
     /// Acquires the next image in the swapchain.
     /// See `vkAcquireNextImageKHR`.
-    pub unsafe fn acquire_next_image(&mut self, context: &mut Context) -> SwapchainImage
+    pub unsafe fn acquire_next_image(&self, context: &mut Context) -> SwapchainImage
     {
         let image_available = context.create_semaphore();
 

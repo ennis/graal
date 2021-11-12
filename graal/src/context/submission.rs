@@ -7,7 +7,6 @@ use crate::{
 };
 
 use crate::context::SEMAPHORE_WAIT_TIMEOUT_NS;
-use ash::version::{DeviceV1_0, DeviceV1_2};
 use std::{
     ffi::{c_void, CString},
     ops::{Deref, DerefMut},
