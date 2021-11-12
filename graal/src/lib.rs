@@ -1,5 +1,4 @@
 #![feature(maybe_uninit_slice)]
-#![feature(maybe_uninit_ref)]
 
 pub use ash::{self, vk};
 

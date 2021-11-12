@@ -72,7 +72,7 @@ fn create_vulkan_instance() -> ash::Instance {
             p_engine_name: b"GRAAL\0".as_ptr() as *const c_char,
             engine_version: 0,
             // require vulkan 1.2
-            api_version: vk::make_version(1, 2, 0),
+            api_version: vk::make_api_version(0, 1, 2, 0),
             ..Default::default()
         };
 

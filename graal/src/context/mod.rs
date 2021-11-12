@@ -1,4 +1,4 @@
-use std::{collections::VecDeque, ffi::CString, fmt, os::raw::c_void, mem, ptr};
+use std::{collections::VecDeque, ffi::CString, fmt, os::raw::c_void, mem};
 
 use ash::vk;
 use slotmap::{Key, SlotMap};
