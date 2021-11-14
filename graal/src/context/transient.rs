@@ -253,6 +253,7 @@ pub(crate) fn allocate_memory_for_transients(
             let allocation = context
                 .device
                 .allocator
+                .borrow_mut()
                 .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
 
@@ -265,9 +266,9 @@ pub(crate) fn allocate_memory_for_transients(
                 );
             }
 
-            context.resources.get_mut(id).unwrap().set_allocation(ResourceAllocation::Default {
-                allocation
-            });
+            context.resources.get_mut(id)
+                .unwrap()
+                .set_allocation(ResourceAllocation::Default { allocation });
         }
     }
 
@@ -279,17 +280,19 @@ pub(crate) fn allocate_memory_for_transients(
             name: "",
             location: req.location,
             requirements: req.mem_req,
-            linear: false,  // FIXME
+            linear: false, // FIXME
         };
         let allocation = context
             .device
             .allocator
+            .borrow_mut()
             .allocate(&allocation_create_desc)
             .expect("failed to allocate device memory");
         shared_allocations.push(allocation);
     }
 
     // finally, bind the shared allocations to the corresponding resources
+
     for &id in temporaries.iter() {
         let resource = context.resources.get_mut(id).unwrap();
 

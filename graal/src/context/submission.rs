@@ -18,7 +18,7 @@ use crate::context::pass::{SemaphoreSignal, SemaphoreWait, SemaphoreSignalKind, 
 
 /// Context passed to the command callbacks.
 pub struct CommandContext<'a> {
-    context: &'a mut Context,
+    context: &'a Context,
 }
 
 impl<'a> Deref for CommandContext<'a> {
@@ -29,12 +29,8 @@ impl<'a> Deref for CommandContext<'a> {
     }
 }
 
-impl<'a> DerefMut for CommandContext<'a> {
-    fn deref_mut(&mut self) -> &mut Context {
-        self.context
-    }
-}
 
+/// Allocates command buffers in a `vk::CommandPool` and allows re-use of freed command buffers.
 #[derive(Debug)]
 pub(crate) struct CommandAllocator {
     queue_family: u32,
@@ -135,7 +131,7 @@ pub(crate) struct FrameSubmissionResult {
 }
 
 impl Context {
-    pub(crate) fn wait(&mut self, serials: &QueueSerialNumbers) {
+    pub(crate) fn wait(&self, serials: &QueueSerialNumbers) {
         let _span = trace_span!("wait", ?serials);
 
         let wait_info = vk::SemaphoreWaitInfo {
@@ -252,22 +248,27 @@ impl Context {
         }
     }
 
-    /// Creates a command pool and wraps it in a `CommandAllocator`.
+    /// Creates a command pool for the given queue and wraps it in a `CommandAllocator`.
     fn create_command_pool(&mut self, queue_index: usize) -> CommandAllocator {
+
+        // Command pools are tied to a queue family
         let queue_family = self.device.queues_info.families[queue_index];
-        if let Some(pos) = self
-            .available_command_pools
+
+        // Try to find a free pool with of the correct queue family in the list of recycled command pools.
+        // If we find one, remove it from the list and return it. Otherwise create a new one.
+        if let Some(pos) = self.available_command_pools
             .iter()
             .position(|cmd_pool| cmd_pool.queue_family == queue_family)
         {
+            // found one, remove it and return it
             self.available_command_pools.swap_remove(pos)
         } else {
+            // create a new one
             let create_info = vk::CommandPoolCreateInfo {
                 flags: vk::CommandPoolCreateFlags::TRANSIENT,
                 queue_family_index: queue_family,
                 ..Default::default()
             };
-
             let command_pool = unsafe {
                 self.device
                     .device
@@ -283,7 +284,8 @@ impl Context {
         }
     }
 
-    ///
+
+    // FIXME: not sure this function needs a mut borrow of passes
     pub(crate) fn submit_frame(
         &mut self,
         passes: &mut [Pass],
@@ -461,6 +463,7 @@ impl Context {
                     };
                     unsafe {
                         // TODO safety
+                        // TODO handle ERROR_OUT_OF_DATE_KHR
                         let queue = self.device.queues_info.queues[q as usize];
                         self.device
                             .vk_khr_swapchain

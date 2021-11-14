@@ -1,13 +1,13 @@
-use crate::{vk, Frame, ImageInfo};
+use crate::{vk, Context, ImageInfo};
 
 pub fn blit_images(
-    frame: &Frame,
+    context: &mut Context,
     src_image: ImageInfo,
     dst_image: ImageInfo,
     size: (u32, u32),
     aspect_mask: vk::ImageAspectFlags,
 ) {
-    frame.add_graphics_pass("blit_images", |pass| {
+    context.add_graphics_pass("blit_images", |pass| {
         pass.register_image_access(
             src_image.id,
             vk::AccessFlags::TRANSFER_READ,

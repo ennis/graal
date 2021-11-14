@@ -13,7 +13,7 @@ use winit::{
 use graal::swapchain::Swapchain;
 
 fn load_image(
-    frame: &graal::Frame,
+    context: &mut graal::Context,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
     mipmaps: bool,
@@ -62,7 +62,7 @@ fn load_image(
     let ImageInfo {
         handle: image_handle,
         id: image_id,
-    } = frame.context().create_image(
+    } = context.create_image(
         path.to_str().unwrap(),
          MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
@@ -85,7 +85,7 @@ fn load_image(
 
     // create a staging buffer
     let mut staging_buffer = 
-        frame.context().create_buffer("staging", MemoryLocation::CpuToGpu, &BufferResourceCreateInfo {
+        context.create_buffer("staging", MemoryLocation::CpuToGpu, &BufferResourceCreateInfo {
             usage: vk::BufferUsageFlags::TRANSFER_SRC,
             byte_size,
             map_on_create: true
@@ -108,7 +108,7 @@ fn load_image(
     let staging_buffer_handle = staging_buffer.handle;
 
     // build the upload pass
-    frame.add_graphics_pass("image upload", |pass| {
+    context.add_graphics_pass("image upload", |pass| {
         pass.register_image_access(
             image_id,
             vk::AccessFlags::TRANSFER_WRITE,
@@ -153,7 +153,7 @@ fn load_image(
         });
     });
 
-    frame.context().destroy_buffer(staging_buffer.id);
+    context.destroy_buffer(staging_buffer.id);
     (image_id, width, height)
 }
 
@@ -183,7 +183,7 @@ fn main() {
                 }
                 WindowEvent::Resized(size) => unsafe {
                     swapchain_size = size.into();
-                    swapchain.resize(&mut context, swapchain_size);
+                    swapchain.resize(&context, swapchain_size);
                 },
                 _ => {}
             },
@@ -192,16 +192,17 @@ fn main() {
             }
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { swapchain.acquire_next_image(&mut context) };
-                let mut frame = context.start_frame(Default::default());
+
+                context.start_frame(FrameCreateInfo { collect_debug_info: true, happens_after: Default::default() });
 
                 let (file_image_id, file_image_width, file_image_height) = load_image(
-                    &frame,
+                    &mut context,
                     "data/haniyasushin_keiki.jpg".as_ref(),
                     vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
                     false,
                 );
 
-                frame.add_graphics_pass("blit to screen", |pass| {
+                context.add_graphics_pass("blit to screen", |pass| {
                     pass.register_image_access(
                         file_image_id,
                         vk::AccessFlags::TRANSFER_READ,
@@ -269,8 +270,8 @@ fn main() {
                     });
                 });
 
-                frame.present("P12", &swapchain_image);
-                frame.finish();
+                context.present("P12", &swapchain_image);
+                context.end_frame();
 
                 context.destroy_image(file_image_id);
                 context.destroy_image(swapchain_image.image_info.id);

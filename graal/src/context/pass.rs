@@ -10,13 +10,13 @@ pub(crate) struct ResourceAccess {
     pub(crate) access_mask: vk::AccessFlags,
 }
 
-pub(crate) enum PassCommands<'a> {
+pub(crate) enum PassCommands {
     Present {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
     },
-    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue) + 'a>),
-    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>),
+    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue)>),
+    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer)>),
 }
 
 #[derive(Copy,Clone,Debug,Eq,PartialEq)]
@@ -51,7 +51,7 @@ pub(crate) struct SemaphoreSignal {
     pub(crate) signal_kind: SemaphoreSignalKind
 }
 
-pub(crate) struct Pass<'a> {
+pub(crate) struct Pass {
     pub(crate) name: String,
 
     /// Submission number of the pass.
@@ -85,10 +85,10 @@ pub(crate) struct Pass<'a> {
     pub(crate) external_semaphore_waits: Vec<SemaphoreWait>,
     pub(crate) external_semaphore_signals: Vec<SemaphoreSignal>,
 
-    pub(crate) commands: Option<PassCommands<'a>>,
+    pub(crate) commands: Option<PassCommands>,
 }
 
-impl<'a> Pass<'a> {
+impl Pass {
     pub(crate) fn get_or_create_image_memory_barrier(
         &mut self,
         handle: vk::Image,
@@ -148,7 +148,7 @@ impl<'a> Pass<'a> {
         }
     }
 
-    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass<'a> {
+    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass {
         Pass {
             name: name.to_string(),
             snn,

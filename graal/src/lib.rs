@@ -7,7 +7,7 @@ pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instanc
 pub use crate::{
     context::{
         BufferId, BufferInfo, BufferResourceCreateInfo, CommandContext, Context,
-        format_aspect_mask, Frame, frame::FrameCreateInfo, get_mip_level_count,
+        format_aspect_mask, frame::FrameCreateInfo, get_mip_level_count,
         GpuFuture, ImageId, ImageInfo, ImageResourceCreateInfo,
         ResourceId, ResourceMemoryInfo, TypedBufferInfo,
     },

@@ -1,4 +1,5 @@
 use std::{collections::VecDeque, ffi::CString, fmt, os::raw::c_void, mem};
+use std::cell::{Cell, RefCell};
 
 use ash::vk;
 use slotmap::{Key, SlotMap};
@@ -14,12 +15,13 @@ pub(crate) mod pass;
 pub(crate) mod submission;
 pub(crate) mod transient;
 
-pub use frame::{Frame, PassBuilder};
+pub use frame::PassBuilder;
 use std::ops::{Deref, DerefMut};
 use std::ptr::NonNull;
 pub use submission::CommandContext;
 use crate::context::pass::SemaphoreWait;
 use crate::ash::vk::Handle;
+use crate::context::frame::Frame;
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
 pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -702,7 +704,7 @@ impl Resource {
 
 /// Destroys a resource and frees its device memory if it was allocated for this resource
 /// exclusively.
-unsafe fn destroy_resource(device: &mut Device, resource: &mut Resource) {
+unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     // deallocate its memory, if it was allocated for this object exclusively
     match resource.ownership {
         ResourceOwnership::Owned { ref mut allocation, .. } => {
@@ -726,7 +728,7 @@ unsafe fn destroy_resource(device: &mut Device, resource: &mut Resource) {
                 Some(ResourceAllocation::Default {
                          allocation
                      }) => {
-                    device.allocator.free(allocation).unwrap()
+                    device.allocator.borrow_mut().free(allocation).unwrap()
                 }
                 _ => {
                     // External: the memory is freed elsewhere (?)
@@ -821,17 +823,17 @@ impl Context {
     /// references.
     pub(crate) fn cleanup_resources(&mut self) {
         let _ = trace_span!("cleanup_resources");
-        let device = &mut self.device;
-        let completed_serials = self.completed_serials;
+        let device = &self.device;
         // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
         // and resources that have reader or writer passes that have not yet completed
+        let completed_serials = self.completed_serials;
         self.resources.retain(|id, r| {
             // refcount != 0 OR any reader not completed OR writer not completed
             let keep = !r.discarded
                 || r.tracking.readers > completed_serials
                 || r.tracking.writer.serial() > completed_serials.serial(r.tracking.writer.queue());
             if !keep {
-                trace!(?id, name = r.name.as_str(), "destroy_resource");
+                trace!(?id, name = r.name.as_str(), tracking=?r.tracking, "destroy_resource");
                 unsafe {
                     // Safety: we know that all serials <= `self.completed_serials` have finished
                     destroy_resource(device, r);
@@ -1014,7 +1016,7 @@ impl Context {
             };
             let allocation = self
                 .device
-                .allocator
+                .allocator.borrow_mut()
                 .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
             unsafe {
@@ -1109,6 +1111,12 @@ impl GpuFuture {
 pub struct Context {
     pub(crate) device: Device,
 
+    /// Free semaphores guaranteed to be in the unsignalled state.
+    semaphore_pool: Vec<vk::Semaphore>,
+
+    /// Resources (images and buffers), mapped by ID
+    resources: ResourceMap,
+
     /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
     timelines: [vk::Semaphore; MAX_QUEUES],
 
@@ -1118,17 +1126,14 @@ pub struct Context {
     /// Pool of recycled command pools.
     available_command_pools: Vec<CommandAllocator>,
 
-    /// Free semaphores guaranteed to be in the unsignalled state.
-    semaphore_pool: Vec<vk::Semaphore>,
-
-    /// Resources (images and buffers), mapped by ID
-    resources: ResourceMap,
+    /// Array containing the last completed pass serials for each queue
+    completed_serials: QueueSerialNumbers,
 
     /// The serial to be used for the next pass (used by `Frame`)
     next_serial: u64,
 
-    /// Array containing the last completed pass serials for each queue
-    completed_serials: QueueSerialNumbers,
+    /// Frames that are currently executing on the GPU.
+    in_flight: VecDeque<FrameInFlight>,
 
     /// Number of submitted frames
     submitted_frame_count: u64,
@@ -1136,8 +1141,7 @@ pub struct Context {
     /// Number of completed frames
     completed_frame_count: u64,
 
-    /// Frames that are currently executing on the GPU.
-    in_flight: VecDeque<FrameInFlight>,
+    current_frame: Option<Frame>,
 }
 
 impl Context {
@@ -1182,12 +1186,13 @@ impl Context {
             last_signalled_serials: Default::default(),
             available_command_pools: vec![],
             completed_serials: Default::default(),
+            resources: SlotMap::with_key(),
+            semaphore_pool: vec![],
             next_serial: 0,
             submitted_frame_count: 0,
             completed_frame_count: 0,
-            resources: SlotMap::with_key(),
             in_flight: VecDeque::new(),
-            semaphore_pool: vec![],
+            current_frame: None
         }
     }
 
@@ -1242,6 +1247,9 @@ impl Context {
         self.completed_frame_count >= serial.0
     }
 
+    /// Finds the ID of the resource that corresponds to the specified image handle.
+    ///
+    /// Returns `ResourceId::null()` if `handle` doesn't refer to a resource managed by this context.
     fn image_resource_by_handle(&self, handle: vk::Image) -> ResourceId {
         self.resources
             .iter()
@@ -1258,6 +1266,9 @@ impl Context {
             .unwrap_or(ResourceId::null())
     }
 
+    /// Finds the ID of the resource that corresponds to the specified buffer handle.
+    ///
+    /// Returns `ResourceId::null()` if `handle` doesn't refer to a resource managed by this context.
     fn buffer_resource_by_handle(&self, handle: vk::Buffer) -> ResourceId {
         self.resources
             .iter()
@@ -1274,10 +1285,6 @@ impl Context {
             .unwrap_or(ResourceId::null())
     }
 
-    fn get_next_serial(&mut self) -> u64 {
-        self.next_serial += 1;
-        self.next_serial
-    }
 
     /// Waits for all but the last submitted frame to finish and then recycles their resources.
     /// Calls `cleanup_resources` internally.
@@ -1307,7 +1314,7 @@ impl Context {
             // free transient allocations
             for alloc in f.transient_allocations {
                 trace!(?alloc, "free_memory");
-                self.device.allocator.free(alloc).unwrap();
+                self.device.allocator.borrow_mut().free(alloc).unwrap();
             }
 
             // bump completed frame count

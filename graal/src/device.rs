@@ -5,6 +5,7 @@ use std::{
     os::raw::c_void,
     ptr,
 };
+use std::cell::RefCell;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
@@ -46,7 +47,7 @@ pub struct Device {
     //pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     //pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
     pub(crate) queues_info: QueuesInfo,
-    pub(crate) allocator: gpu_allocator::vulkan::Allocator,
+    pub(crate) allocator: RefCell<gpu_allocator::vulkan::Allocator>,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
@@ -458,7 +459,7 @@ impl Device {
                 //physical_device_features: phy.features,
                 physical_device_memory_properties,
                 queues_info,
-                allocator,
+                allocator: RefCell::new(allocator),
                 vk_khr_swapchain,
                 vk_khr_surface,
                 vk_ext_debug_utils,
