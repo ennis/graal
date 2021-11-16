@@ -1,8 +1,9 @@
+//! Allocation of memory for transient resources in a frame.
 use crate::{
     ash::vk,
     context::{
-        local_pass_index, pass::Pass, AllocationRequirements, Resource, ResourceAllocation,
-        ResourceKind, ResourceOwnership,
+        local_pass_index, AllocationRequirements, Pass, Resource, ResourceAllocation, ResourceKind,
+        ResourceOwnership,
     },
     Context, ResourceId,
 };
@@ -49,7 +50,7 @@ fn compute_reachability(passes: &[Pass]) -> Reachability {
 
 type AllocMap = SecondaryMap<ResourceId, SharedAllocEntry>;
 
-fn allocate_or_alias_memory(
+/*fn allocate_or_alias_memory(
     context: &mut Context,
     base_serial: u64,
     passes: &[Pass],
@@ -57,7 +58,7 @@ fn allocate_or_alias_memory(
     allocation_requirements: &mut Vec<AllocationRequirements>,
     allocation_map: &mut AllocMap,
 ) {
-}
+}*/
 
 /// Index of an allocation
 #[derive(Copy, Clone, Debug)]
@@ -108,11 +109,11 @@ pub(crate) fn allocate_memory_for_transients(
 
     fn get_allocation_requirements(resource: &Resource) -> Option<AllocationRequirements> {
         match &resource.ownership {
-            ResourceOwnership::Referenced => {
+            ResourceOwnership::External => {
                 // skip non-owned resources
                 None
             }
-            ResourceOwnership::Owned {
+            ResourceOwnership::OwnedResource {
                 requirements,
                 allocation,
             } => {
@@ -266,7 +267,9 @@ pub(crate) fn allocate_memory_for_transients(
                 );
             }
 
-            context.resources.get_mut(id)
+            context
+                .resources
+                .get_mut(id)
                 .unwrap()
                 .set_allocation(ResourceAllocation::Default { allocation });
         }

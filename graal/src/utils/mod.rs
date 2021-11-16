@@ -8,14 +8,14 @@ pub fn blit_images(
     aspect_mask: vk::ImageAspectFlags,
 ) {
     context.add_graphics_pass("blit_images", |pass| {
-        pass.register_image_access(
+        pass.reference_image(
             src_image.id,
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         );
-        pass.register_image_access(
+        pass.reference_image(
             dst_image.id,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,

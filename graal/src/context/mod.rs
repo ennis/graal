@@ -1,27 +1,23 @@
-use std::{collections::VecDeque, ffi::CString, fmt, os::raw::c_void, mem};
-use std::cell::{Cell, RefCell};
+use std::{collections::VecDeque, ffi::CString, fmt, mem, os::raw::c_void};
 
 use ash::vk;
 use slotmap::{Key, SlotMap};
 
-use crate::{context::{
-    submission::CommandAllocator,
-}, device::Device, MAX_QUEUES, MemoryLocation};
+use crate::{context::submission::CommandAllocator, device::Device, MemoryLocation, MAX_QUEUES};
 use std::cmp::Ordering;
 use tracing::{trace, trace_span};
 
 pub(crate) mod frame;
-pub(crate) mod pass;
 pub(crate) mod submission;
 pub(crate) mod transient;
 
-pub use frame::PassBuilder;
-use std::ops::{Deref, DerefMut};
-use std::ptr::NonNull;
-pub use submission::CommandContext;
-use crate::context::pass::SemaphoreWait;
 use crate::ash::vk::Handle;
-use crate::context::frame::Frame;
+pub use frame::PassBuilder;
+use std::{
+    ops::{Deref, DerefMut},
+    ptr::NonNull,
+};
+pub use submission::CommandContext;
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
 pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
@@ -29,9 +25,38 @@ pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
 /// A number that uniquely identifies a frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]
 #[repr(transparent)]
-pub struct FrameSerialNumber(pub u64);
+pub struct FrameNumber(pub u64);
 
 /// A number that combines the serial number of a pass and the queue it was submitted on.
+///
+/// # About serial and submission numbers
+///
+/// The **serial number** (SN) of a pass uniquely identifies it among all other passes submitted to a context,
+/// regardless of the queue it was submitted on. SN 0 is considered invalid, and thus passes start at SN 1.
+///
+/// The **submission number** (SNN) of a pass is composed of the SN plus the *queue index*,
+/// which identifies the queue to which the pass has been or is going to be submitted.
+/// They are written in the form `Q:SN` (e.g. `0:47` for queue #0, SN 47, `2:51` for queue #2, SN 51).
+/// There cannot be two SNNs with the same SN but different queue indices (`0:50` and `1:50` is impossible).
+///
+/// # Queue timelines
+///
+/// Each queue has a timeline semaphore, which holds a monotonically increasing value that describes
+/// the progression of passes submitted to the queue: when the timeline of queue Q reaches a value X,
+/// all passes with SN <= X **that were submitted to Q** are guaranteed to have completed execution.
+///
+/// For example, we can wait on timeline 0 for the value 3 to ensure that passes `0:1` and `0:3` have finished.
+/// However, this wouldn't guarantee anything for pass `1:2`, submitted on a different queue.
+///
+/// Timelines are more convenient than binary semaphores:
+/// * we have a lot less semaphores to keep track of (one per queue instead of one per pass), and they are alive for the whole application.
+/// * it's trivially easy to check if a pass with a given SNN (`Q:SN`) has finished: just get the value of `Q`'s timeline and check that it is greater than or equal to `SN`.
+///
+/// We often use the phrase *waiting on an SNN* to signify waiting for the pass with that SNN on
+/// its corresponding timeline semaphore. For instance, waiting on SNN `1:120` means waiting for the
+/// value 120 to be signalled on the timeline semaphore of queue 1. When that value is reached, we can
+/// be certain that pass SN 120 has finished executing.
+///
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Default)]
 #[repr(transparent)]
 pub struct SubmissionNumber(u64);
@@ -125,6 +150,16 @@ impl QueueSerialNumbers {
         self.0.iter()
     }
 
+    fn is_single_source_same_queue_and_frame(
+        &self,
+        queue: usize,
+        frame_base_serial: u64,
+    ) -> bool {
+        self.iter().enumerate().all(|(i, &sn)| {
+            (i != queue && sn == 0) || (i == queue && (sn == 0 || sn > frame_base_serial))
+        })
+    }
+
     //pub fn iter_mut(&mut self) -> impl Iterator<Item = &'_ mut u64> {
     //    self.0.iter_mut()
     //}
@@ -167,6 +202,7 @@ fn local_pass_index(serial: u64, frame_base_serial: u64) -> usize {
 
 pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     match count {
+        0 => vk::SampleCountFlags::TYPE_1,
         1 => vk::SampleCountFlags::TYPE_1,
         2 => vk::SampleCountFlags::TYPE_2,
         4 => vk::SampleCountFlags::TYPE_4,
@@ -366,7 +402,11 @@ pub fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
 }
 
 slotmap::new_key_type! {
+    /// Identifies a GPU resource (buffer or image).
     pub struct ResourceId;
+
+    /// Identifies a resource group.
+    pub struct GroupId;
 }
 
 /// TODO docs
@@ -459,41 +499,50 @@ impl ResourceMemoryInfo {
         ResourceMemoryInfo::new().host_visible().host_coherent();
 }
 
-/// Parameters of a newly created image resource.
-#[derive(Copy, Clone, Debug, Default)]
+/// Information passed to `Context::create_image` to describe the image to be created.
+#[derive(Copy, Clone, Debug)]
 pub struct ImageResourceCreateInfo {
-    /// Image type.
+    /// Dimensionality of the image.
     pub image_type: vk::ImageType,
-    /// Usage flags.
+    /// Image usage flags. Must include all intended uses of the image.
     pub usage: vk::ImageUsageFlags,
     /// Format of the image.
     pub format: vk::Format,
     /// Size of the image.
     pub extent: vk::Extent3D,
-    /// Number of mipmap levels. Note that the mipmaps contents must still be generated manually.
+    /// Number of mipmap levels. Note that the mipmaps contents must still be generated manually. Default is 1. 0 is *not* a valid value.
     pub mip_levels: u32,
-    /// Number of array layers.
+    /// Number of array layers. Default is 1. 0 is *not* a valid value.
     pub array_layers: u32,
-    /// Number of samples.
+    /// Number of samples. Default is 1. 0 is *not* a valid value.
     pub samples: u32,
     /// Tiling.
     pub tiling: vk::ImageTiling,
 }
 
-/// Parameters of a newly created buffer resource.
-#[derive(Copy, Clone, Debug, Default)]
+/// Information passed to `Context::create_buffer` to describe the buffer to be created.
+#[derive(Copy, Clone, Debug)]
 pub struct BufferResourceCreateInfo {
-    /// Usage flags.
+    /// Usage flags. Must include all intended uses of the buffer.
     pub usage: vk::BufferUsageFlags,
     /// Size of the buffer in bytes.
     pub byte_size: u64,
     /// Whether the memory for the resource should be mapped for host access immediately.
-    /// If this flag is set, `create_buffer_resource` will also return a pointer to the mapped buffer.
+    /// If this flag is set, `create_buffer` will also return a pointer to the mapped buffer.
     /// This flag is ignored for resources that can't be mapped.
     pub map_on_create: bool,
 }
 
 /// Computes the number of mip levels for a 2D image of the given size.
+///
+/// # Examples
+///
+/// ```
+/// use graal::get_mip_level_count;
+/// assert_eq!(get_mip_level_count(512, 512), 9);
+/// assert_eq!(get_mip_level_count(512, 256), 9);
+/// assert_eq!(get_mip_level_count(511, 256), 8);
+/// ```
 pub fn get_mip_level_count(width: u32, height: u32) -> u32 {
     (width.max(height) as f32).log2().floor() as u32
 }
@@ -507,7 +556,15 @@ pub struct AllocationRequirements {
 }
 
 impl AllocationRequirements {
-    fn adjusted_requirements(&self, other: &AllocationRequirements) -> Option<AllocationRequirements> {
+    /// Returns a copy of these allocation requirements, adjusted so that they fit `other`.
+    /// If these requirements cannot be adjusted, returns `None`.
+    ///
+    /// Adjustment succeeds when the memory location and memory type bits are the same between the two requirements.
+    /// In this case, size and alignment are set to the biggest of the two.
+    fn adjusted_requirements(
+        &self,
+        other: &AllocationRequirements,
+    ) -> Option<AllocationRequirements> {
         if self.location != other.location {
             return None;
         }
@@ -612,33 +669,34 @@ pub(crate) enum ResourceMemory {
 }*/
 
 /// Describes how a resource got its memory.
-#[derive(Clone,Debug)]
+#[derive(Clone, Debug)]
 pub enum ResourceAllocation {
-
     /// a block of memory exclusively for this resource.
     Default {
-        allocation: gpu_allocator::vulkan::Allocation
+        allocation: gpu_allocator::vulkan::Allocation,
     },
 
     /// Memory aliasing: allocate a block of memory for the resource, which can possibly be shared
     /// with other aliasable resources if their lifetimes do not overlap.
     Transient {
         device_memory: vk::DeviceMemory,
-        offset: vk::DeviceSize
+        offset: vk::DeviceSize,
     },
 
     /// The memory for this resource was imported or exported from/to an external handle.
     External { device_memory: vk::DeviceMemory },
-
 }
 
-#[derive(Clone,Debug)]
+/// Specifies the kind of ownership held on a resource.
+#[derive(Clone, Debug)]
 pub enum ResourceOwnership {
-    Owned {
+    /// We own the resource and are responsible for its deletion.
+    OwnedResource {
         requirements: AllocationRequirements,
         allocation: Option<ResourceAllocation>,
     },
-    Referenced,
+    /// We are referencing an external resource which we do not own (e.g. a swapchain image).
+    External,
 }
 
 #[derive(Debug)]
@@ -649,7 +707,7 @@ pub(crate) struct Resource {
     /// Whether this pass has been discarded during the last frame.
     pub(crate) discarded: bool,
 
-    /// The memory bound to the resource.
+    /// Who owns the resource.
     pub(crate) ownership: ResourceOwnership,
 
     /// Details specific to the kind of resource (buffer or image).
@@ -691,13 +749,13 @@ impl Resource {
     fn set_allocation(&mut self, alloc: ResourceAllocation) {
         // set the allocation type on the resource object
         match self.ownership {
-            ResourceOwnership::Owned {
+            ResourceOwnership::OwnedResource {
                 ref mut allocation, ..
             } => {
                 assert!(allocation.is_none());
                 *allocation = Some(alloc)
-            },
-            _ => panic!("trying to set an allocation on an unowned object")
+            }
+            _ => panic!("trying to set an allocation on an unowned object"),
         }
     }
 }
@@ -707,7 +765,9 @@ impl Resource {
 unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     // deallocate its memory, if it was allocated for this object exclusively
     match resource.ownership {
-        ResourceOwnership::Owned { ref mut allocation, .. } => {
+        ResourceOwnership::OwnedResource {
+            ref mut allocation, ..
+        } => {
             // destroy the object, if we're responsible for it (we're not responsible of destroying
             // swapchain images, for example, since they are destroyed with the swapchain).
             match &mut resource.kind {
@@ -725,9 +785,7 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
 
             // free the memory associated to the object
             match allocation.take() {
-                Some(ResourceAllocation::Default {
-                         allocation
-                     }) => {
+                Some(ResourceAllocation::Default { allocation }) => {
                     device.allocator.borrow_mut().free(allocation).unwrap()
                 }
                 _ => {
@@ -776,13 +834,17 @@ impl<T> From<TypedBufferInfo<T>> for BufferInfo {
 }
 
 impl<T: Copy> TypedBufferInfo<T> {
-    pub unsafe fn byte_cast<U>(&self) -> TypedBufferInfo<U> where T: Sized, U: Sized {
+    pub unsafe fn byte_cast<U>(&self) -> TypedBufferInfo<U>
+    where
+        T: Sized,
+        U: Sized,
+    {
         // TODO static assert?
         assert_eq!(mem::size_of::<T>(), mem::size_of::<U>());
         TypedBufferInfo {
             id: self.id,
             handle: self.handle,
-            mapped_ptr: self.mapped_ptr.map(|ptr| ptr.cast())
+            mapped_ptr: self.mapped_ptr.map(|ptr| ptr.cast()),
         }
     }
 }
@@ -798,11 +860,23 @@ pub struct ImageInfo {
 
 // ---------------------------------------------------------------------------------------------
 
+struct ResourceGroup {
+    wait_serials: QueueSerialNumbers,
+    // ignored if waiting on multiple queues
+    src_stage_mask: vk::PipelineStageFlags,
+    dst_stage_mask: vk::PipelineStageFlags,
+    // ignored if waiting on multiple queues
+    src_access_mask: vk::AccessFlags,
+    dst_access_mask: vk::AccessFlags,
+}
+
+// ---------------------------------------------------------------------------------------------
+
 #[derive(Clone, Debug)]
 pub struct ResourceRegistrationInfo<'a> {
     pub name: &'a str,
     pub ownership: ResourceOwnership,
-    pub initial_wait: Option<SemaphoreWait>
+    pub initial_wait: Option<SemaphoreWait>,
 }
 
 #[derive(Clone, Debug)]
@@ -819,7 +893,7 @@ pub struct BufferRegistrationInfo<'a> {
 }
 
 impl Context {
-    /// Frees or recycles resources used by batches that have completed and that have no user
+    /// Frees or recycles resources used by frames that have completed and that have no user
     /// references.
     pub(crate) fn cleanup_resources(&mut self) {
         let _ = trace_span!("cleanup_resources");
@@ -843,12 +917,11 @@ impl Context {
         })
     }
 
-
-
-    unsafe fn register_resource(&mut self,
-                                info: ResourceRegistrationInfo,
-                                kind: ResourceKind) -> ResourceId
-    {
+    unsafe fn register_resource(
+        &mut self,
+        info: ResourceRegistrationInfo,
+        kind: ResourceKind,
+    ) -> ResourceId {
         let (object_type, object_handle) = match kind {
             ResourceKind::Buffer(ref buf) => (vk::ObjectType::BUFFER, buf.handle.as_raw()),
             ResourceKind::Image(ref img) => (vk::ObjectType::IMAGE, img.handle.as_raw()),
@@ -859,7 +932,7 @@ impl Context {
             discarded: false,
             tracking: Default::default(),
             kind,
-            ownership: info.ownership
+            ownership: info.ownership,
         });
 
         set_debug_object_name(
@@ -867,41 +940,162 @@ impl Context {
             object_type,
             object_handle,
             info.name,
-            Some(self.next_serial)
+            Some(self.next_serial),
         );
 
         id
     }
 
     /// Registers an existing buffer resource in the context.
-    pub unsafe fn register_buffer_resource(
-        &mut self,
-        info: BufferRegistrationInfo,
-    ) -> BufferId {
-        let id = self.register_resource( info.resource, ResourceKind::Buffer(BufferResource { handle: info.handle }));
+    pub unsafe fn register_buffer_resource(&mut self, info: BufferRegistrationInfo) -> BufferId {
+        let id = self.register_resource(
+            info.resource,
+            ResourceKind::Buffer(BufferResource {
+                handle: info.handle,
+            }),
+        );
         BufferId(id)
     }
 
     /// Registers an existing image resource in the context.
-    pub unsafe fn register_image_resource(
-        &mut self,
-        info: ImageRegistrationInfo,
-    ) -> ImageId {
-        let id = self.register_resource(info.resource, ResourceKind::Image(ImageResource { handle: info.handle, format: info.format }));
+    pub unsafe fn register_image_resource(&mut self, info: ImageRegistrationInfo) -> ImageId {
+        let id = self.register_resource(
+            info.resource,
+            ResourceKind::Image(ImageResource {
+                handle: info.handle,
+                format: info.format,
+            }),
+        );
         ImageId(id)
     }
 
-    /// Destroys the image once it's not in use.
+    /// Marks the image as ready to be deleted.
+    ///
+    /// The actual destruction of the resource is delayed until all passes referencing this resource
+    /// have finished execution.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use graal::{ImageInfo, MemoryLocation, vk, ImageResourceCreateInfo};
+    /// # let mut context = graal::Context::new();
+    ///
+    /// context.start_frame(Default::default());
+    ///
+    /// // create the image resource.
+    /// # let image_resource_create_info : ImageResourceCreateInfo = todo!();
+    /// let image_info = context.create_image("target", MemoryLocation::GpuOnly, &image_resource_create_info);
+    ///
+    /// // reference the resource in pass P1, in the current frame.
+    /// context.add_graphics_pass("P1", |pass| {
+    ///
+    ///     pass.reference_image(image_info.id,
+    ///             vk::AccessFlags::TRANSFER_WRITE,    // whatever
+    ///             vk::PipelineStageFlags::TRANSFER,
+    ///             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    ///             vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+    ///     // ... do stuff in the pass ...
+    /// });
+    ///
+    /// // We won't be using the image in subsequent passes, we can ask to destroy it.
+    /// // The resource will be destroyed once P1 has finished executing.
+    /// context.destroy_image(image_info.id);
+    /// context.end_frame();
+    /// ```
     pub fn destroy_image(&mut self, id: ImageId) {
+        // resources are really destroyed during `Context::cleanup_resources`, which checks that
+        // all passes referencing this resource have finished executing.
         self.resources.get_mut(id.0).unwrap().discarded = true;
     }
 
-    /// Destroys the buffer once it's not in use.
+    /// Marks the buffer as unused and ready to be deleted.
+    ///
+    /// The resource will be destroyed once all passes referencing this resource
+    /// have finished execution.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use graal::{BufferInfo, MemoryLocation, vk, BufferResourceCreateInfo};
+    /// # let mut context = graal::Context::new();
+    ///
+    /// context.start_frame(Default::default());
+    ///
+    /// // create the buffer resource.
+    /// # let buffer_resource_create_info : BufferResourceCreateInfo = todo!();
+    /// let buffer_info = context.create_buffer("target", MemoryLocation::GpuOnly,
+    ///                                         &buffer_resource_create_info);
+    ///
+    /// // reference the resource in pass P1, in the current frame.
+    /// context.add_graphics_pass("P1", |pass| {
+    ///     pass.reference_buffer(buffer_info.id,
+    ///             vk::AccessFlags::VERTEX_ATTRIBUTE_READ,
+    ///             vk::PipelineStageFlags::VERTEX_SHADER);
+    ///     // ... do stuff with the buffer in the pass ...
+    /// });
+    ///
+    /// // We won't be using the buffer in subsequent passes, we can ask to destroy it.
+    /// // The resource will be destroyed once P1 has finished executing.
+    /// context.destroy_buffer(buffer_info.id);
+    /// context.end_frame();
+    /// ```
     pub fn destroy_buffer(&mut self, id: BufferId) {
         self.resources.get_mut(id.0).unwrap().discarded = true;
     }
 
+    /// Creates a resource group.
+    pub fn create_resource_group(
+        &mut self,
+        src_stage_mask: vk::PipelineStageFlags,
+        dst_stage_mask: vk::PipelineStageFlags,
+        src_access_mask: vk::AccessFlags,
+        dst_access_mask: vk::AccessFlags,
+    ) -> GroupId {
+        self.resource_groups.insert(ResourceGroup {
+            wait_serials: Default::default(),
+            src_stage_mask,
+            dst_stage_mask,
+            src_access_mask,
+            dst_access_mask,
+        })
+    }
+
+    /// Destroys a resource group.
+    pub fn destroy_resource_group(&mut self, group_id: GroupId) {
+        self.resource_groups.remove(group_id);
+    }
+
     /// Creates a new image resource.
+    ///
+    /// Returns an `ImageInfo` struct containing the image resource ID and the vulkan image handle.
+    ///
+    /// # Notes
+    /// The image might not have any device memory attached when this function returns.
+    /// This is because graal may delay the allocation and binding of device memory until the end of the
+    /// current frame (see `Context::end_frame`).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use graal::{ImageInfo, MemoryLocation, vk, ImageResourceCreateInfo};
+    /// # let mut context = graal::Context::new();
+    ///
+    /// // Create a 512x512 RGBA16F image that will serve as both a color attachment and a sampled texture.
+    /// let ImageInfo { id, handle } = context.create_image("texture", MemoryLocation::GpuOnly, &ImageResourceCreateInfo {
+    ///     image_type: vk::ImageType::TYPE_2D,
+    ///     usage: vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT,
+    ///     format: vk::Format::R16G16B16A16_SFLOAT,
+    ///     extent: vk::Extent3D {
+    ///         width: 512,
+    ///         height: 512,
+    ///         depth: 1,
+    ///     },
+    ///     mip_levels: 1,
+    ///     array_layers: 1,
+    ///     samples: 1,
+    ///     tiling: Default::default(),
+    /// });
+    /// ```
     ///
     /// Whether the resource should live only for the duration of the frame it's used in.
     /// When the frame that uses the resource completes, the resource is automatically deleted.
@@ -943,17 +1137,14 @@ impl Context {
             self.register_image_resource(ImageRegistrationInfo {
                 resource: ResourceRegistrationInfo {
                     name,
-                    ownership: ResourceOwnership::Owned {
-                        requirements: AllocationRequirements {
-                            mem_req,
-                            location
-                        },
-                        allocation: None
+                    ownership: ResourceOwnership::OwnedResource {
+                        requirements: AllocationRequirements { mem_req, location },
+                        allocation: None,
                     },
-                    initial_wait: None
+                    initial_wait: None,
                 },
                 handle,
-                format: image_info.format
+                format: image_info.format,
             })
         };
 
@@ -961,13 +1152,38 @@ impl Context {
     }
 
     /// Creates a new buffer resource.
+    ///
+    /// Returns a `BufferInfo` struct containing the buffer resource ID, the vulkan buffer handle,
+    /// and a pointer to the buffer mapped in host memory, if `buffer_create_info.map_on_create == true`.
+    ///
+    /// # Notes
+    /// If `map_on_create` is specified in `BufferResourceCreateInfo`, the returned vulkan buffer
+    /// is guaranteed to have a block of device memory attached to it after this function returns
+    /// (i.e. a call `vkBindBufferMemory` has been made for this buffer).
+    ///
+    /// Otherwise, graal can opt to delay the allocation and binding of device memory for this buffer until the
+    /// end of the current frame for optimization purposes (see `Context::end_frame`).
+    /// In this case, the created buffer object might not have any device memory attached when this function returns.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use graal::{BufferInfo, BufferResourceCreateInfo, MemoryLocation, vk};
+    /// # let mut context = graal::Context::new();
+    ///
+    /// // Create a staging buffer for uploading data to the GPU
+    /// let BufferInfo { id, handle, mapped_ptr } = context.create_buffer("staging", MemoryLocation::CpuToGpu, &BufferResourceCreateInfo {
+    ///     usage: vk::BufferUsageFlags::TRANSFER_SRC,
+    ///     byte_size: 1024,
+    ///     map_on_create: true,    // ensures that mapped_ptr is not empty
+    /// });
+    /// ```
     pub fn create_buffer(
         &mut self,
         name: &str,
         location: MemoryLocation,
         buffer_create_info: &BufferResourceCreateInfo,
     ) -> BufferInfo {
-
         // create the buffer object first
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
@@ -995,17 +1211,11 @@ impl Context {
         let (ownership, mapped_ptr) = if !buffer_create_info.map_on_create {
             // We can delay allocation only if the user requests a transient resource and
             // if the resource does not need to be mapped immediately.
-            let ownership = ResourceOwnership::Owned {
-                requirements: AllocationRequirements {
-                    mem_req,
-                    location,
-                },
-                allocation: None
+            let ownership = ResourceOwnership::OwnedResource {
+                requirements: AllocationRequirements { mem_req, location },
+                allocation: None,
             };
-            (
-                /* ownership */ ownership,
-                /* mapped_ptr */ None,
-            )
+            (/* ownership */ ownership, /* mapped_ptr */ None)
         } else {
             // caller requested a mapped pointer, must create and allocate immediately
             let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
@@ -1016,28 +1226,20 @@ impl Context {
             };
             let allocation = self
                 .device
-                .allocator.borrow_mut()
+                .allocator
+                .borrow_mut()
                 .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
             unsafe {
                 self.device
                     .device
-                    .bind_buffer_memory(
-                        handle,
-                        allocation.memory(),
-                        allocation.offset() as u64,
-                    )
+                    .bind_buffer_memory(handle, allocation.memory(), allocation.offset() as u64)
                     .unwrap();
             }
             let mapped_ptr = allocation.mapped_ptr();
-            let ownership = ResourceOwnership::Owned {
-                requirements: AllocationRequirements {
-                    mem_req,
-                    location,
-                },
-                allocation: Some(ResourceAllocation::Default {
-                    allocation
-                })
+            let ownership = ResourceOwnership::OwnedResource {
+                requirements: AllocationRequirements { mem_req, location },
+                allocation: Some(ResourceAllocation::Default { allocation }),
             };
             /*let mapped_ptr = if buffer_create_info.map_on_create {
                 let ptr = allocation.mapped_ptr().expect("failed to map buffer");
@@ -1047,16 +1249,18 @@ impl Context {
                 ptr::null_mut()
             };*/
 
-            (ownership,  mapped_ptr)
+            (ownership, mapped_ptr)
         };
 
-        let id = unsafe { self.register_buffer_resource(BufferRegistrationInfo {
-            resource: ResourceRegistrationInfo {
-                name,
-                initial_wait: None,
-                ownership
-            },
-            handle})
+        let id = unsafe {
+            self.register_buffer_resource(BufferRegistrationInfo {
+                resource: ResourceRegistrationInfo {
+                    name,
+                    initial_wait: None,
+                    ownership,
+                },
+                handle,
+            })
         };
 
         BufferInfo {
@@ -1066,7 +1270,6 @@ impl Context {
         }
     }
 }
-
 
 /// Stores the set of resources owned by a currently executing frame.
 #[derive(Debug)]
@@ -1107,6 +1310,279 @@ impl GpuFuture {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+pub(crate) struct ResourceAccess {
+    pub(crate) id: ResourceId,
+    pub(crate) access_mask: vk::AccessFlags,
+}
+
+pub(crate) enum PassCommands {
+    Present {
+        swapchain: vk::SwapchainKHR,
+        image_index: u32,
+    },
+    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue)>),
+    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer)>),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SemaphoreWaitKind {
+    Binary,
+    Timeline(u64),
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SemaphoreSignalKind {
+    Binary,
+    Timeline(u64),
+}
+
+/// Represents a semaphore wait operation outside of the queue timelines.
+#[derive(Clone, Debug)]
+pub struct SemaphoreWait {
+    /// The semaphore in question
+    pub(crate) semaphore: vk::Semaphore,
+    /// Whether the semaphore is internally managed (owned by the context).
+    /// If true, the semaphore will be reclaimed by the context after it is consumed (waited on).
+    pub(crate) owned: bool,
+    /// Destination stage
+    pub(crate) dst_stage: vk::PipelineStageFlags,
+    /// The kind of wait operation.
+    pub(crate) wait_kind: SemaphoreWaitKind,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct SemaphoreSignal {
+    pub(crate) semaphore: vk::Semaphore,
+    pub(crate) signal_kind: SemaphoreSignalKind,
+}
+
+/// A pass within a frame.
+pub(crate) struct Pass {
+    name: String,
+
+    /// Submission number of the pass.
+    snn: SubmissionNumber,
+
+    /// Index of the pass in the frame.
+    frame_index: usize,
+
+    /// Predecessors of the pass (all passes that must happen before this one).
+    preds: Vec<usize>,
+
+    /// Successors of the pass (all passes for which this task is a predecessor).
+    //pub(crate) succs: Vec<usize>,
+
+    /// List of accesses made by the pass to resources.
+    // FIXME Right now, this is used only for debugging purposes, and when allocating memory for the resources.
+    // It probably could be removed.
+    pub(crate) accesses: Vec<ResourceAccess>,
+
+    /// Whether the queue timeline semaphores must be signalled after the pass.
+    pub(crate) signal_queue_timelines: bool,
+
+    pub(crate) src_stage_mask: vk::PipelineStageFlags,
+    pub(crate) dst_stage_mask: vk::PipelineStageFlags,
+    pub(crate) image_memory_barriers: Vec<vk::ImageMemoryBarrier>,
+    pub(crate) buffer_memory_barriers: Vec<vk::BufferMemoryBarrier>,
+    pub(crate) global_memory_barrier: Option<vk::MemoryBarrier>,
+
+    pub(crate) wait_serials: QueueSerialNumbers,
+    pub(crate) wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
+
+    pub(crate) external_semaphore_waits: Vec<SemaphoreWait>,
+    pub(crate) external_semaphore_signals: Vec<SemaphoreSignal>,
+
+    pub(crate) commands: Option<PassCommands>,
+}
+
+impl Pass {
+    pub(crate) fn get_or_create_image_memory_barrier(
+        &mut self,
+        handle: vk::Image,
+        format: vk::Format,
+    ) -> &mut vk::ImageMemoryBarrier {
+        if let Some(b) = self
+            .image_memory_barriers
+            .iter_mut()
+            .position(|b| b.image == handle)
+        {
+            &mut self.image_memory_barriers[b]
+        } else {
+            let subresource_range = vk::ImageSubresourceRange {
+                aspect_mask: format_aspect_mask(format),
+                base_mip_level: 0,
+                level_count: vk::REMAINING_MIP_LEVELS,
+                base_array_layer: 0,
+                layer_count: vk::REMAINING_ARRAY_LAYERS,
+            };
+            self.image_memory_barriers.push(vk::ImageMemoryBarrier {
+                src_access_mask: vk::AccessFlags::empty(),
+                dst_access_mask: vk::AccessFlags::empty(),
+                old_layout: vk::ImageLayout::UNDEFINED,
+                new_layout: vk::ImageLayout::UNDEFINED,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                image: handle,
+                subresource_range,
+                ..Default::default()
+            });
+            self.image_memory_barriers.last_mut().unwrap()
+        }
+    }
+
+    pub(crate) fn get_or_create_buffer_memory_barrier(
+        &mut self,
+        handle: vk::Buffer,
+    ) -> &mut vk::BufferMemoryBarrier {
+        if let Some(b) = self
+            .buffer_memory_barriers
+            .iter_mut()
+            .position(|b| b.buffer == handle)
+        {
+            &mut self.buffer_memory_barriers[b]
+        } else {
+            self.buffer_memory_barriers.push(vk::BufferMemoryBarrier {
+                src_access_mask: vk::AccessFlags::empty(),
+                dst_access_mask: vk::AccessFlags::empty(),
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                buffer: handle,
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+                ..Default::default()
+            });
+            self.buffer_memory_barriers.last_mut().unwrap()
+        }
+    }
+
+    pub(crate) fn get_or_create_global_memory_barrier(&mut self) -> &mut vk::MemoryBarrier {
+        self.global_memory_barrier
+            .get_or_insert_with(Default::default)
+    }
+
+    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass {
+        Pass {
+            name: name.to_string(),
+            snn,
+            preds: vec![],
+            //succs: vec![],
+            accesses: vec![],
+            signal_queue_timelines: false,
+            src_stage_mask: Default::default(),
+            dst_stage_mask: Default::default(),
+            image_memory_barriers: vec![],
+            buffer_memory_barriers: vec![],
+            global_memory_barrier: None,
+            wait_serials: Default::default(),
+            wait_dst_stages: Default::default(),
+            external_semaphore_waits: vec![],
+            external_semaphore_signals: vec![],
+            frame_index,
+            commands: None,
+        }
+    }
+}
+
+type TemporarySet = std::collections::BTreeSet<ResourceId>;
+
+/// Collected debugging information about a frame.
+struct SyncDebugInfo {
+    tracking: slotmap::SecondaryMap<ResourceId, ResourceTrackingInfo>,
+    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
+}
+
+impl SyncDebugInfo {
+    fn new() -> SyncDebugInfo {
+        SyncDebugInfo {
+            tracking: Default::default(),
+            xq_sync_table: Default::default(),
+        }
+    }
+}
+
+///
+pub(crate) struct Frame {
+    frame_number: FrameNumber,
+    span: tracing::span::EnteredSpan,
+    build_span: tracing::span::EnteredSpan,
+    base_serial: u64,
+    /// Map temporary index -> resource
+    temporaries: Vec<ResourceId>,
+    /// Set of all resources referenced in the frame
+    temporary_set: TemporarySet,
+    /// List of passes
+    passes: Vec<Pass>,
+    /// Serials to wait for before executing the frame.
+    wait_init: QueueSerialNumbers,
+
+    /// Cross-queue synchronization table.
+    ///
+    /// This table tracks, for each queue, the latest passes on every other queue for which we
+    /// have inserted an execution dependency in the command stream.
+    ///
+    /// By construction, we can ensure that all subsequent commands on `dst_queue` will happen after all passes
+    /// on `src_queue` with a SN lower than or equal to `xq_sync_table[dst_queue][src_queue]`.
+    ///
+    ///
+    /// # Example
+    /// Consider `MAX_QUEUES = 4`. The table starts initialized to zero.
+    /// We have 4 passes: with SNNs `0:1`, `1:2`, `2:3`, `0:4`, with dependencies:
+    /// 1 -> 2, 1 -> 3 and (2,3) -> 4.
+    ///
+    /// The sync table starts empty:
+    /// ```text
+    ///     SRC_Q:  Q0  Q1  Q2  Q3
+    ///  DST_Q:
+    ///    Q0:   [  0   0   0   0 ]
+    ///    Q1:   [  0   0   0   0 ]
+    ///    Q2:   [  0   0   0   0 ]
+    ///    Q3:   [  0   0   0   0 ]
+    /// ```
+    ///
+    /// When submitting pass `1:2`, we insert a wait on Q1, for SN 1 on Q0.
+    /// We can update the table as follows:
+    /// ```text
+    ///     SRC_Q:  Q0  Q1  Q2  Q3
+    ///  DST_Q:
+    ///    Q0:   [  0   0   0   0  ]
+    ///    Q1:   [  1   0   0   0  ]
+    ///    Q2:   [  0   0   0   0  ]
+    ///    Q3:   [  0   0   0   0  ]
+    /// ```
+    ///
+    /// Similarly, when submitting pass `2:3`, we insert a wait on Q2, for SN 1 on Q0:
+    /// ```text
+    ///     SRC_Q:  Q0  Q1  Q2  Q3
+    ///  DST_Q:
+    ///    Q0:   [  0   0   0   0  ]
+    ///    Q1:   [  1   0   0   0  ]
+    ///    Q2:   [  1   0   0   0  ]
+    ///    Q3:   [  0   0   0   0  ]
+    /// ```
+    ///
+    /// Finally, when submitting pass `0:4`, we insert a wait on Q0, for SN 2 on Q1 and SN 3 on Q2:
+    /// The final state of the sync table is:
+    /// ```text
+    ///     SRC_Q:  Q0  Q1  Q2  Q3
+    ///  DST_Q:
+    ///    Q0:   [  0   2   3   0  ]
+    ///    Q1:   [  1   0   0   0  ]
+    ///    Q2:   [  1   0   0   0  ]
+    ///    Q3:   [  0   0   0   0  ]
+    /// ```
+    ///
+    /// This tells us that, in the current state of the command stream:
+    /// - Q0 has waited for pass SN 2 on Q1, and pass SN 3 on Q2
+    /// - Q1 has waited for pass SN 1 on Q0
+    /// - Q2 has also waited for pass SN 1 on Q0
+    /// - Q3 hasn't synchronized with anything
+    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
+
+    collect_sync_debug_info: bool,
+    sync_debug_info: Vec<SyncDebugInfo>,
+}
+
 /// Graphics context
 pub struct Context {
     pub(crate) device: Device,
@@ -1116,6 +1592,9 @@ pub struct Context {
 
     /// Resources (images and buffers), mapped by ID
     resources: ResourceMap,
+
+    /// Resource groups.
+    resource_groups: slotmap::SlotMap<GroupId, ResourceGroup>,
 
     /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
     timelines: [vk::Semaphore; MAX_QUEUES],
@@ -1142,6 +1621,13 @@ pub struct Context {
     completed_frame_count: u64,
 
     current_frame: Option<Frame>,
+}
+
+impl fmt::Debug for Context {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // TODO good luck with that
+        f.debug_struct("Context").finish()
+    }
 }
 
 impl Context {
@@ -1187,12 +1673,13 @@ impl Context {
             available_command_pools: vec![],
             completed_serials: Default::default(),
             resources: SlotMap::with_key(),
+            resource_groups: SlotMap::with_key(),
             semaphore_pool: vec![],
             next_serial: 0,
             submitted_frame_count: 0,
             completed_frame_count: 0,
             in_flight: VecDeque::new(),
-            current_frame: None
+            current_frame: None,
         }
     }
 
@@ -1243,7 +1730,7 @@ impl Context {
     }
 
     /// Returns whether the given frame, identified by its serial, has completed execution.
-    pub fn is_frame_completed(&self, serial: FrameSerialNumber) -> bool {
+    pub fn is_frame_completed(&self, serial: FrameNumber) -> bool {
         self.completed_frame_count >= serial.0
     }
 
@@ -1284,7 +1771,6 @@ impl Context {
             })
             .unwrap_or(ResourceId::null())
     }
-
 
     /// Waits for all but the last submitted frame to finish and then recycles their resources.
     /// Calls `cleanup_resources` internally.

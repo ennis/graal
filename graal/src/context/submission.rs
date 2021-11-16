@@ -1,20 +1,21 @@
+//! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
-    context::{
-        pass::{Pass, PassCommands},
-        QueueSerialNumbers, SubmissionNumber,
-    },
+    context::{QueueSerialNumbers, SubmissionNumber},
     vk, Context, MAX_QUEUES,
 };
 
-use crate::context::SEMAPHORE_WAIT_TIMEOUT_NS;
+use crate::context::{
+    Frame, FrameInFlight, PassCommands, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+    SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
+};
 use std::{
     ffi::{c_void, CString},
     ops::{Deref, DerefMut},
     ptr,
 };
 
+use crate::context::transient::allocate_memory_for_transients;
 use tracing::trace_span;
-use crate::context::pass::{SemaphoreSignal, SemaphoreWait, SemaphoreSignalKind, SemaphoreWaitKind};
 
 /// Context passed to the command callbacks.
 pub struct CommandContext<'a> {
@@ -28,7 +29,6 @@ impl<'a> Deref for CommandContext<'a> {
         self.context
     }
 }
-
 
 /// Allocates command buffers in a `vk::CommandPool` and allows re-use of freed command buffers.
 #[derive(Debug)]
@@ -116,20 +116,6 @@ impl Default for CommandBatch {
     }
 }
 
-/// Represents the result of a successful frame submission operation.
-pub(crate) struct FrameSubmissionResult {
-    /// The command pools used in the batch
-    pub(crate) command_pools: Vec<CommandAllocator>,
-
-    /// The last signalled serial numbers for each queue. They correspond to the last submitted passes
-    /// in each queue.
-    pub(crate) signalled_serials: QueueSerialNumbers,
-
-    /// All semaphores used in this batch. When the batch is complete, those
-    /// semaphores are guaranteed to be in the unsignalled state.
-    pub(crate) semaphores: Vec<vk::Semaphore>,
-}
-
 impl Context {
     pub(crate) fn wait(&self, serials: &QueueSerialNumbers) {
         let _span = trace_span!("wait", ?serials);
@@ -205,7 +191,6 @@ impl Context {
             match wait.wait_kind {
                 SemaphoreWaitKind::Binary => {
                     wait_semaphore_values.push(0);
-
                 }
                 SemaphoreWaitKind::Timeline(value) => {
                     wait_semaphore_values.push(value);
@@ -250,13 +235,13 @@ impl Context {
 
     /// Creates a command pool for the given queue and wraps it in a `CommandAllocator`.
     fn create_command_pool(&mut self, queue_index: usize) -> CommandAllocator {
-
         // Command pools are tied to a queue family
         let queue_family = self.device.queues_info.families[queue_index];
 
         // Try to find a free pool with of the correct queue family in the list of recycled command pools.
         // If we find one, remove it from the list and return it. Otherwise create a new one.
-        if let Some(pos) = self.available_command_pools
+        if let Some(pos) = self
+            .available_command_pools
             .iter()
             .position(|cmd_pool| cmd_pool.queue_family == queue_family)
         {
@@ -284,14 +269,18 @@ impl Context {
         }
     }
 
+    pub(crate) fn submit_frame(&mut self, mut frame: Frame) -> QueueSerialNumbers {
+        frame.build_span.exit();
 
-    // FIXME: not sure this function needs a mut borrow of passes
-    pub(crate) fn submit_frame(
-        &mut self,
-        passes: &mut [Pass],
-        wait_init: QueueSerialNumbers,
-    ) -> FrameSubmissionResult {
         let _ = trace_span!("submit_frame").entered();
+
+        // Allocate and assign memory for all transient resources of this frame.
+        let transient_allocations = allocate_memory_for_transients(
+            self,
+            frame.base_serial,
+            &frame.passes,
+            &frame.temporaries,
+        );
 
         // current submission batches per queue
         let mut cmd_batches: [CommandBatch; MAX_QUEUES] = Default::default();
@@ -303,12 +292,13 @@ impl Context {
 
         let mut first_pass_of_queue = [true; MAX_QUEUES];
 
-        for p in passes.iter_mut() {
+        for p in frame.passes.iter_mut() {
             // queue index
             let q = p.snn.queue();
 
-            let wait_serials = if first_pass_of_queue[q] && wait_init > self.completed_serials {
-                p.wait_serials.join(wait_init)
+            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials
+            {
+                p.wait_serials.join(frame.wait_init)
             } else {
                 p.wait_serials
             };
@@ -336,7 +326,7 @@ impl Context {
             if needs_semaphore_wait {
                 batch.wait_serials = wait_serials;
                 batch.wait_dst_stages = p.wait_dst_stages; // FIXME are those OK?
-                // the current batch shouldn't have any pending waits because we just flushed them
+                                                           // the current batch shouldn't have any pending waits because we just flushed them
                 batch.external_semaphore_waits = p.external_semaphore_waits.clone();
             }
 
@@ -392,13 +382,18 @@ impl Context {
                     p.dst_stage_mask
                 };
                 unsafe {
+                    let global_memory_barrier = if let Some(mb) = p.global_memory_barrier.as_ref() {
+                        std::slice::from_ref(mb)
+                    } else {
+                        &[]
+                    };
                     // TODO safety
                     self.device.device.cmd_pipeline_barrier(
                         cb,
                         src_stage_mask,
                         dst_stage_mask,
                         Default::default(),
-                        &[],
+                        global_memory_barrier,
                         &p.buffer_memory_barriers,
                         &p.image_memory_barriers,
                     )
@@ -408,9 +403,7 @@ impl Context {
             match p.commands.take() {
                 Some(PassCommands::CommandBuffer(handler)) => {
                     // perform a command-buffer level operation
-                    let mut cctx = CommandContext {
-                        context: self,
-                    };
+                    let mut cctx = CommandContext { context: self };
                     handler(&mut cctx, cb);
 
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
@@ -423,9 +416,7 @@ impl Context {
                     batch.reset();
                     // call the handler
                     let queue = self.device.queues_info.queues[q as usize];
-                    let mut cctx = CommandContext {
-                        context: self,
-                    };
+                    let mut cctx = CommandContext { context: self };
                     handler(&mut cctx, queue);
                 }
                 Some(PassCommands::Present {
@@ -443,12 +434,10 @@ impl Context {
                     // and maintainability.
                     // Eventually, the presentation engine might support timeline semaphores
                     // directly, which will make this entire problem vanish.
-                    batch
-                        .external_semaphore_signals
-                        .push(SemaphoreSignal {
-                            semaphore: render_finished_semaphore,
-                            signal_kind: SemaphoreSignalKind::Binary
-                        });
+                    batch.external_semaphore_signals.push(SemaphoreSignal {
+                        semaphore: render_finished_semaphore,
+                        signal_kind: SemaphoreSignalKind::Binary,
+                    });
                     self.submit_command_batch(q, batch, &mut used_semaphores);
                     batch.reset();
                     // build present info that waits on the batch that was just submitted
@@ -499,11 +488,25 @@ impl Context {
             .filter_map(|cmd_pool| cmd_pool.take())
             .collect();
 
-        FrameSubmissionResult {
-            command_pools,
+        // Add this frame to the list of "frames in flight": frames that might be executing on the device.
+        // When this frame is completed, all resources of the frame will be automatically recycled.
+        // This includes:
+        // - device memory blocks for transient allocations
+        // - command buffers (in command pools)
+        // - image views
+        // - framebuffers
+        // - descriptor sets
+        self.in_flight.push_back(FrameInFlight {
             signalled_serials: self.last_signalled_serials,
+            transient_allocations,
+            command_pools,
             semaphores: used_semaphores,
-        }
+        });
+
+        // one more frame submitted
+        self.submitted_frame_count += 1;
+
+        self.last_signalled_serials
     }
 
     /// Recycles command pools returned by `submit_frame`.

@@ -1,14 +1,12 @@
+//! Contains code related to the construction of frames and passes.
 use crate::{
     context::{
-        is_write_access, local_pass_index,
-        pass::{
-            Pass, PassCommands, ResourceAccess, SemaphoreSignal, SemaphoreSignalKind,
-            SemaphoreWait, SemaphoreWaitKind,
-        },
-        transient::allocate_memory_for_transients,
-        BufferId, CommandContext, FrameInFlight, FrameSerialNumber, GpuFuture, ImageId,
-        QueueSerialNumbers, ResourceAccessDetails, ResourceAllocation, ResourceId, ResourceKind,
-        ResourceOwnership, ResourceTrackingInfo, SubmissionNumber, TypedBufferInfo,
+        is_write_access, local_pass_index, BufferId, BufferResource, CommandContext, Frame,
+        FrameInFlight, FrameNumber, GpuFuture, GroupId, ImageId, ImageResource, Pass, PassCommands,
+        QueueSerialNumbers, Resource, ResourceAccess, ResourceAccessDetails, ResourceAllocation,
+        ResourceId, ResourceKind, ResourceOwnership, ResourceTrackingInfo, SemaphoreSignal,
+        SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind, SubmissionNumber, SyncDebugInfo,
+        TemporarySet, TypedBufferInfo,
     },
     swapchain::SwapchainImage,
     vk,
@@ -23,8 +21,6 @@ use std::{
     mem,
 };
 use tracing::trace_span;
-
-type TemporarySet = std::collections::BTreeSet<ResourceId>;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct AccessTypeInfo {
@@ -69,8 +65,13 @@ impl<'a> PassBuilder<'a> {
         })
     }
 
+    /// References a resource group.
+    pub fn reference_group(&mut self, id: GroupId) {
+        self.context.reference_group(&mut self.pass, id);
+    }
+
     /// Registers an image access made by this pass.
-    pub fn register_image_access(
+    pub fn reference_image(
         &mut self,
         id: ImageId,
         access_mask: vk::AccessFlags,
@@ -78,7 +79,7 @@ impl<'a> PassBuilder<'a> {
         initial_layout: vk::ImageLayout,
         final_layout: vk::ImageLayout,
     ) {
-        self.context.add_resource_dependency(
+        self.context.reference_resource(
             &mut self.pass,
             id.0,
             &ResourceAccessDetails {
@@ -90,13 +91,13 @@ impl<'a> PassBuilder<'a> {
         )
     }
 
-    pub fn register_buffer_access(
+    pub fn reference_buffer(
         &mut self,
         id: BufferId,
         access_mask: vk::AccessFlags,
         stage_mask: vk::PipelineStageFlags,
     ) {
-        self.context.add_resource_dependency(
+        self.context.reference_resource(
             &mut self.pass,
             id.0,
             &ResourceAccessDetails {
@@ -125,51 +126,227 @@ impl<'a> PassBuilder<'a> {
     }
 }
 
-struct SyncDebugInfo {
-    tracking: slotmap::SecondaryMap<ResourceId, ResourceTrackingInfo>,
-    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
+enum MemoryBarrierKind<'a> {
+    Buffer {
+        resource: &'a BufferResource,
+        src_access_mask: vk::AccessFlags,
+        dst_access_mask: vk::AccessFlags,
+    },
+    Image {
+        resource: &'a ImageResource,
+        src_access_mask: vk::AccessFlags,
+        dst_access_mask: vk::AccessFlags,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    },
+    Global {
+        src_access_mask: vk::AccessFlags,
+        dst_access_mask: vk::AccessFlags,
+    },
 }
 
-impl SyncDebugInfo {
-    fn new() -> SyncDebugInfo {
-        SyncDebugInfo {
-            tracking: Default::default(),
-            xq_sync_table: Default::default(),
+struct PipelineBarrierDesc<'a> {
+    src_stage_mask: vk::PipelineStageFlags,
+    dst_stage_mask: vk::PipelineStageFlags,
+    memory_barrier: Option<MemoryBarrierKind<'a>>,
+}
+
+/// Helper function to add a memory dependency between source passes and a destination pass.
+/// Updates the sync tracking information in `frame`.
+///
+/// # Arguments
+///
+/// * `frame`: the current frame
+/// * `pass`: the pass being built
+/// * `sources`: SNNs of the passes to synchronize with
+fn add_memory_dependency(
+    frame: &mut Frame,
+    dst_pass: &mut Pass,
+    sources: QueueSerialNumbers,
+    barrier: PipelineBarrierDesc,
+) {
+    let q = dst_pass.snn.queue();
+
+    // from here, we have two possible methods of synchronization:
+    // 1. semaphore signal/wait: this is straightforward, there's not a lot we can do
+    // 2. pipeline barrier: we can choose **where** to put the barrier,
+    //    we can put it anywhere between the source and the destination pass
+    // -> if the source is just before, then use a pipeline barrier
+    // -> if there's a gap, use an event?
+
+    if !sources.is_single_source_same_queue_and_frame(q, frame.base_serial) {
+        // Either:
+        // - there are multiple sources across several queues
+        // - the source is in a different queue
+        // - the source is in an older frame
+        // In those cases, a semaphore wait is necessary to synchronize.
+
+        // go through each non-zero source
+        for (iq, &sn) in sources.iter().enumerate() {
+            if sn == 0 {
+                continue;
+            }
+
+            // look in the cross-queue sync table to see if there's already an execution dependency
+            // between the source (sn) and us.
+            if frame.xq_sync_table[q].0[iq] >= sn {
+                // already synced
+                continue;
+            }
+
+            // we're adding a semaphore wait: update sync table
+            frame.xq_sync_table[q].0[iq] = sn;
+
+            dst_pass.wait_serials.0[iq] = sn;
+            dst_pass.wait_dst_stages[iq] |= barrier.dst_stage_mask;
+
+            if sn > frame.base_serial {
+                let src_pass_index = local_pass_index(sn, frame.base_serial);
+                let src_pass = &mut frame.passes[src_pass_index];
+                src_pass.signal_queue_timelines = true;
+            }
+        }
+    } else {
+        // There's only one source pass, which furthermore is on the same queue, and in the
+        // same frame as the destination. In this case, we can use a pipeline barrier for
+        // synchronization.
+
+        let src_sn = sources[q];
+
+        // sync dst=q, src=q
+        if frame.xq_sync_table[q][q] >= src_sn {
+            // if we're already synchronized with the source via a cross-queue (xq) wait
+            // (a.k.a. semaphore), we don't need to add a memory barrier.
+            // Note that layout transitions are handled separately, outside this condition.
+        } else {
+            // not synced with a semaphore, see if there's already a pipeline barrier
+            // that ensures the execution dependency between the source (src_sn) and us
+
+            let local_src_index = local_pass_index(src_sn, frame.base_serial);
+
+            // The question we ask ourselves now is: is there already an execution dependency,
+            // from the source pass, for the stages in `src_stage_mask`,
+            // to us (dst_pass), for the stages in `dst_stage_mask`,
+            // created by barriers in passes between the source and us?
+            //
+            // This is not easy to determine: to be perfectly accurate, we need to consider:
+            // - transitive dependencies: e.g. COMPUTE -> FRAGMENT and then FRAGMENT -> TRANSFER also creates a COMPUTE -> TRANSFER dependency
+            // - logically later and earlier stages: e.g. COMPUTE -> VERTEX also implies a COMPUTE -> FRAGMENT dependency
+            //
+            // For now, we just look for a pipeline barrier that directly contains the relevant stages
+            // (i.e. `barrier.src_stage_mask` contains `src_stage_mask`, and `barrier.dst_stage_mask` contains `dst_stage_mask`,
+            // ignoring transitive dependencies and any logical ordering between stages.
+            //
+            // The impact of this approximation is currently unknown.
+
+            // find a pipeline barrier that already takes care of our execution dependency
+            let barrier_pass = frame.passes[local_src_index + 1..]
+                .iter_mut()
+                .find_map(|p| {
+                    if p.snn.queue() == q
+                        && p.src_stage_mask.contains(barrier.src_stage_mask)
+                        && p.dst_stage_mask.contains(barrier.dst_stage_mask)
+                    {
+                        Some(p)
+                    } else {
+                        None
+                    }
+                })
+                // otherwise, just add a pipeline barrier on the current pass
+                .unwrap_or(dst_pass);
+
+            // add our stages to the execution dependency
+            barrier_pass.src_stage_mask |= barrier.src_stage_mask;
+            barrier_pass.dst_stage_mask |= barrier.dst_stage_mask;
+
+            // now deal with the memory dependency
+
+            match barrier.memory_barrier {
+                Some(MemoryBarrierKind::Image {
+                    resource,
+                    src_access_mask,
+                    dst_access_mask,
+                    old_layout,
+                    new_layout,
+                }) => {
+                    let mb = barrier_pass
+                        .get_or_create_image_memory_barrier(resource.handle, resource.format);
+                    mb.src_access_mask |= src_access_mask;
+                    mb.dst_access_mask |= dst_access_mask;
+                    // Also specify the layout transition here.
+                    // This is redundant with the code after that handles the layout transition,
+                    // but we might not always go through here when a layout transition is necessary.
+                    // With Sync2, just set these to UNDEFINED.
+                    // TODO check for consistency: there should be at more one layout transition
+                    // for the image in the pass
+                    mb.old_layout = old_layout;
+                    mb.new_layout = new_layout;
+                }
+                Some(MemoryBarrierKind::Buffer {
+                    resource,
+                    src_access_mask,
+                    dst_access_mask,
+                }) => {
+                    let mb = barrier_pass.get_or_create_buffer_memory_barrier(resource.handle);
+                    mb.src_access_mask |= src_access_mask;
+                    mb.dst_access_mask |= dst_access_mask;
+                }
+                Some(MemoryBarrierKind::Global {
+                    src_access_mask,
+                    dst_access_mask,
+                }) => {
+                    let mb = barrier_pass.get_or_create_global_memory_barrier();
+                    mb.src_access_mask |= src_access_mask;
+                    mb.dst_access_mask |= dst_access_mask;
+                }
+                _ => {}
+            }
         }
     }
 }
 
 // ---------------------------------------------------------------------------------------
-
-// TODO: just drop the `Frame` type altogether? replace with context.begin_frame() and context.end_frame(). No borrow required.
-// -> however, command callbacks will not be able to borrow data.
-pub(crate) struct Frame {
-    frame_serial: FrameSerialNumber,
-    span: tracing::span::EnteredSpan,
-    build_span: tracing::span::EnteredSpan,
-    base_serial: u64,
-    /// Map temporary index -> resource
-    temporaries: Vec<ResourceId>,
-    /// Set of all resources referenced in the frame
-    temporary_set: TemporarySet,
-    /// List of passes
-    passes: Vec<Pass>,
-    /// Serials to wait for before executing the frame.
-    wait_init: QueueSerialNumbers,
-    /// Cross-queue synchronization table
-    /// TODO detailed description
-    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
-    collect_sync_debug_info: bool,
-    sync_debug_info: Vec<SyncDebugInfo>,
-}
-
 impl Context {
+    /// Registers an access to a resource group
+
+    // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
+    // more than one execution and visibility barrier
+    fn reference_group(&mut self, dst_pass: &mut Pass, id: GroupId) {
+        // we just have to wait for the SNNs and stages of the group.
+        let frame = self.current_frame.as_mut().expect("not in a frame");
+
+        let group = self
+            .resource_groups
+            .get(id)
+            .expect("invalid or expired resource group");
+
+        add_memory_dependency(
+            frame,
+            dst_pass,
+            group.wait_serials,
+            PipelineBarrierDesc {
+                src_stage_mask: group.src_stage_mask, // the mask will be big (combined stages of all writes)
+                dst_stage_mask: group.dst_stage_mask,
+                memory_barrier: Some(MemoryBarrierKind::Global {
+                    src_access_mask: group.src_access_mask,
+                    dst_access_mask: group.dst_access_mask,
+                }),
+            },
+        );
+
+        // P1: write to resources (buffers, textures): group.stage = COMPUTE_SHADER | COLOR_ATTACHMENT_OUTPUT
+        //
+
+        let wait_passes = group.wait_serials;
+
+    }
+
     /// Registers an access to a resource within the specified pass and updates the dependency graph.
     ///
     /// This is the meat of the automatic synchronization system: given the known state of the resources,
     /// this function infers the necessary execution barriers, memory barriers, and layout transitions,
     /// and updates the state of the resources.
-    fn add_resource_dependency(
+    fn reference_resource(
         &mut self,
         dst_pass: &mut Pass,
         id: ResourceId,
@@ -262,20 +439,30 @@ impl Context {
                 QueueSerialNumbers::from_submission_number(resource.tracking.writer)
             };
 
-            // from here, we have two possible methods of synchronization:
-            // 1. semaphore signal/wait: this is straightforward, there's not a lot we can do
-            // 2. pipeline barrier: we can choose **where** to put the barrier,
-            //    we can put it anywhere between the source and the destination pass
-            // -> if the source is just before, then use a pipeline barrier
-            // -> if there's a gap, use an event?
-            let base_serial = frame.base_serial;
-
-            // whether `sync_sources` identifies a single source pass in the queue that one we're
-            // submitting on
-            let single_local_source_in_same_queue = sync_sources
-                .iter()
-                .enumerate()
-                .all(|(i, &sn)| (i != q && sn == 0) || (i == q && (sn == 0 || sn > base_serial)));
+            add_memory_dependency(
+                frame,
+                dst_pass,
+                sync_sources,
+                PipelineBarrierDesc {
+                    src_stage_mask: resource.tracking.stages,
+                    dst_stage_mask: access.stage_mask,
+                    memory_barrier: match &resource.kind {
+                        ResourceKind::Buffer(buf) => Some(MemoryBarrierKind::Buffer {
+                            resource: buf,
+                            src_access_mask: resource.tracking.availability_mask,
+                            dst_access_mask: access.access_mask,
+                        }),
+                        ResourceKind::Image(img) => Some(MemoryBarrierKind::Image {
+                            resource: img,
+                            src_access_mask: resource.tracking.availability_mask,
+                            dst_access_mask: access.access_mask,
+                            old_layout: resource.tracking.layout,
+                            new_layout: access.initial_layout,
+                        }),
+                    },
+                },
+            );
+            /*let single_local_source_in_same_queue = sync_sources.is_single_source_same_queue_and_frame(q, frame.base_serial);
 
             if !single_local_source_in_same_queue {
                 // Either:
@@ -394,6 +581,17 @@ impl Context {
                     resource.tracking.availability_mask = vk::AccessFlags::empty();
                     resource.tracking.visibility_mask |= access.access_mask;
                 }
+            }*/
+
+            if sync_sources.is_single_source_same_queue_and_frame(q, frame.base_serial) {
+                // TODO is this really necessary?
+                // I think it's just there so that we can return early when syncing on the same queue (see `writes_visible`).
+                // However even if we proceed, add_memory_dependency shouldn't emit a redundant barrier anyway.
+
+                // this memory dependency makes all writes on the resource available, and
+                // visible to the types specified in `access.access_mask`
+                resource.tracking.availability_mask = vk::AccessFlags::empty();
+                resource.tracking.visibility_mask |= access.access_mask;
             }
 
             // layout transitions
@@ -448,124 +646,6 @@ impl Context {
     }
 }
 
-fn print_frame_info(context: &Context, passes: &[Pass], temporaries: &[ResourceId]) {
-    let resources = &context.resources;
-
-    println!("=============================================================");
-    println!("Passes:");
-    for p in passes.iter() {
-        println!("- `{}` ({:?})", p.name, p.snn);
-        if p.wait_serials != Default::default() {
-            println!("    semaphore wait:");
-            if p.wait_serials[0] != 0 {
-                println!("        0:{}|{:?}", p.wait_serials[0], p.wait_dst_stages[0]);
-            }
-            if p.wait_serials[1] != 0 {
-                println!("        1:{}|{:?}", p.wait_serials[1], p.wait_dst_stages[1]);
-            }
-            if p.wait_serials[2] != 0 {
-                println!("        2:{}|{:?}", p.wait_serials[2], p.wait_dst_stages[2]);
-            }
-            if p.wait_serials[3] != 0 {
-                println!("        3:{}|{:?}", p.wait_serials[3], p.wait_dst_stages[3]);
-            }
-        }
-        println!(
-            "    input execution barrier: {:?}->{:?}",
-            p.src_stage_mask, p.dst_stage_mask
-        );
-        println!("    input memory barriers:");
-        for imb in p.image_memory_barriers.iter() {
-            let id = context.image_resource_by_handle(imb.image);
-            print!("        image handle={:?} ", imb.image);
-            if !id.is_null() {
-                print!("(id={:?}, name={})", id, resources.get(id).unwrap().name);
-            } else {
-                print!("(unknown resource)");
-            }
-            println!(
-                " access_mask:{:?}->{:?} layout:{:?}->{:?}",
-                imb.src_access_mask, imb.dst_access_mask, imb.old_layout, imb.new_layout
-            );
-        }
-        for bmb in p.buffer_memory_barriers.iter() {
-            let id = context.buffer_resource_by_handle(bmb.buffer);
-            print!("        buffer handle={:?} ", bmb.buffer);
-            if !id.is_null() {
-                print!("(id={:?}, name={})", id, resources.get(id).unwrap().name);
-            } else {
-                print!("(unknown resource)");
-            }
-            println!(
-                " access_mask:{:?}->{:?}",
-                bmb.src_access_mask, bmb.dst_access_mask
-            );
-        }
-
-        //println!("    output stage: {:?}", p.output_stage_mask);
-        if p.signal_queue_timelines {
-            println!("    semaphore signal: {:?}", p.snn);
-        }
-    }
-
-    println!("Final resource states: ");
-
-    for &id in temporaries.iter() {
-        let resource = context.resources.get(id).unwrap();
-        println!("`{}`", resource.name);
-        println!("    stages={:?}", resource.tracking.stages);
-        println!("    avail={:?}", resource.tracking.availability_mask);
-        println!("    vis={:?}", resource.tracking.visibility_mask);
-        println!("    layout={:?}", resource.tracking.layout);
-
-        if resource.tracking.has_readers() {
-            println!("    readers: ");
-            if resource.tracking.readers[0] != 0 {
-                println!("        0:{}", resource.tracking.readers[0]);
-            }
-            if resource.tracking.readers[1] != 0 {
-                println!("        1:{}", resource.tracking.readers[1]);
-            }
-            if resource.tracking.readers[2] != 0 {
-                println!("        2:{}", resource.tracking.readers[2]);
-            }
-            if resource.tracking.readers[3] != 0 {
-                println!("        3:{}", resource.tracking.readers[3]);
-            }
-        }
-        if resource.tracking.has_writer() {
-            println!("    writer: {:?}", resource.tracking.writer);
-        }
-        match resource.ownership {
-            ResourceOwnership::Referenced => {}
-            ResourceOwnership::Owned { ref allocation, .. } => match allocation {
-                Some(ResourceAllocation::Default { allocation }) => {
-                    println!("    allocation: exclusive");
-                }
-                Some(ResourceAllocation::External { device_memory }) => {
-                    println!(
-                        "    allocation: external, device memory {:016x}",
-                        device_memory.as_raw()
-                    );
-                }
-                Some(ResourceAllocation::Transient {
-                    device_memory,
-                    offset,
-                }) => {
-                    println!(
-                        "    allocation: transient, device memory {:016x}@{:016x}",
-                        device_memory.as_raw(),
-                        offset
-                    );
-                }
-                None => {
-                    println!("    allocation: none (unallocated)");
-                }
-            },
-        }
-    }
-}
-
 #[derive(Copy, Clone, Debug)]
 pub struct FrameCreateInfo {
     pub happens_after: GpuFuture,
@@ -597,7 +677,7 @@ impl fmt::Debug for Frame {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Frame")
             .field("base_serial", &self.base_serial)
-            .field("frame_serial", &self.frame_serial)
+            .field("frame_serial", &self.frame_number)
             .finish()
     }
 }
@@ -650,7 +730,7 @@ impl Context {
             },
             false,
             |builder| {
-                builder.register_image_access(
+                builder.reference_image(
                     image.image_info.id,
                     vk::AccessFlags::MEMORY_READ,
                     vk::PipelineStageFlags::ALL_COMMANDS, // ?
@@ -671,6 +751,7 @@ impl Context {
     ) {
         let frame = self.current_frame.as_mut().expect("not in a frame");
         let frame_index = frame.passes.len();
+        // not sure why we need to do it in this order
         self.next_serial += 1;
         let serial = self.next_serial;
 
@@ -833,7 +914,7 @@ impl Context {
         }
 
         let frame_json = json!({
-            "frameSerial": frame.frame_serial.0,
+            "frameSerial": frame.frame_number.0,
             "baseSerial": frame.base_serial,
             "passes": passes_json,
         });
@@ -841,10 +922,134 @@ impl Context {
         let file = File::create(format!(
             "{}-{}.json",
             file_name_prefix.unwrap_or("frame"),
-            frame.frame_serial.0
+            frame.frame_number.0
         ))
         .expect("could not open file for dumping JSON frame information");
         serde_json::to_writer_pretty(file, &frame_json).unwrap();
+    }
+
+    fn print_frame_info(&self, passes: &[Pass], temporaries: &[ResourceId]) {
+        println!("=============================================================");
+        println!("Passes:");
+        for p in passes.iter() {
+            println!("- `{}` ({:?})", p.name, p.snn);
+            if p.wait_serials != Default::default() {
+                println!("    semaphore wait:");
+                if p.wait_serials[0] != 0 {
+                    println!("        0:{}|{:?}", p.wait_serials[0], p.wait_dst_stages[0]);
+                }
+                if p.wait_serials[1] != 0 {
+                    println!("        1:{}|{:?}", p.wait_serials[1], p.wait_dst_stages[1]);
+                }
+                if p.wait_serials[2] != 0 {
+                    println!("        2:{}|{:?}", p.wait_serials[2], p.wait_dst_stages[2]);
+                }
+                if p.wait_serials[3] != 0 {
+                    println!("        3:{}|{:?}", p.wait_serials[3], p.wait_dst_stages[3]);
+                }
+            }
+            println!(
+                "    input execution barrier: {:?}->{:?}",
+                p.src_stage_mask, p.dst_stage_mask
+            );
+            println!("    input memory barriers:");
+            for imb in p.image_memory_barriers.iter() {
+                let id = self.image_resource_by_handle(imb.image);
+                print!("        image handle={:?} ", imb.image);
+                if !id.is_null() {
+                    print!(
+                        "(id={:?}, name={})",
+                        id,
+                        self.resources.get(id).unwrap().name
+                    );
+                } else {
+                    print!("(unknown resource)");
+                }
+                println!(
+                    " access_mask:{:?}->{:?} layout:{:?}->{:?}",
+                    imb.src_access_mask, imb.dst_access_mask, imb.old_layout, imb.new_layout
+                );
+            }
+            for bmb in p.buffer_memory_barriers.iter() {
+                let id = self.buffer_resource_by_handle(bmb.buffer);
+                print!("        buffer handle={:?} ", bmb.buffer);
+                if !id.is_null() {
+                    print!(
+                        "(id={:?}, name={})",
+                        id,
+                        self.resources.get(id).unwrap().name
+                    );
+                } else {
+                    print!("(unknown resource)");
+                }
+                println!(
+                    " access_mask:{:?}->{:?}",
+                    bmb.src_access_mask, bmb.dst_access_mask
+                );
+            }
+
+            //println!("    output stage: {:?}", p.output_stage_mask);
+            if p.signal_queue_timelines {
+                println!("    semaphore signal: {:?}", p.snn);
+            }
+        }
+
+        println!("Final resource states: ");
+
+        for &id in temporaries.iter() {
+            let resource = self.resources.get(id).unwrap();
+            println!("`{}`", resource.name);
+            println!("    stages={:?}", resource.tracking.stages);
+            println!("    avail={:?}", resource.tracking.availability_mask);
+            println!("    vis={:?}", resource.tracking.visibility_mask);
+            println!("    layout={:?}", resource.tracking.layout);
+
+            if resource.tracking.has_readers() {
+                println!("    readers: ");
+                if resource.tracking.readers[0] != 0 {
+                    println!("        0:{}", resource.tracking.readers[0]);
+                }
+                if resource.tracking.readers[1] != 0 {
+                    println!("        1:{}", resource.tracking.readers[1]);
+                }
+                if resource.tracking.readers[2] != 0 {
+                    println!("        2:{}", resource.tracking.readers[2]);
+                }
+                if resource.tracking.readers[3] != 0 {
+                    println!("        3:{}", resource.tracking.readers[3]);
+                }
+            }
+            if resource.tracking.has_writer() {
+                println!("    writer: {:?}", resource.tracking.writer);
+            }
+            match resource.ownership {
+                ResourceOwnership::External => {}
+                ResourceOwnership::OwnedResource { ref allocation, .. } => match allocation {
+                    Some(ResourceAllocation::Default { allocation }) => {
+                        println!("    allocation: exclusive");
+                    }
+                    Some(ResourceAllocation::External { device_memory }) => {
+                        println!(
+                            "    allocation: external, device memory {:016x}",
+                            device_memory.as_raw()
+                        );
+                    }
+                    Some(ResourceAllocation::Transient {
+                        device_memory,
+                        offset,
+                    }) => {
+                        println!(
+                            "    allocation: transient, device memory {:016x}@{:016x}",
+                            device_memory.as_raw(),
+                            offset
+                        );
+                    }
+                    None => {
+                        println!("    allocation: none (unallocated)");
+                    }
+                },
+            }
+        }
     }
 
     /// Starts a new frame. The execution of the frame can optionally be synchronized
@@ -865,7 +1070,7 @@ impl Context {
 
         self.current_frame = Some(Frame {
             base_serial,
-            frame_serial: FrameSerialNumber(self.submitted_frame_count + 1),
+            frame_number: FrameNumber(self.submitted_frame_count + 1),
             wait_init,
             temporaries: vec![],
             temporary_set: TemporarySet::new(),
@@ -881,48 +1086,16 @@ impl Context {
     /// Finishes building the frame and submits all the passes to the command queues.
     pub fn end_frame(&mut self) -> GpuFuture {
         self.dump_current_frame(None);
+        //self.print_frame_info(&frame.passes, &frame.temporaries);
 
-        let mut frame = self.current_frame.take().expect("not in a frame");
-
-        // end build span
-        frame.build_span.exit();
+        let frame = self.current_frame.take().expect("not in a frame");
 
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the frames that are not in use anymore.
         self.wait_for_frames_in_flight();
 
-        // Allocate and assign memory for all transient resources of this frame.
-        let transient_allocations = allocate_memory_for_transients(
-            self,
-            frame.base_serial,
-            &frame.passes,
-            &frame.temporaries,
-        );
-
-        // All resources now have a block of device memory assigned. We're ready to
-        // build the command buffers and submit them to the device queues.
-        let submission_result = self.submit_frame(&mut frame.passes, frame.wait_init);
-
-        let serials = submission_result.signalled_serials;
-
-        print_frame_info(self, &frame.passes, &frame.temporaries);
-
-        // Add this frame to the list of "frames in flight": frames that might be executing on the device.
-        // When this frame is completed, all resources of the frame will be automatically recycled.
-        // This includes:
-        // - device memory blocks for transient allocations
-        // - command buffers (in command pools)
-        // - image views
-        // - framebuffers
-        // - descriptor sets
-        self.in_flight.push_back(FrameInFlight {
-            signalled_serials: serials,
-            transient_allocations,
-            command_pools: submission_result.command_pools,
-            semaphores: submission_result.semaphores,
-        });
-
-        self.submitted_frame_count += 1;
+        // Submit the frame
+        let serials = self.submit_frame(frame);
 
         GpuFuture { serials }
     }

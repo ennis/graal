@@ -109,14 +109,14 @@ fn load_image(
 
     // build the upload pass
     context.add_graphics_pass("image upload", |pass| {
-        pass.register_image_access(
+        pass.reference_image(
             image_id,
             vk::AccessFlags::TRANSFER_WRITE,
             vk::PipelineStageFlags::TRANSFER,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         );
-        pass.register_buffer_access(
+        pass.reference_buffer(
             staging_buffer.id,
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
@@ -203,14 +203,14 @@ fn main() {
                 );
 
                 context.add_graphics_pass("blit to screen", |pass| {
-                    pass.register_image_access(
+                    pass.reference_image(
                         file_image_id,
                         vk::AccessFlags::TRANSFER_READ,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     );
-                    pass.register_image_access(
+                    pass.reference_image(
                         swapchain_image.image_info.id,
                         vk::AccessFlags::TRANSFER_WRITE,
                         vk::PipelineStageFlags::TRANSFER,

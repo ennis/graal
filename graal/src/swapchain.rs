@@ -1,8 +1,7 @@
-use crate::{ ImageInfo, Context};
+use crate::{ImageInfo, Context};
 use ash::vk;
 use std::ptr;
-use crate::context::pass::{SemaphoreWait, SemaphoreWaitKind};
-use crate::context::{ImageRegistrationInfo, ResourceRegistrationInfo, ResourceOwnership};
+use crate::context::{ImageRegistrationInfo, ResourceRegistrationInfo, ResourceOwnership, SemaphoreWait, SemaphoreWaitKind};
 
 /// Chooses a swapchain surface format among a list of supported formats.
 fn get_preferred_swapchain_surface_format(
@@ -182,7 +181,7 @@ impl Swapchain {
                         dst_stage: Default::default(),
                         wait_kind: SemaphoreWaitKind::Binary
                     }),
-                    ownership: ResourceOwnership::Referenced
+                    ownership: ResourceOwnership::External
                 },
                 handle,
                 format: self.format
