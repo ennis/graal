@@ -1,11 +1,9 @@
 //! Allocation of memory for transient resources in a frame.
 use crate::{
     ash::vk,
-    context::{
-        local_pass_index, AllocationRequirements, Pass, Resource, ResourceAllocation, ResourceKind,
-        ResourceOwnership,
-    },
-    Context, ResourceId,
+    context::{local_pass_index, Pass},
+    resource::{Resource, ResourceAllocation, ResourceKind},
+    AllocationRequirements, Context, ResourceId, ResourceOwnership,
 };
 use fixedbitset::FixedBitSet;
 use slotmap::SecondaryMap;
@@ -100,6 +98,11 @@ pub(crate) fn allocate_memory_for_transients(
     let _span = trace_span!("allocate_memory_for_transients").entered();
 
     let reachability = compute_reachability(&passes);
+    let mut resources = context
+        .device
+        .resources
+        .lock()
+        .expect("could not lock resources");
 
     //------ shared alloc state------
     // For each transient resource, its shared allocation index.
@@ -129,7 +132,7 @@ pub(crate) fn allocate_memory_for_transients(
 
     for &id in temporaries.iter() {
         // TARGET = the resource we want to alias with
-        let resource = context.resources.get(id).unwrap();
+        let resource = resources.resources.get(id).unwrap();
 
         let allocation_requirements = if let Some(req) = get_allocation_requirements(resource) {
             req
@@ -146,7 +149,7 @@ pub(crate) fn allocate_memory_for_transients(
             // try to find a suitable resource to alias with (the "target")
             let mut aliased = false;
             'alias: for &target_id in temporaries.iter() {
-                let target_resource = context.resources.get(id).unwrap();
+                let target_resource = resources.resources.get(id).unwrap();
                 if target_id == id {
                     // don't alias with the same resource...
                     continue;
@@ -267,7 +270,7 @@ pub(crate) fn allocate_memory_for_transients(
                 );
             }
 
-            context
+            resources
                 .resources
                 .get_mut(id)
                 .unwrap()
@@ -297,7 +300,7 @@ pub(crate) fn allocate_memory_for_transients(
     // finally, bind the shared allocations to the corresponding resources
 
     for &id in temporaries.iter() {
-        let resource = context.resources.get_mut(id).unwrap();
+        let resource = resources.resources.get_mut(id).unwrap();
 
         let alloc_index = if let Some(entry) = shared_alloc_map.get(id) {
             entry.index

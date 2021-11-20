@@ -6,6 +6,9 @@ use std::{
     ptr,
 };
 use std::cell::RefCell;
+use std::sync::Mutex;
+use slotmap::SlotMap;
+use crate::resource::DeviceResources;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
@@ -36,7 +39,8 @@ pub(crate) struct QueuesInfo {
     pub queues: [vk::Queue; MAX_QUEUES],
 }
 
-/// Wrapper around a vulkan device and associated queues.
+
+/// Wrapper around a vulkan device, associated queues and tracked resources.
 pub struct Device {
     /// Underlying vulkan device
     pub device: ash::Device,
@@ -52,6 +56,7 @@ pub struct Device {
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
     pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
+    pub(crate) resources: Mutex<DeviceResources>,
 }
 
 struct PhysicalDeviceAndProperties {
@@ -231,9 +236,9 @@ impl Device {
             memory_type_bits,
             required_memory_properties | preferred_memory_properties,
         )
-        .or_else(|| {
-            self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties)
-        })
+            .or_else(|| {
+                self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties)
+            })
     }
 
     /// Creates a new `Device` that can render to the specified `present_surface` if one is specified.
@@ -402,9 +407,9 @@ impl Device {
                 compute_queue_index,
                 transfer_queue_index,
             ]
-            .iter()
-            .max()
-            .unwrap() as usize
+                .iter()
+                .max()
+                .unwrap() as usize
                 + 1;
 
             let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -464,6 +469,7 @@ impl Device {
                 vk_khr_surface,
                 vk_ext_debug_utils,
                 debug_messenger,
+                resources: Mutex::new(DeviceResources::new())
             }
         }
     }

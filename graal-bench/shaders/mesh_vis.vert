@@ -21,7 +21,12 @@ layout(set=2,binding=0,std140) uniform PerObject {
     mat4 u_model_it_matrix;
 };
 
-void main() {
+void main(
+    [[in]] vec3 a_position,
+    [[in]] vec3 a_normal,
+    [[in]] vec3 a_tangent,
+
+) {
     vec4 pos = vec4(a_position,1.0f);
     vec4 n = vec4(a_normal, 0.0);
     vec4 t = vec4(a_tangent, 0.0);

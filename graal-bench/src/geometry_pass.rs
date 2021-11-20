@@ -10,93 +10,92 @@ static GEOMETRY_PASS_SHADER_FRAG: &[u32] = include_spirv!("shaders/mesh_vis.frag
 
 // --- Uniforms ------------------------------------------------------------------------------------
 
-/// Per-scene uniforms.
-#[derive(Copy, Clone, Debug)]
+
+// --- Shader interfaces ---------------------------------------------------------------------------
+
+#[derive(mlr::ShaderArguments)]
 #[repr(C)]
-struct Globals {
+struct SceneArguments {
+    // uniform variables will be put in a single uniform buffer, at location 0
     u_view_matrix: Mat4,
     u_proj_matrix: Mat4,
     u_view_proj_matrix: Mat4,
     u_inverse_proj_matrix: Mat4,
 }
+// to create: `mlr::ArgumentBlock::new(SceneArguments { ... })`
 
-/// Per-material uniforms.
-#[derive(Copy, Clone, Debug)]
+#[derive(mlr::ShaderArguments)]
 #[repr(C)]
-struct Material {
-    u_color: Vec4,
+struct MaterialArguments {
+    u_color: Vec4
 }
 
-/// Per-object uniforms
-#[derive(Copy, Clone, Debug)]
+// draw<Push: PushConstants>(..., push_constants: Option<Push>, ...)
+
+// problem:
+// 1. descriptor set will be created in the command callback, because we can't create a descriptor set before the resources are allocated
+// 2. ShaderArguments can borrow data
+// 3. BUT the command closure passed to `graal::Context` has a 'static bound
+// => this doesn't work.
+//
+// Solution:
+// A. ShaderArguments don't borrow stuff
+// B. Make it so that command callbacks can borrow stuff
+//      -> issue: they will be borrowed for *the whole frame*, which means that we won't be able to access an image mutably in subsequent passes
+// C. Make MLR resources refcounted (bleh)
+//
+// ShaderArguments borrow stuff
+// -> just before moving into pass callback, write VkDescriptor{Image,Buffer}Info in an auxiliary struct
+// -> then just move this aux struct in the callback
+//
+// But, in the first place, how are we supposed to submit multiple draw calls into a single pass?
+// -> we can't run a loop within the pass callback, since we can't *borrow* any of our resources in the pass callback
+// -> the mlr::draw call won't happen within a pass callback
+// -> must fuse consecutive draw calls without data dependencies into the same pass
+//      -> must detect whether there's a data dependency between two consecutive draw calls
+//      -> if there's one, end pass, submit batch
+//      -> enum PendingDrawCall
+
+#[derive(mlr::ShaderArguments)]
+#[argument(dynamic_uniform_buffer)]  // use a dynamic uniform buffer
 #[repr(C)]
-struct PerObject {
-    u_model_matrix: Mat4,
-    u_model_it_matrix: Mat4,
+struct ObjectDataUniform<'a> {
+    matrix: Mat4,
 }
 
-// --- Shader interfaces ---------------------------------------------------------------------------
-#[derive(graal::DescriptorSetInterface)]
-#[repr(C)]
-struct GlobalsInterface {
-    #[layout(binding = 0, uniform_buffer, stages(vertex, fragment))]
-    globals: graal::BufferDescriptor<Globals>,
+// to create: `mlr::ArgumentBlock::new(ObjectDataUniform { ... })`
+// internally:
+// - will create/reuse one single descriptor set for the type, and for the current frame, that points to the upload buffer
+// - will upload the uniform data to an upload buffer
+// - on bind, set the buffer offset
+
+
+// draw<Push: PushConstants>(..., push_constants: Option<Push>, ...)
+#[derive(mlr::PushConstants)]
+struct ObjectData {
+    matrix: Mat4,
+    // texture index, instance index, etc.
 }
 
-#[derive(graal::DescriptorSetInterface)]
-#[repr(C)]
-struct PerObjectInterface {
-    #[layout(binding = 0, uniform_buffer, stages(vertex))]
-    per_object: graal::BufferDescriptor<PerObject>,
-}
-
-#[derive(graal::DescriptorSetInterface)]
-#[repr(C)]
-struct MaterialsInterface {
-    #[layout(binding = 0, uniform_buffer, stages(fragment))]
-    material: graal::BufferDescriptor<Material>,
-}
-
-#[derive(Copy, Clone, Debug, graal::VertexInputInterface)]
+#[derive(Copy, Clone, Debug, mlr::VertexInputInterface)]
 struct MeshVertexInput {
     #[layout(binding = 0, location = 0, per_vertex)]
-    vertices: graal::VertexBufferView<Vertex3D>,
+    vertices: mlr::Buffer<Vertex3D>,
 }
 
-#[derive(graal::FragmentOutputInterface, Copy, Clone, Debug)]
-pub struct GBuffers {
-    /// Color buffer, R16G16B16A16_SFLOAT
-    #[attachment(
-        color,
-        format = "R16G16B16A16_SFLOAT",
-        samples = 1,
-        load_op = "CLEAR",
-        store_op = "STORE",
-        layout = "COLOR_ATTACHMENT_OPTIMAL"
-    )]
-    pub color: graal::ImageInfo,
+#[derive(mlr::FragmentOutputInterface, Copy, Clone, Debug)]
+pub struct GBuffers<'a> {
+    /// Color buffer
+    #[attachment(color, load_op="CLEAR", store_op="STORE")]
+    pub color: &'a mlr::Image,
 
-    /// Normals, RG16_SFLOAT
-    #[attachment(
-        color,
-        format = "R16G16_SFLOAT",
-        samples = 1,
-        load_op = "CLEAR",
-        store_op = "STORE",
-        layout = "COLOR_ATTACHMENT_OPTIMAL"
-    )]
-    pub normal: graal::ImageInfo,
+    /// Normals
+    #[attachment(color, load_op = "CLEAR", store_op = "STORE")]
+    pub normal: &'a mlr::Image,
 
-    /// Tangents: RG16_SFLOAT
-    #[attachment(
-        color,
-        format = "R16G16_SFLOAT",
-        samples = 1,
-        load_op = "CLEAR",
-        store_op = "STORE",
-        layout = "COLOR_ATTACHMENT_OPTIMAL"
-    )]
-    pub tangent: graal::ImageInfo,
+    /// Tangents
+    #[attachment(color)]
+    pub tangent: &'a mlr::Image,
 
     /// Depth: D32_SFLOAT
     #[attachment(
@@ -109,6 +108,13 @@ pub struct GBuffers {
     )]
     pub depth: graal::ImageInfo,
 }
+
+// ShaderOutput
+// fn add_color_target(attachment: usize, &mut image, load_op, store_op, blend_mode)
+// fn add_color_target(attachment: usize, &mut image, load_op, store_op, blend_mode)
+
+// -> internally, keeps track of which shader interfaces it was validated against
+// -> re-creating it is not a big deal: cache it internally
 
 // Problem: can't re-use a group of resources (like a FragmentOutputInterface)
 // Solution: also derive PassResources on the group of resources?

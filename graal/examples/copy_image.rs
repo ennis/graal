@@ -1,7 +1,8 @@
-use ash::{
-    vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
+use ash::vk::{BufferUsageFlags, Rect2D, SampleCountFlags};
+use graal::{
+    swapchain::Swapchain, vk, BufferResourceCreateInfo, FrameCreateInfo, ImageId, ImageInfo,
+    ImageResourceCreateInfo, MemoryLocation, ResourceId,
 };
-use graal::{vk, BufferResourceCreateInfo, FrameCreateInfo, ImageId, ImageInfo, ImageResourceCreateInfo, ResourceId, ResourceMemoryInfo, MemoryLocation};
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -10,7 +11,6 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
-use graal::swapchain::Swapchain;
 
 fn load_image(
     context: &mut graal::Context,
@@ -62,9 +62,9 @@ fn load_image(
     let ImageInfo {
         handle: image_handle,
         id: image_id,
-    } = context.create_image(
+    } = context.device().create_image(
         path.to_str().unwrap(),
-         MemoryLocation::GpuOnly,
+        MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
             image_type: vk::ImageType::TYPE_2D,
             usage: usage | vk::ImageUsageFlags::TRANSFER_DST,
@@ -84,12 +84,15 @@ fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = 
-        context.create_buffer("staging", MemoryLocation::CpuToGpu, &BufferResourceCreateInfo {
+    let mut staging_buffer = context.device().create_buffer(
+        "staging",
+        MemoryLocation::CpuToGpu,
+        &BufferResourceCreateInfo {
             usage: vk::BufferUsageFlags::TRANSFER_SRC,
             byte_size,
-            map_on_create: true
-        });
+            map_on_create: true,
+        },
+    );
 
     // read image data
     unsafe {
@@ -153,7 +156,7 @@ fn load_image(
         });
     });
 
-    context.destroy_buffer(staging_buffer.id);
+    context.device().destroy_buffer(staging_buffer.id);
     (image_id, width, height)
 }
 
@@ -193,7 +196,10 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { swapchain.acquire_next_image(&mut context) };
 
-                context.start_frame(FrameCreateInfo { collect_debug_info: true, happens_after: Default::default() });
+                context.start_frame(FrameCreateInfo {
+                    collect_debug_info: true,
+                    happens_after: Default::default(),
+                });
 
                 let (file_image_id, file_image_width, file_image_height) = load_image(
                     &mut context,
@@ -222,8 +228,9 @@ fn main() {
                     let blit_h = file_image_height.min(swapchain_size.1);
 
                     pass.set_commands(move |context, command_buffer| {
-                        let dst_image_handle = context.image_handle(swapchain_image.image_info.id);
-                        let src_image_handle = context.image_handle(file_image_id);
+                        let dst_image_handle =
+                            context.device().image_handle(swapchain_image.image_info.id);
+                        let src_image_handle = context.device().image_handle(file_image_id);
 
                         let regions = &[vk::ImageBlit {
                             src_subresource: vk::ImageSubresourceLayers {
@@ -273,8 +280,10 @@ fn main() {
                 context.present("P12", &swapchain_image);
                 context.end_frame();
 
-                context.destroy_image(file_image_id);
-                context.destroy_image(swapchain_image.image_info.id);
+                context.device().destroy_image(file_image_id);
+                context
+                    .device()
+                    .destroy_image(swapchain_image.image_info.id);
             }
             _ => (),
         }

@@ -1,15 +1,15 @@
 #version 450
 
-layout(set=0,binding=0,std140) uniform Globals {
-    vec2 u_resolution;
-    vec2 u_scroll_offset;
-    float u_zoom;
-};
 
-layout(location=0) in vec2 v_position;
-layout(location=0) out vec4 out_color;
+// problem: cool syntax, but when are we going to compile actual code?
+// -> compile bits of SPIR-V and link them at run time (should be cheap)
 
-void main() {
+fragment vec4 main(
+    [[in]] vec2 position,
+    [[uniform]] vec2 u_resolution,
+    [[uniform]] vec2 u_scroll_offset
+    [[uniform]] u_zoom)
+{
     vec2 px_position = v_position * vec2(1.0, -1.0) * u_resolution * 0.5;
     // #005fa4
     float vignette = clamp(0.7 * length(v_position), 0.0, 1.0);

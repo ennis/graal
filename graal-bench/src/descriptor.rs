@@ -1,6 +1,7 @@
 use ash::vk;
 use graal_spirv as spirv;
 use std::{collections::BTreeMap, marker::PhantomData};
+use crate::vk;
 
 //const MAX_DESCRIPTOR_SET_LAYOUT_BINDING_DESCRIPTORS: usize = 16;
 pub const MAX_DESCRIPTOR_SET_LAYOUT_BINDINGS: usize = 16;

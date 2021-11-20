@@ -1,17 +1,17 @@
 //! Contains code related to the construction of frames and passes.
 use crate::{
     context::{
-        is_write_access, local_pass_index, BufferId, BufferResource, CommandContext, Frame,
-        FrameInFlight, FrameNumber, GpuFuture, GroupId, ImageId, ImageResource, Pass, PassCommands,
-        QueueSerialNumbers, Resource, ResourceAccess, ResourceAccessDetails, ResourceAllocation,
-        ResourceId, ResourceKind, ResourceOwnership, ResourceTrackingInfo, SemaphoreSignal,
-        SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind, SubmissionNumber, SyncDebugInfo,
-        TemporarySet, TypedBufferInfo,
+        is_write_access, local_pass_index, BufferId, CommandContext, Frame, FrameInFlight,
+        GpuFuture, ImageId, Pass, PassCommands, ResourceAccess, ResourceAccessDetails, ResourceId,
+        ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind,
+        SyncDebugInfo, TemporarySet,
     },
+    resource::{BufferResource, ImageResource, ResourceAllocation},
+    serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
     swapchain::SwapchainImage,
     vk,
     vk::Handle,
-    Context, MAX_QUEUES,
+    Context, ResourceGroupId, ResourceOwnership, MAX_QUEUES,
 };
 use slotmap::Key;
 use std::{
@@ -66,7 +66,7 @@ impl<'a> PassBuilder<'a> {
     }
 
     /// References a resource group.
-    pub fn reference_group(&mut self, id: GroupId) {
+    pub fn reference_group(&mut self, id: ResourceGroupId) {
         self.context.reference_group(&mut self.pass, id);
     }
 
@@ -204,6 +204,8 @@ fn add_memory_dependency(
                 let src_pass_index = local_pass_index(sn, frame.base_serial);
                 let src_pass = &mut frame.passes[src_pass_index];
                 src_pass.signal_queue_timelines = true;
+                // update in-frame predecessor list for this pass; used for transient allocation
+                dst_pass.preds.push(src_pass_index);
             }
         }
     } else {
@@ -307,15 +309,58 @@ fn add_memory_dependency(
 
 // ---------------------------------------------------------------------------------------
 impl Context {
-    /// Registers an access to a resource group
+    /// Adds a resource to a resource group.
+    fn add_resource_to_group(&mut self, resource_id: ResourceId, group_id: ResourceGroupId) {
+        let mut resources = self
+            .device
+            .resources
+            .lock()
+            .expect("could not lock resources");
+        let mut group = resources
+            .resource_groups
+            .get_mut(group_id)
+            .expect("invalid or expired resource group");
+        let mut resource = resources
+            .resources
+            .get_mut(resource_id)
+            .expect("invalid resource");
+        assert!(resource.group.is_none());
 
+        // set group
+        resource.group = Some(group_id);
+        // set additional serials and stages to wait for in this group
+        group
+            .wait_serials
+            .join_assign(QueueSerialNumbers::from_submission_number(
+                resource.tracking.writer,
+            ));
+        group.src_stage_mask |= resource.tracking.stages;
+        group.src_access_mask |= resource.tracking.availability_mask;
+    }
+
+    /// Adds an image to a resource group.
+    pub fn add_image_to_resource_group(&mut self, image_id: ImageId, group_id: ResourceGroupId) {
+        self.add_resource_to_group(image_id.0, group_id)
+    }
+
+    /// Adds a buffer to a resource group.
+    pub fn add_buffer_to_resource_group(&mut self, buffer_id: BufferId, group_id: ResourceGroupId) {
+        self.add_resource_to_group(buffer_id.0, group_id)
+    }
+
+    /// Registers an access to a resource group
     // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
     // more than one execution and visibility barrier
-    fn reference_group(&mut self, dst_pass: &mut Pass, id: GroupId) {
-        // we just have to wait for the SNNs and stages of the group.
+    fn reference_group(&mut self, dst_pass: &mut Pass, id: ResourceGroupId) {
+        let mut resources = self
+            .device
+            .resources
+            .lock()
+            .expect("could not lock resources");
         let frame = self.current_frame.as_mut().expect("not in a frame");
 
-        let group = self
+        // we just have to wait for the SNNs and stages of the group.
+        let group = resources
             .resource_groups
             .get(id)
             .expect("invalid or expired resource group");
@@ -333,12 +378,6 @@ impl Context {
                 }),
             },
         );
-
-        // P1: write to resources (buffers, textures): group.stage = COMPUTE_SHADER | COLOR_ATTACHMENT_OUTPUT
-        //
-
-        let wait_passes = group.wait_serials;
-
     }
 
     /// Registers an access to a resource within the specified pass and updates the dependency graph.
@@ -354,9 +393,19 @@ impl Context {
     ) {
         //------------------------
         // first, add the resource into the set of temporaries used within this frame
-        let mut frame = self.current_frame.as_mut().expect("not in a frame");
 
-        let resource = self.resources.get_mut(id).unwrap();
+        let mut frame = self.current_frame.as_mut().expect("not in a frame");
+        let mut resources = self
+            .device
+            .resources
+            .lock()
+            .expect("could not lock resources");
+
+        let resource = resources.resources.get_mut(id).unwrap();
+
+        // we can't synchronize on a resource that belongs to a group: we synchronize on the group instead
+        assert!(resource.group.is_none(), "cannot synchronize on a resource belonging to a group; synchronize on the group instead");
+
         if frame.temporary_set.insert(id) {
             frame.temporaries.push(id);
         }
@@ -635,8 +684,10 @@ impl Context {
 
         if frame.collect_sync_debug_info {
             let mut info = SyncDebugInfo::new();
+
             // current resource tracking info
-            for (id, r) in self.resources.iter() {
+            let resources = self.device.resources.lock().unwrap();
+            for (id, r) in resources.resources.iter() {
                 info.tracking.insert(id, r.tracking);
             }
             // current sync table
@@ -798,6 +849,11 @@ impl Context {
         use std::fs::File;
 
         let frame = self.current_frame.as_ref().expect("not in a frame");
+        let resources = self
+            .device
+            .resources
+            .lock()
+            .expect("could not lock resources");
 
         // passes
         let mut passes_json = Vec::new();
@@ -806,8 +862,8 @@ impl Context {
                 .image_memory_barriers
                 .iter()
                 .map(|imb| {
-                    let id = self.image_resource_by_handle(imb.image);
-                    let name = &self.resources.get(id).unwrap().name;
+                    let id = resources.image_resource_by_handle(imb.image);
+                    let name = &resources.resources.get(id).unwrap().name;
                     json!({
                         "type": "image",
                         "srcAccessMask": format!("{:?}", imb.src_access_mask),
@@ -825,8 +881,8 @@ impl Context {
                 .buffer_memory_barriers
                 .iter()
                 .map(|bmb| {
-                    let id = self.buffer_resource_by_handle(bmb.buffer);
-                    let name = &self.resources.get(id).unwrap().name;
+                    let id = resources.buffer_resource_by_handle(bmb.buffer);
+                    let name = &resources.resources.get(id).unwrap().name;
                     json!({
                         "type": "buffer",
                         "srcAccessMask": format!("{:?}", bmb.src_access_mask),
@@ -842,7 +898,7 @@ impl Context {
                 .accesses
                 .iter()
                 .map(|a| {
-                    let r = self.resources.get(a.id).unwrap();
+                    let r = resources.resources.get(a.id).unwrap();
                     let name = &r.name;
                     let (ty, handle) = match r.kind {
                         ResourceKind::Buffer(ref buf) => ("buffer", buf.handle.as_raw()),
@@ -883,7 +939,7 @@ impl Context {
 
                 let mut resource_tracking_json = Vec::new();
                 for (id, tracking) in sync_debug_info.tracking.iter() {
-                    let name = &self.resources.get(id).unwrap().name;
+                    let name = &resources.resources.get(id).unwrap().name;
                     resource_tracking_json.push(json!({
                         "id": format!("{:?}", id.data()),
                         "name": name,
@@ -929,6 +985,12 @@ impl Context {
     }
 
     fn print_frame_info(&self, passes: &[Pass], temporaries: &[ResourceId]) {
+        let resources = self
+            .device
+            .resources
+            .lock()
+            .expect("could not lock resources");
+
         println!("=============================================================");
         println!("Passes:");
         for p in passes.iter() {
@@ -954,13 +1016,13 @@ impl Context {
             );
             println!("    input memory barriers:");
             for imb in p.image_memory_barriers.iter() {
-                let id = self.image_resource_by_handle(imb.image);
+                let id = resources.image_resource_by_handle(imb.image);
                 print!("        image handle={:?} ", imb.image);
                 if !id.is_null() {
                     print!(
                         "(id={:?}, name={})",
                         id,
-                        self.resources.get(id).unwrap().name
+                        resources.resources.get(id).unwrap().name
                     );
                 } else {
                     print!("(unknown resource)");
@@ -971,13 +1033,13 @@ impl Context {
                 );
             }
             for bmb in p.buffer_memory_barriers.iter() {
-                let id = self.buffer_resource_by_handle(bmb.buffer);
+                let id = resources.buffer_resource_by_handle(bmb.buffer);
                 print!("        buffer handle={:?} ", bmb.buffer);
                 if !id.is_null() {
                     print!(
                         "(id={:?}, name={})",
                         id,
-                        self.resources.get(id).unwrap().name
+                        resources.resources.get(id).unwrap().name
                     );
                 } else {
                     print!("(unknown resource)");
@@ -997,7 +1059,7 @@ impl Context {
         println!("Final resource states: ");
 
         for &id in temporaries.iter() {
-            let resource = self.resources.get(id).unwrap();
+            let resource = resources.resources.get(id).unwrap();
             println!("`{}`", resource.name);
             println!("    stages={:?}", resource.tracking.stages);
             println!("    avail={:?}", resource.tracking.availability_mask);

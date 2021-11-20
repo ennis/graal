@@ -5,13 +5,15 @@ pub use ash::{self, vk};
 pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instance};
 
 pub use crate::{
-    context::{
-        BufferId, BufferInfo, BufferResourceCreateInfo, CommandContext, Context,
-        format_aspect_mask, frame::FrameCreateInfo, get_mip_level_count,
-        GpuFuture, ImageId, ImageInfo, ImageResourceCreateInfo,
-        ResourceId, ResourceMemoryInfo, TypedBufferInfo,
-    },
+    context::{format_aspect_mask, frame::FrameCreateInfo, CommandContext, Context, GpuFuture},
     device::Device,
+    resource::{
+        get_mip_level_count, AllocationRequirements, BufferId, BufferInfo, BufferRegistrationInfo,
+        BufferResourceCreateInfo, ImageId, ImageInfo, ImageRegistrationInfo,
+        ImageResourceCreateInfo, ResourceGroupId, ResourceId, ResourceOwnership,
+        ResourceRegistrationInfo,
+    },
+    serial::{QueueSerialNumbers, SubmissionNumber},
 };
 pub use gpu_allocator::MemoryLocation;
 
@@ -22,10 +24,11 @@ pub(crate) use crate::{
 
 mod context;
 pub mod device;
-pub(crate) mod instance;
+mod instance;
+pub mod platform;
+mod platform_impl;
+mod resource;
+mod serial;
 pub mod surface;
 pub mod swapchain;
 pub mod utils;
-mod platform_impl;
-
-pub mod platform;

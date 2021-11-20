@@ -1,7 +1,7 @@
-use crate::{ImageInfo, Context};
+use crate::{Context, ImageInfo, ImageRegistrationInfo, ResourceOwnership, ResourceRegistrationInfo};
 use ash::vk;
 use std::ptr;
-use crate::context::{ImageRegistrationInfo, ResourceRegistrationInfo, ResourceOwnership, SemaphoreWait, SemaphoreWaitKind};
+use crate::context::{SemaphoreWait, SemaphoreWaitKind};
 
 /// Chooses a swapchain surface format among a list of supported formats.
 fn get_preferred_swapchain_surface_format(
@@ -171,7 +171,7 @@ impl Swapchain {
 
         let handle = self.images[image_index as usize];
         let name = format!("swapchain {:?} image #{}", handle, image_index);
-        let id = context.register_image_resource(
+        let id = context.device.register_image_resource(
             ImageRegistrationInfo {
                 resource: ResourceRegistrationInfo {
                     name: &name,

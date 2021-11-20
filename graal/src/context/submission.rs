@@ -1,20 +1,18 @@
 //! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
-    context::{QueueSerialNumbers, SubmissionNumber},
+    context::{
+        transient::allocate_memory_for_transients, Frame, FrameInFlight, PassCommands,
+        SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind,
+        SEMAPHORE_WAIT_TIMEOUT_NS,
+    },
+    serial::{QueueSerialNumbers, SubmissionNumber},
     vk, Context, MAX_QUEUES,
-};
-
-use crate::context::{
-    Frame, FrameInFlight, PassCommands, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
-    SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
 };
 use std::{
     ffi::{c_void, CString},
     ops::{Deref, DerefMut},
     ptr,
 };
-
-use crate::context::transient::allocate_memory_for_transients;
 use tracing::trace_span;
 
 /// Context passed to the command callbacks.
