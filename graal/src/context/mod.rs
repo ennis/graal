@@ -647,6 +647,7 @@ pub(crate) struct Frame {
 
     collect_sync_debug_info: bool,
     sync_debug_info: Vec<SyncDebugInfo>,
+
 }
 
 /// Graphics context
@@ -681,6 +682,7 @@ pub struct Context {
     completed_frame_count: u64,
 
     current_frame: Option<Frame>,
+    current_pass: Option<Pass>,
 }
 
 impl fmt::Debug for Context {
@@ -738,6 +740,7 @@ impl Context {
             completed_frame_count: 0,
             in_flight: VecDeque::new(),
             current_frame: None,
+            current_pass: None
         }
     }
 

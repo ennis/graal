@@ -110,53 +110,52 @@ fn load_image(
 
     let staging_buffer_handle = staging_buffer.handle;
 
-    // build the upload pass
-    context.add_graphics_pass("image upload", |pass| {
-        pass.reference_image(
-            image_id,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
+    // === upload pass ===
+    context.start_graphics_pass("image upload");
+    context.pass_image_dependency(
+        image_id,
+        vk::AccessFlags::TRANSFER_WRITE,
+        vk::PipelineStageFlags::TRANSFER,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+    );
+    context.pass_buffer_dependency(
+        staging_buffer.id,
+        vk::AccessFlags::TRANSFER_READ,
+        vk::PipelineStageFlags::TRANSFER,
+    );
+    context.pass_commands(move |context, command_buffer| unsafe {
+        let device = context.vulkan_device();
+        let regions = &[vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: width,
+            buffer_image_height: height,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        }];
+
+        device.cmd_copy_buffer_to_image(
+            command_buffer,
+            staging_buffer_handle,
+            image_handle,
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            regions,
         );
-        pass.reference_buffer(
-            staging_buffer.id,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-        );
-
-        pass.set_commands(move |context, command_buffer| unsafe {
-            let device = context.vulkan_device();
-
-            let regions = &[vk::BufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: width,
-                buffer_image_height: height,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                image_extent: vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                },
-            }];
-
-            device.cmd_copy_buffer_to_image(
-                command_buffer,
-                staging_buffer_handle,
-                image_handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                regions,
-            );
-        });
     });
+    context.end_pass();
 
     context.device().destroy_buffer(staging_buffer.id);
+
     (image_id, width, height)
 }
 
@@ -208,74 +207,75 @@ fn main() {
                     false,
                 );
 
-                context.add_graphics_pass("blit to screen", |pass| {
-                    pass.reference_image(
-                        file_image_id,
-                        vk::AccessFlags::TRANSFER_READ,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    );
-                    pass.reference_image(
-                        swapchain_image.image_info.id,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    );
+                context.start_graphics_pass("blit to screen");
 
-                    let blit_w = file_image_width.min(swapchain_size.0);
-                    let blit_h = file_image_height.min(swapchain_size.1);
+                context.pass_image_dependency(
+                    file_image_id,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                );
+                context.pass_image_dependency(
+                    swapchain_image.image_info.id,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                );
 
-                    pass.set_commands(move |context, command_buffer| {
-                        let dst_image_handle =
-                            context.device().image_handle(swapchain_image.image_info.id);
-                        let src_image_handle = context.device().image_handle(file_image_id);
+                let blit_w = file_image_width.min(swapchain_size.0);
+                let blit_h = file_image_height.min(swapchain_size.1);
 
-                        let regions = &[vk::ImageBlit {
-                            src_subresource: vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                mip_level: 0,
-                                base_array_layer: 0,
-                                layer_count: 1,
+                context.pass_commands(move |context, command_buffer| {
+                    let dst_image_handle =
+                        context.device().image_handle(swapchain_image.image_info.id);
+                    let src_image_handle = context.device().image_handle(file_image_id);
+
+                    let regions = &[vk::ImageBlit {
+                        src_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        src_offsets: [
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: blit_w as i32,
+                                y: blit_h as i32,
+                                z: 1,
                             },
-                            src_offsets: [
-                                vk::Offset3D { x: 0, y: 0, z: 0 },
-                                vk::Offset3D {
-                                    x: blit_w as i32,
-                                    y: blit_h as i32,
-                                    z: 1,
-                                },
-                            ],
-                            dst_subresource: vk::ImageSubresourceLayers {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                mip_level: 0,
-                                base_array_layer: 0,
-                                layer_count: 1,
+                        ],
+                        dst_subresource: vk::ImageSubresourceLayers {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            mip_level: 0,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        },
+                        dst_offsets: [
+                            vk::Offset3D { x: 0, y: 0, z: 0 },
+                            vk::Offset3D {
+                                x: blit_w as i32,
+                                y: blit_h as i32,
+                                z: 1,
                             },
-                            dst_offsets: [
-                                vk::Offset3D { x: 0, y: 0, z: 0 },
-                                vk::Offset3D {
-                                    x: blit_w as i32,
-                                    y: blit_h as i32,
-                                    z: 1,
-                                },
-                            ],
-                        }];
+                        ],
+                    }];
 
-                        unsafe {
-                            context.vulkan_device().cmd_blit_image(
-                                command_buffer,
-                                src_image_handle,
-                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                                dst_image_handle,
-                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                regions,
-                                vk::Filter::NEAREST,
-                            );
-                        }
-                    });
+                    unsafe {
+                        context.vulkan_device().cmd_blit_image(
+                            command_buffer,
+                            src_image_handle,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            dst_image_handle,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            regions,
+                            vk::Filter::NEAREST,
+                        );
+                    }
                 });
+                context.end_pass();
 
                 context.present("P12", &swapchain_image);
                 context.end_frame();
