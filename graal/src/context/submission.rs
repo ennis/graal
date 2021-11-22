@@ -1,12 +1,12 @@
 //! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
     context::{
-        transient::allocate_memory_for_transients, Frame, FrameInFlight, PassCommands,
+        transient::allocate_memory_for_transients, Frame, FrameInFlight, Pass, PassCommands,
         SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind,
         SEMAPHORE_WAIT_TIMEOUT_NS,
     },
     serial::{QueueSerialNumbers, SubmissionNumber},
-    vk, Context, MAX_QUEUES,
+    vk, Context, ResourceId, MAX_QUEUES,
 };
 use std::{
     ffi::{c_void, CString},
@@ -14,6 +14,7 @@ use std::{
     ptr,
 };
 use tracing::trace_span;
+use crate::context::FrameInner;
 
 /// Context passed to the command callbacks.
 pub struct CommandContext<'a> {
@@ -266,19 +267,21 @@ impl Context {
             }
         }
     }
+}
 
-    pub(crate) fn submit_frame(&mut self, mut frame: Frame) -> QueueSerialNumbers {
+impl Context {
+    pub(crate) fn submit_frame(
+        &mut self,
+        mut frame: FrameInner,
+    ) -> QueueSerialNumbers {
+
         frame.build_span.exit();
 
         let _ = trace_span!("submit_frame").entered();
 
         // Allocate and assign memory for all transient resources of this frame.
-        let transient_allocations = allocate_memory_for_transients(
-            self,
-            frame.base_serial,
-            &frame.passes,
-            &frame.temporaries,
-        );
+        let transient_allocations =
+            allocate_memory_for_transients(self, frame.base_serial, &frame.passes, &frame.temporaries);
 
         // current submission batches per queue
         let mut cmd_batches: [CommandBatch; MAX_QUEUES] = Default::default();
@@ -294,8 +297,7 @@ impl Context {
             // queue index
             let q = p.snn.queue();
 
-            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials
-            {
+            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials {
                 p.wait_serials.join(frame.wait_init)
             } else {
                 p.wait_serials

@@ -2,9 +2,9 @@
 use crate::{
     context::{
         is_write_access, local_pass_index, BufferId, CommandContext, Frame, FrameInFlight,
-        GpuFuture, ImageId, Pass, PassCommands, ResourceAccess, ResourceAccessDetails, ResourceId,
-        ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind,
-        SyncDebugInfo, TemporarySet,
+        FrameInner, GpuFuture, ImageId, Pass, PassCommands, ResourceAccess, ResourceAccessDetails,
+        ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+        SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
     },
     resource::{BufferResource, ImageResource, ResourceAllocation},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
@@ -29,14 +29,7 @@ pub struct AccessTypeInfo {
     pub layout: vk::ImageLayout,
 }
 
-/// Builder object for passes.
-pub struct PassBuilder<'a> {
-    context: &'a mut Context,
-    pass: Pass,
-    _span: tracing::span::EnteredSpan,
-}
-
-impl Context {
+impl<'a> Frame<'a> {
     /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
     /// before starting.
     pub fn pass_external_semaphore_wait(
@@ -63,7 +56,8 @@ impl Context {
         semaphore: vk::Semaphore,
         signal_kind: SemaphoreSignalKind,
     ) {
-        self.current_pass.as_mut()
+        self.current_pass
+            .as_mut()
             .expect("not in a pass")
             .external_semaphore_signals
             .push(SemaphoreSignal {
@@ -113,7 +107,7 @@ impl Context {
     /// The handler will be called when building the command buffer, on batch submission.
     pub fn pass_commands(
         &mut self,
-        commands: impl FnOnce(&mut CommandContext, vk::CommandBuffer) + 'static,
+        commands: impl FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a,
     ) {
         self.current_pass.as_mut().expect("not in a pass").commands =
             Some(PassCommands::CommandBuffer(Box::new(commands)));
@@ -121,7 +115,7 @@ impl Context {
 
     pub fn pass_queue_commands(
         &mut self,
-        commands: impl FnOnce(&mut CommandContext, vk::Queue) + 'static,
+        commands: impl FnOnce(&mut CommandContext, vk::Queue) + 'a,
     ) {
         self.current_pass.as_mut().expect("not in a pass").commands =
             Some(PassCommands::Queue(Box::new(commands)));
@@ -161,9 +155,9 @@ struct PipelineBarrierDesc<'a> {
 /// * `frame`: the current frame
 /// * `pass`: the pass being built
 /// * `sources`: SNNs of the passes to synchronize with
-fn add_memory_dependency(
-    frame: &mut Frame,
-    dst_pass: &mut Pass,
+fn add_memory_dependency<'a>(
+    frame: &mut FrameInner<'a>,
+    dst_pass: &mut Pass<'a>,
     sources: QueueSerialNumbers,
     barrier: PipelineBarrierDesc,
 ) {
@@ -310,10 +304,11 @@ fn add_memory_dependency(
 }
 
 // ---------------------------------------------------------------------------------------
-impl Context {
+impl<'a> Frame<'a> {
     /// Adds a resource to a resource group.
     fn add_resource_to_group(&mut self, resource_id: ResourceId, group_id: ResourceGroupId) {
         let mut resources = self
+            .context
             .device
             .resources
             .lock()
@@ -355,10 +350,10 @@ impl Context {
     // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
     // more than one execution and visibility barrier
     fn reference_group(&mut self, id: ResourceGroupId) {
-        let frame = self.current_frame.as_mut().expect("not in a frame");
         let dst_pass = self.current_pass.as_mut().expect("not in a pass");
 
         let mut resources = self
+            .context
             .device
             .resources
             .lock()
@@ -371,7 +366,7 @@ impl Context {
             .expect("invalid or expired resource group");
 
         add_memory_dependency(
-            frame,
+            &mut self.inner,
             dst_pass,
             group.wait_serials,
             PipelineBarrierDesc {
@@ -391,10 +386,10 @@ impl Context {
     /// this function infers the necessary execution barriers, memory barriers, and layout transitions,
     /// and updates the state of the resources.
     fn reference_resource(&mut self, id: ResourceId, access: &ResourceAccessDetails) {
-        let mut frame = self.current_frame.as_mut().expect("not in a frame");
-        let dst_pass = self.current_pass.as_mut().expect("not in a pass");
+        let mut dst_pass = self.current_pass.as_mut().expect("not in a pass");
 
         let mut resources = self
+            .context
             .device
             .resources
             .lock()
@@ -408,8 +403,8 @@ impl Context {
 
         //------------------------
         // first, add the resource into the set of temporaries used within this frame
-        if frame.temporary_set.insert(id) {
-            frame.temporaries.push(id);
+        if self.inner.temporary_set.insert(id) {
+            self.inner.temporaries.push(id);
         }
 
         // set first use
@@ -491,7 +486,7 @@ impl Context {
             };
 
             add_memory_dependency(
-                frame,
+                &mut self.inner,
                 dst_pass,
                 sync_sources,
                 PipelineBarrierDesc {
@@ -514,7 +509,7 @@ impl Context {
                 },
             );
 
-            if sync_sources.is_single_source_same_queue_and_frame(q, frame.base_serial) {
+            if sync_sources.is_single_source_same_queue_and_frame(q, self.inner.base_serial) {
                 // TODO is this really necessary?
                 // I think it's just there so that we can return early when syncing on the same queue (see `writes_visible`).
                 // However even if we proceed, add_memory_dependency shouldn't emit a redundant barrier anyway.
@@ -597,16 +592,16 @@ impl PassType {
     }
 }
 
-impl fmt::Debug for Frame {
+impl<'a> fmt::Debug for Frame<'a> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Frame")
-            .field("base_serial", &self.base_serial)
-            .field("frame_serial", &self.frame_number)
+            .field("base_serial", &self.inner.base_serial)
+            .field("frame_serial", &self.inner.frame_number)
             .finish()
     }
 }
 
-impl Context {
+impl<'a> Frame<'a> {
     // Returns this frame's serial
     //pub fn serial(&self) -> FrameSerialNumber {
     //    self.frame_serial
@@ -616,8 +611,7 @@ impl Context {
     ///
     /// Execution of the *whole* frame will wait for the operation represented by the future to complete.
     pub fn add_frame_dependency(&mut self, future: GpuFuture) {
-        let frame = self.current_frame.as_mut().expect("not in a frame");
-        frame.wait_init = frame.wait_init.join(future.serials);
+        self.inner.wait_init = self.inner.wait_init.join(future.serials);
     }
 
     /// Starts a graphics pass.
@@ -654,49 +648,47 @@ impl Context {
     }
 
     /// Common code for `start_xxx_pass`
-    fn start_pass(&mut self, name: &str, ty: PassType, async_pass: bool) -> &mut Pass {
-        let frame = self.current_frame.as_mut().expect("not in a frame");
-        let frame_index = frame.passes.len();
+    fn start_pass(&mut self, name: &str, ty: PassType, async_pass: bool) -> &mut Pass<'a> {
+        let frame_index = self.inner.passes.len();
         assert!(
             self.current_pass.is_none(),
             "`start_pass` called while already in a pass"
         );
 
         // not sure why we need to do it in this order
-        self.next_serial += 1;
-        let serial = self.next_serial;
-        let q = ty.queue_index(&self.device, async_pass);
+        self.context.next_serial += 1;
+        let serial = self.context.next_serial;
+        let q = ty.queue_index(&self.context.device, async_pass);
         let snn = SubmissionNumber::new(q, serial);
         self.current_pass.insert(Pass::new(name, frame_index, snn))
     }
 
     /// Ends the current pass.
     pub fn end_pass(&mut self) {
-        let mut frame = self.current_frame.as_mut().expect("not in a frame");
         let pass = self.current_pass.take().expect("not in a pass");
-        frame.passes.push(pass);
+        self.inner.passes.push(pass);
 
-        if frame.collect_sync_debug_info {
+        if self.inner.collect_sync_debug_info {
             let mut info = SyncDebugInfo::new();
 
             // current resource tracking info
-            let resources = self.device.resources.lock().unwrap();
+            let resources = self.context.device.resources.lock().unwrap();
             for (id, r) in resources.resources.iter() {
                 info.tracking.insert(id, r.tracking);
             }
             // current sync table
-            info.xq_sync_table = frame.xq_sync_table;
-            frame.sync_debug_info.push(info);
+            info.xq_sync_table = self.inner.xq_sync_table;
+            self.inner.sync_debug_info.push(info);
         }
     }
 
     /// Dumps the frame to a JSON object.
-    pub fn dump_current_frame(&self, file_name_prefix: Option<&str>) {
+    pub fn dump(&self, file_name_prefix: Option<&str>) {
         use serde_json::json;
         use std::fs::File;
 
-        let frame = self.current_frame.as_ref().expect("not in a frame");
         let resources = self
+            .context
             .device
             .resources
             .lock()
@@ -704,7 +696,7 @@ impl Context {
 
         // passes
         let mut passes_json = Vec::new();
-        for (pass_index, p) in frame.passes.iter().enumerate() {
+        for (pass_index, p) in self.inner.passes.iter().enumerate() {
             let image_memory_barriers_json: Vec<_> = p
                 .image_memory_barriers
                 .iter()
@@ -781,8 +773,8 @@ impl Context {
             });
 
             // additional debug information
-            if frame.collect_sync_debug_info {
-                let sync_debug_info = &frame.sync_debug_info[pass_index];
+            if self.inner.collect_sync_debug_info {
+                let sync_debug_info = &self.inner.sync_debug_info[pass_index];
 
                 let mut resource_tracking_json = Vec::new();
                 for (id, tracking) in sync_debug_info.tracking.iter() {
@@ -817,15 +809,15 @@ impl Context {
         }
 
         let frame_json = json!({
-            "frameSerial": frame.frame_number.0,
-            "baseSerial": frame.base_serial,
+            "frameSerial": self.inner.frame_number.0,
+            "baseSerial": self.inner.base_serial,
             "passes": passes_json,
         });
 
         let file = File::create(format!(
             "{}-{}.json",
             file_name_prefix.unwrap_or("frame"),
-            frame.frame_number.0
+            self.inner.frame_number.0
         ))
         .expect("could not open file for dumping JSON frame information");
         serde_json::to_writer_pretty(file, &frame_json).unwrap();
@@ -833,6 +825,7 @@ impl Context {
 
     fn print_frame_info(&self, passes: &[Pass], temporaries: &[ResourceId]) {
         let resources = self
+            .context
             .device
             .resources
             .lock()
@@ -966,8 +959,8 @@ impl Context {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn start_frame(&mut self, create_info: FrameCreateInfo) {
-        let base_serial = self.next_serial;
+    pub fn new(context: &'a mut Context, create_info: FrameCreateInfo) -> Frame<'a> {
+        let base_serial = context.next_serial;
         let wait_init = create_info.happens_after.serials;
 
         // Full CPU-side frame processing
@@ -975,42 +968,45 @@ impl Context {
         // DAG build only
         let build_span = trace_span!("DAG build").entered();
 
-        assert!(self.current_frame.is_none(), "frame already started");
+        let frame_number = FrameNumber(context.submitted_frame_count + 1);
 
-        self.current_frame = Some(Frame {
-            base_serial,
-            frame_number: FrameNumber(self.submitted_frame_count + 1),
-            wait_init,
-            temporaries: vec![],
-            temporary_set: TemporarySet::new(),
-            passes: vec![],
-            xq_sync_table: Default::default(),
-            collect_sync_debug_info: create_info.collect_debug_info,
-            sync_debug_info: Vec::new(),
-            span,
-            build_span,
-        })
+        Frame {
+            context,
+            inner: FrameInner {
+                base_serial,
+                frame_number,
+                wait_init,
+                temporaries: vec![],
+                temporary_set: TemporarySet::new(),
+                passes: vec![],
+                xq_sync_table: Default::default(),
+                collect_sync_debug_info: create_info.collect_debug_info,
+                sync_debug_info: Vec::new(),
+                span,
+                build_span,
+            },
+            current_pass: None,
+        }
     }
 
     /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn end_frame(&mut self) -> GpuFuture {
-        assert!(self.current_frame.is_some(), "not in a frame");
+    pub fn finish(mut self) -> GpuFuture {
         assert!(self.current_pass.is_none(), "pass not finished");
 
-        self.dump_current_frame(None);
+        self.dump(None);
         //self.print_frame_info(&frame.passes, &frame.temporaries);
-
-        let frame = self.current_frame.take().unwrap();
 
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the frames that are not in use anymore.
-        self.wait_for_frames_in_flight();
+        self.context.wait_for_frames_in_flight();
 
         // Submit the frame
-        let serials = self.submit_frame(frame);
+        let serials = self.context.submit_frame(self.inner);
 
         GpuFuture { serials }
     }
-}
 
-impl Context {}
+    pub fn device(&self) -> &Device {
+        &self.context.device
+    }
+}

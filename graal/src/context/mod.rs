@@ -7,7 +7,6 @@ use crate::{
     BufferId, ImageId, MemoryLocation, ResourceId, MAX_QUEUES,
 };
 use ash::vk;
-pub use frame::PassBuilder;
 use slotmap::{Key, SlotMap};
 use std::{
     borrow::BorrowMut,
@@ -382,13 +381,13 @@ pub(crate) struct ResourceAccess {
     pub(crate) access_mask: vk::AccessFlags,
 }
 
-pub(crate) enum PassCommands {
+pub(crate) enum PassCommands<'a> {
     Present {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
     },
-    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue)>),
-    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer)>),
+    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue) + 'a>),
+    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -424,7 +423,7 @@ pub(crate) struct SemaphoreSignal {
 }
 
 /// A pass within a frame.
-pub(crate) struct Pass {
+pub(crate) struct Pass<'a> {
     name: String,
 
     /// Submission number of the pass.
@@ -459,10 +458,10 @@ pub(crate) struct Pass {
     pub(crate) external_semaphore_waits: Vec<SemaphoreWait>,
     pub(crate) external_semaphore_signals: Vec<SemaphoreSignal>,
 
-    pub(crate) commands: Option<PassCommands>,
+    pub(crate) commands: Option<PassCommands<'a>>,
 }
 
-impl Pass {
+impl<'a> Pass<'a> {
     pub(crate) fn get_or_create_image_memory_barrier(
         &mut self,
         handle: vk::Image,
@@ -527,7 +526,7 @@ impl Pass {
             .get_or_insert_with(Default::default)
     }
 
-    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass {
+    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass<'a> {
         Pass {
             name: name.to_string(),
             snn,
@@ -567,8 +566,7 @@ impl SyncDebugInfo {
     }
 }
 
-///
-pub(crate) struct Frame {
+pub(crate) struct FrameInner<'a> {
     frame_number: FrameNumber,
     span: tracing::span::EnteredSpan,
     build_span: tracing::span::EnteredSpan,
@@ -578,7 +576,7 @@ pub(crate) struct Frame {
     /// Set of all resources referenced in the frame
     temporary_set: TemporarySet,
     /// List of passes
-    passes: Vec<Pass>,
+    passes: Vec<Pass<'a>>,
     /// Serials to wait for before executing the frame.
     wait_init: QueueSerialNumbers,
 
@@ -647,7 +645,13 @@ pub(crate) struct Frame {
 
     collect_sync_debug_info: bool,
     sync_debug_info: Vec<SyncDebugInfo>,
+}
 
+///
+pub struct Frame<'a> {
+    context: &'a mut Context,
+    inner: FrameInner<'a>,
+    current_pass: Option<Pass<'a>>,
 }
 
 /// Graphics context
@@ -680,9 +684,6 @@ pub struct Context {
 
     /// Number of completed frames
     completed_frame_count: u64,
-
-    current_frame: Option<Frame>,
-    current_pass: Option<Pass>,
 }
 
 impl fmt::Debug for Context {
@@ -739,8 +740,6 @@ impl Context {
             submitted_frame_count: 0,
             completed_frame_count: 0,
             in_flight: VecDeque::new(),
-            current_frame: None,
-            current_pass: None
         }
     }
 

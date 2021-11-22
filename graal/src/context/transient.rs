@@ -48,16 +48,6 @@ fn compute_reachability(passes: &[Pass]) -> Reachability {
 
 type AllocMap = SecondaryMap<ResourceId, SharedAllocEntry>;
 
-/*fn allocate_or_alias_memory(
-    context: &mut Context,
-    base_serial: u64,
-    passes: &[Pass],
-    temporaries: &[ResourceId],
-    allocation_requirements: &mut Vec<AllocationRequirements>,
-    allocation_map: &mut AllocMap,
-) {
-}*/
-
 /// Index of an allocation
 #[derive(Copy, Clone, Debug)]
 struct SharedAllocEntry {

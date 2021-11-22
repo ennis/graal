@@ -1,6 +1,6 @@
 use ash::vk::{BufferUsageFlags, Rect2D, SampleCountFlags};
 use graal::{
-    swapchain::Swapchain, vk, BufferResourceCreateInfo, FrameCreateInfo, ImageId, ImageInfo,
+    swapchain::Swapchain, vk, BufferResourceCreateInfo, Frame, FrameCreateInfo, ImageId, ImageInfo,
     ImageResourceCreateInfo, MemoryLocation, ResourceId,
 };
 use inline_spirv::include_spirv;
@@ -13,7 +13,7 @@ use winit::{
 };
 
 fn load_image(
-    context: &mut graal::Context,
+    frame: &mut graal::Frame,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
     mipmaps: bool,
@@ -62,7 +62,7 @@ fn load_image(
     let ImageInfo {
         handle: image_handle,
         id: image_id,
-    } = context.device().create_image(
+    } = frame.device().create_image(
         path.to_str().unwrap(),
         MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
@@ -84,7 +84,7 @@ fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = context.device().create_buffer(
+    let mut staging_buffer = frame.device().create_buffer(
         "staging",
         MemoryLocation::CpuToGpu,
         &BufferResourceCreateInfo {
@@ -111,20 +111,20 @@ fn load_image(
     let staging_buffer_handle = staging_buffer.handle;
 
     // === upload pass ===
-    context.start_graphics_pass("image upload");
-    context.pass_image_dependency(
+    frame.start_graphics_pass("image upload");
+    frame.pass_image_dependency(
         image_id,
         vk::AccessFlags::TRANSFER_WRITE,
         vk::PipelineStageFlags::TRANSFER,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
-    context.pass_buffer_dependency(
+    frame.pass_buffer_dependency(
         staging_buffer.id,
         vk::AccessFlags::TRANSFER_READ,
         vk::PipelineStageFlags::TRANSFER,
     );
-    context.pass_commands(move |context, command_buffer| unsafe {
+    frame.pass_commands(move |context, command_buffer| unsafe {
         let device = context.vulkan_device();
         let regions = &[vk::BufferImageCopy {
             buffer_offset: 0,
@@ -152,9 +152,9 @@ fn load_image(
             regions,
         );
     });
-    context.end_pass();
+    frame.end_pass();
 
-    context.device().destroy_buffer(staging_buffer.id);
+    frame.device().destroy_buffer(staging_buffer.id);
 
     (image_id, width, height)
 }
@@ -195,28 +195,31 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { swapchain.acquire_next_image(&mut context) };
 
-                context.start_frame(FrameCreateInfo {
-                    collect_debug_info: true,
-                    happens_after: Default::default(),
-                });
+                let mut frame = Frame::new(
+                    &mut context,
+                    FrameCreateInfo {
+                        collect_debug_info: true,
+                        happens_after: Default::default(),
+                    },
+                );
 
                 let (file_image_id, file_image_width, file_image_height) = load_image(
-                    &mut context,
+                    &mut frame,
                     "data/haniyasushin_keiki.jpg".as_ref(),
                     vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
                     false,
                 );
 
-                context.start_graphics_pass("blit to screen");
+                frame.start_graphics_pass("blit to screen");
 
-                context.pass_image_dependency(
+                frame.pass_image_dependency(
                     file_image_id,
                     vk::AccessFlags::TRANSFER_READ,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 );
-                context.pass_image_dependency(
+                frame.pass_image_dependency(
                     swapchain_image.image_info.id,
                     vk::AccessFlags::TRANSFER_WRITE,
                     vk::PipelineStageFlags::TRANSFER,
@@ -227,7 +230,7 @@ fn main() {
                 let blit_w = file_image_width.min(swapchain_size.0);
                 let blit_h = file_image_height.min(swapchain_size.1);
 
-                context.pass_commands(move |context, command_buffer| {
+                frame.pass_commands(move |context, command_buffer| {
                     let dst_image_handle =
                         context.device().image_handle(swapchain_image.image_info.id);
                     let src_image_handle = context.device().image_handle(file_image_id);
@@ -275,10 +278,10 @@ fn main() {
                         );
                     }
                 });
-                context.end_pass();
+                frame.end_pass();
 
-                context.present("P12", &swapchain_image);
-                context.end_frame();
+                frame.present("P12", &swapchain_image);
+                frame.finish();
 
                 context.device().destroy_image(file_image_id);
                 context

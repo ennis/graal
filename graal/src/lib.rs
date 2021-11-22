@@ -5,7 +5,7 @@ pub use ash::{self, vk};
 pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instance};
 
 pub use crate::{
-    context::{format_aspect_mask, frame::FrameCreateInfo, CommandContext, Context, GpuFuture},
+    context::{format_aspect_mask, Frame, frame::FrameCreateInfo, CommandContext, Context, GpuFuture},
     device::Device,
     resource::{
         get_mip_level_count, AllocationRequirements, BufferId, BufferInfo, BufferRegistrationInfo,
@@ -32,3 +32,4 @@ mod serial;
 pub mod surface;
 pub mod swapchain;
 pub mod utils;
+mod allocator;

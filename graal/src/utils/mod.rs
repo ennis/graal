@@ -1,28 +1,29 @@
 use crate::{vk, Context, ImageInfo};
+use crate::context::Frame;
 
 pub fn blit_images(
-    context: &mut Context,
+    frame: &mut Frame,
     src_image: ImageInfo,
     dst_image: ImageInfo,
     size: (u32, u32),
     aspect_mask: vk::ImageAspectFlags,
 ) {
-    context.start_graphics_pass("blit_images");
-    context.pass_image_dependency(
+    frame.start_graphics_pass("blit_images");
+    frame.pass_image_dependency(
         src_image.id,
         vk::AccessFlags::TRANSFER_READ,
         vk::PipelineStageFlags::TRANSFER,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     );
-    context.pass_image_dependency(
+    frame.pass_image_dependency(
         dst_image.id,
         vk::AccessFlags::TRANSFER_WRITE,
         vk::PipelineStageFlags::TRANSFER,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
-    context.pass_commands(move |context, command_buffer| {
+    frame.pass_commands(move |context, command_buffer| {
         let regions = &[vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask,
@@ -66,5 +67,5 @@ pub fn blit_images(
             );
         }
     });
-    context.end_pass();
+    frame.end_pass();
 }
