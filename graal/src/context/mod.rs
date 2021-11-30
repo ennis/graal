@@ -1,25 +1,13 @@
 use crate::{
-    ash::vk::Handle,
     context::submission::CommandAllocator,
     device::Device,
     resource::{ResourceKind, ResourceTrackingInfo},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
-    BufferId, ImageId, MemoryLocation, ResourceId, MAX_QUEUES,
+    BufferId, ImageId, ResourceId, MAX_QUEUES,
 };
 use ash::vk;
-use slotmap::{Key, SlotMap};
-use std::{
-    borrow::BorrowMut,
-    cmp::Ordering,
-    collections::VecDeque,
-    ffi::CString,
-    fmt, mem,
-    ops::{Deref, DerefMut},
-    os::raw::c_void,
-    ptr::NonNull,
-    sync::{Arc, Mutex},
-};
-pub use submission::CommandContext;
+use std::{collections::VecDeque, fmt, os::raw::c_void, sync::Arc};
+pub use submission::RecordingContext;
 use tracing::{trace, trace_span};
 
 pub(crate) mod frame;
@@ -153,7 +141,7 @@ fn is_read_access(mask: vk::AccessFlags) -> bool {
     )
 }*/
 
-pub(crate) fn is_write_access(mask: vk::AccessFlags) -> bool {
+pub fn is_write_access(mask: vk::AccessFlags) -> bool {
     mask.intersects(
         vk::AccessFlags::SHADER_WRITE
             | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
@@ -168,7 +156,7 @@ pub(crate) fn is_write_access(mask: vk::AccessFlags) -> bool {
     )
 }
 
-fn is_depth_and_stencil_format(fmt: vk::Format) -> bool {
+pub fn is_depth_and_stencil_format(fmt: vk::Format) -> bool {
     match fmt {
         vk::Format::D16_UNORM_S8_UINT => true,
         vk::Format::D24_UNORM_S8_UINT => true,
@@ -177,7 +165,7 @@ fn is_depth_and_stencil_format(fmt: vk::Format) -> bool {
     }
 }
 
-fn is_depth_only_format(fmt: vk::Format) -> bool {
+pub fn is_depth_only_format(fmt: vk::Format) -> bool {
     match fmt {
         vk::Format::D16_UNORM => true,
         vk::Format::X8_D24_UNORM_PACK32 => true,
@@ -186,7 +174,7 @@ fn is_depth_only_format(fmt: vk::Format) -> bool {
     }
 }
 
-fn is_stencil_only_format(fmt: vk::Format) -> bool {
+pub fn is_stencil_only_format(fmt: vk::Format) -> bool {
     match fmt {
         vk::Format::S8_UINT => true,
         _ => false,
@@ -340,9 +328,11 @@ impl<T: Copy> TypedBufferInfo<T> {
 #[derive(Debug)]
 struct FrameInFlight {
     signalled_serials: QueueSerialNumbers,
-    transient_allocations: Vec<gpu_allocator::vulkan::Allocation>,
+    //transient_allocations: Vec<gpu_allocator::vulkan::Allocation>,
     command_pools: Vec<CommandAllocator>,
     semaphores: Vec<vk::Semaphore>,
+    //image_views: Vec<vk::ImageView>,
+    //framebuffers: Vec<vk::Framebuffer>,
 }
 
 /// Represents a GPU operation that may have not finished yet.
@@ -381,13 +371,13 @@ pub(crate) struct ResourceAccess {
     pub(crate) access_mask: vk::AccessFlags,
 }
 
-pub(crate) enum PassCommands<'a> {
+pub(crate) enum PassEvaluationCallback<'a, EvalContext> {
     Present {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
     },
-    Queue(Box<dyn FnOnce(&mut CommandContext, vk::Queue) + 'a>),
-    CommandBuffer(Box<dyn FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a>),
+    Queue(Box<dyn FnOnce(&mut RecordingContext, &mut EvalContext, vk::Queue) + 'a>),
+    CommandBuffer(Box<dyn FnOnce(&mut RecordingContext, &mut EvalContext, vk::CommandBuffer) + 'a>),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -423,7 +413,7 @@ pub(crate) struct SemaphoreSignal {
 }
 
 /// A pass within a frame.
-pub(crate) struct Pass<'a> {
+pub(crate) struct Pass<'a, EvalContext> {
     name: String,
 
     /// Submission number of the pass.
@@ -458,10 +448,10 @@ pub(crate) struct Pass<'a> {
     pub(crate) external_semaphore_waits: Vec<SemaphoreWait>,
     pub(crate) external_semaphore_signals: Vec<SemaphoreSignal>,
 
-    pub(crate) commands: Option<PassCommands<'a>>,
+    pub(crate) eval_callback: Option<PassEvaluationCallback<'a, EvalContext>>,
 }
 
-impl<'a> Pass<'a> {
+impl<'a, EvalContext> Pass<'a, EvalContext> {
     pub(crate) fn get_or_create_image_memory_barrier(
         &mut self,
         handle: vk::Image,
@@ -526,7 +516,11 @@ impl<'a> Pass<'a> {
             .get_or_insert_with(Default::default)
     }
 
-    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass<'a> {
+    pub(crate) fn new(
+        name: &str,
+        frame_index: usize,
+        snn: SubmissionNumber,
+    ) -> Pass<'a, EvalContext> {
         Pass {
             name: name.to_string(),
             snn,
@@ -544,7 +538,7 @@ impl<'a> Pass<'a> {
             external_semaphore_waits: vec![],
             external_semaphore_signals: vec![],
             frame_index,
-            commands: None,
+            eval_callback: None,
         }
     }
 }
@@ -566,7 +560,7 @@ impl SyncDebugInfo {
     }
 }
 
-pub(crate) struct FrameInner<'a> {
+pub(crate) struct FrameInner<'a, EvalContext> {
     frame_number: FrameNumber,
     span: tracing::span::EnteredSpan,
     build_span: tracing::span::EnteredSpan,
@@ -576,7 +570,7 @@ pub(crate) struct FrameInner<'a> {
     /// Set of all resources referenced in the frame
     temporary_set: TemporarySet,
     /// List of passes
-    passes: Vec<Pass<'a>>,
+    passes: Vec<Pass<'a, EvalContext>>,
     /// Serials to wait for before executing the frame.
     wait_init: QueueSerialNumbers,
 
@@ -645,13 +639,15 @@ pub(crate) struct FrameInner<'a> {
 
     collect_sync_debug_info: bool,
     sync_debug_info: Vec<SyncDebugInfo>,
+    //descriptor_sets: Vec<vk::DescriptorSet>,
+    //framebuffers: Vec
 }
 
 ///
-pub struct Frame<'a> {
+pub struct Frame<'a, EvalContext> {
     context: &'a mut Context,
-    inner: FrameInner<'a>,
-    current_pass: Option<Pass<'a>>,
+    inner: FrameInner<'a, EvalContext>,
+    current_pass: Option<Pass<'a, EvalContext>>,
 }
 
 /// Graphics context
@@ -807,11 +803,12 @@ impl Context {
             // waited on them.
             self.recycle_semaphores(f.semaphores);
 
-            // free transient allocations
+            // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
+            /*// free transient allocations
             for alloc in f.transient_allocations {
                 trace!(?alloc, "free_memory");
                 self.device.allocator.borrow_mut().free(alloc).unwrap();
-            }
+            }*/
 
             // bump completed frame count
             self.completed_frame_count += 1;

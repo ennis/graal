@@ -1,10 +1,10 @@
 //! Contains code related to the construction of frames and passes.
 use crate::{
     context::{
-        is_write_access, local_pass_index, BufferId, CommandContext, Frame, FrameInFlight,
-        FrameInner, GpuFuture, ImageId, Pass, PassCommands, ResourceAccess, ResourceAccessDetails,
-        ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
-        SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
+        is_write_access, local_pass_index, BufferId, Frame, FrameInFlight, FrameInner, GpuFuture,
+        ImageId, Pass, PassEvaluationCallback, RecordingContext, ResourceAccess,
+        ResourceAccessDetails, ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind,
+        SemaphoreWait, SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
     },
     resource::{BufferResource, ImageResource, ResourceAllocation},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
@@ -19,6 +19,7 @@ use std::{
     fmt,
     fmt::Formatter,
     mem,
+    sync::Arc,
 };
 use tracing::trace_span;
 
@@ -29,7 +30,7 @@ pub struct AccessTypeInfo {
     pub layout: vk::ImageLayout,
 }
 
-impl<'a> Frame<'a> {
+impl<'a, EvalContext> Frame<'a, EvalContext> {
     /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
     /// before starting.
     pub fn pass_external_semaphore_wait(
@@ -103,22 +104,26 @@ impl<'a> Frame<'a> {
         )
     }
 
-    /// Sets the command handler for this pass.
+    /// Sets the command buffer recording function for this pass.
     /// The handler will be called when building the command buffer, on batch submission.
-    pub fn pass_commands(
+    pub fn pass_set_record_callback(
         &mut self,
-        commands: impl FnOnce(&mut CommandContext, vk::CommandBuffer) + 'a,
+        record_cb: impl FnOnce(&mut RecordingContext, &mut EvalContext, vk::CommandBuffer) + 'a,
     ) {
-        self.current_pass.as_mut().expect("not in a pass").commands =
-            Some(PassCommands::CommandBuffer(Box::new(commands)));
+        self.current_pass
+            .as_mut()
+            .expect("not in a pass")
+            .eval_callback = Some(PassEvaluationCallback::CommandBuffer(Box::new(record_cb)));
     }
 
-    pub fn pass_queue_commands(
+    pub fn pass_set_submit_callback(
         &mut self,
-        commands: impl FnOnce(&mut CommandContext, vk::Queue) + 'a,
+        submit_cb: impl FnOnce(&mut RecordingContext, &mut EvalContext, vk::Queue) + 'a,
     ) {
-        self.current_pass.as_mut().expect("not in a pass").commands =
-            Some(PassCommands::Queue(Box::new(commands)));
+        self.current_pass
+            .as_mut()
+            .expect("not in a pass")
+            .eval_callback = Some(PassEvaluationCallback::Queue(Box::new(submit_cb)));
     }
 }
 
@@ -155,9 +160,9 @@ struct PipelineBarrierDesc<'a> {
 /// * `frame`: the current frame
 /// * `pass`: the pass being built
 /// * `sources`: SNNs of the passes to synchronize with
-fn add_memory_dependency<'a>(
-    frame: &mut FrameInner<'a>,
-    dst_pass: &mut Pass<'a>,
+fn add_memory_dependency<'a, EvalContext>(
+    frame: &mut FrameInner<'a, EvalContext>,
+    dst_pass: &mut Pass<'a, EvalContext>,
     sources: QueueSerialNumbers,
     barrier: PipelineBarrierDesc,
 ) {
@@ -304,7 +309,7 @@ fn add_memory_dependency<'a>(
 }
 
 // ---------------------------------------------------------------------------------------
-impl<'a> Frame<'a> {
+impl<'a, EvalContext> Frame<'a, EvalContext> {
     /// Adds a resource to a resource group.
     fn add_resource_to_group(&mut self, resource_id: ResourceId, group_id: ResourceGroupId) {
         let mut resources = self
@@ -337,12 +342,12 @@ impl<'a> Frame<'a> {
     }
 
     /// Adds an image to a resource group.
-    pub fn add_image_to_resource_group(&mut self, image_id: ImageId, group_id: ResourceGroupId) {
+    pub fn freeze_image(&mut self, image_id: ImageId, group_id: ResourceGroupId) {
         self.add_resource_to_group(image_id.0, group_id)
     }
 
     /// Adds a buffer to a resource group.
-    pub fn add_buffer_to_resource_group(&mut self, buffer_id: BufferId, group_id: ResourceGroupId) {
+    pub fn freeze_buffer(&mut self, buffer_id: BufferId, group_id: ResourceGroupId) {
         self.add_resource_to_group(buffer_id.0, group_id)
     }
 
@@ -592,7 +597,7 @@ impl PassType {
     }
 }
 
-impl<'a> fmt::Debug for Frame<'a> {
+impl<'a, EvalContext> fmt::Debug for Frame<'a, EvalContext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Frame")
             .field("base_serial", &self.inner.base_serial)
@@ -601,7 +606,7 @@ impl<'a> fmt::Debug for Frame<'a> {
     }
 }
 
-impl<'a> Frame<'a> {
+impl<'a, EvalContext> Frame<'a, EvalContext> {
     // Returns this frame's serial
     //pub fn serial(&self) -> FrameSerialNumber {
     //    self.frame_serial
@@ -633,7 +638,7 @@ impl<'a> Frame<'a> {
     pub fn present(&mut self, name: &str, image: &SwapchainImage) {
         let mut pass = self.start_pass(name, PassType::Present, false);
 
-        pass.commands = Some(PassCommands::Present {
+        pass.eval_callback = Some(PassEvaluationCallback::Present {
             swapchain: image.swapchain_handle,
             image_index: image.image_index,
         });
@@ -648,7 +653,12 @@ impl<'a> Frame<'a> {
     }
 
     /// Common code for `start_xxx_pass`
-    fn start_pass(&mut self, name: &str, ty: PassType, async_pass: bool) -> &mut Pass<'a> {
+    fn start_pass(
+        &mut self,
+        name: &str,
+        ty: PassType,
+        async_pass: bool,
+    ) -> &mut Pass<'a, EvalContext> {
         let frame_index = self.inner.passes.len();
         assert!(
             self.current_pass.is_none(),
@@ -823,7 +833,7 @@ impl<'a> Frame<'a> {
         serde_json::to_writer_pretty(file, &frame_json).unwrap();
     }
 
-    fn print_frame_info(&self, passes: &[Pass], temporaries: &[ResourceId]) {
+    fn print_frame_info(&self, passes: &[Pass<EvalContext>], temporaries: &[ResourceId]) {
         let resources = self
             .context
             .device
@@ -959,7 +969,7 @@ impl<'a> Frame<'a> {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn new(context: &'a mut Context, create_info: FrameCreateInfo) -> Frame<'a> {
+    pub fn new(context: &'a mut Context, create_info: FrameCreateInfo) -> Frame<'a, EvalContext> {
         let base_serial = context.next_serial;
         let wait_init = create_info.happens_after.serials;
 
@@ -990,7 +1000,7 @@ impl<'a> Frame<'a> {
     }
 
     /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn finish(mut self) -> GpuFuture {
+    pub fn finish(mut self, eval_context: &mut EvalContext) -> GpuFuture {
         assert!(self.current_pass.is_none(), "pass not finished");
 
         self.dump(None);
@@ -1001,12 +1011,12 @@ impl<'a> Frame<'a> {
         self.context.wait_for_frames_in_flight();
 
         // Submit the frame
-        let serials = self.context.submit_frame(self.inner);
+        let serials = self.context.submit_frame(self.inner, eval_context);
 
         GpuFuture { serials }
     }
 
-    pub fn device(&self) -> &Device {
+    pub fn device(&self) -> &Arc<Device> {
         &self.context.device
     }
 }

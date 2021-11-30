@@ -5,7 +5,11 @@ pub use ash::{self, vk};
 pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instance};
 
 pub use crate::{
-    context::{format_aspect_mask, Frame, frame::FrameCreateInfo, CommandContext, Context, GpuFuture},
+    context::{
+        format_aspect_mask, frame::FrameCreateInfo, is_depth_and_stencil_format,
+        is_depth_only_format, is_stencil_only_format, is_write_access, RecordingContext, Context,
+        Frame, GpuFuture,
+    },
     device::Device,
     resource::{
         get_mip_level_count, AllocationRequirements, BufferId, BufferInfo, BufferRegistrationInfo,
@@ -22,14 +26,14 @@ pub(crate) use crate::{
     instance::{VULKAN_ENTRY, VULKAN_INSTANCE},
 };
 
+mod allocator;
 mod context;
 pub mod device;
 mod instance;
 pub mod platform;
 mod platform_impl;
 mod resource;
-mod serial;
+pub mod serial;
 pub mod surface;
 pub mod swapchain;
 pub mod utils;
-mod allocator;

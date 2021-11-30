@@ -1,12 +1,12 @@
 //! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
     context::{
-        transient::allocate_memory_for_transients, Frame, FrameInFlight, Pass, PassCommands,
-        SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind,
-        SEMAPHORE_WAIT_TIMEOUT_NS,
+        transient::allocate_memory_for_transients, FrameInFlight, FrameInner,
+        PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+        SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
     },
     serial::{QueueSerialNumbers, SubmissionNumber},
-    vk, Context, ResourceId, MAX_QUEUES,
+    vk, Context, MAX_QUEUES,
 };
 use std::{
     ffi::{c_void, CString},
@@ -14,14 +14,20 @@ use std::{
     ptr,
 };
 use tracing::trace_span;
-use crate::context::FrameInner;
+
+/// Frame transient objects.
+pub struct TransientObjects {
+    image_views: Vec<vk::ImageView>,
+    framebuffers: Vec<vk::Framebuffer>,
+    //descriptor_sets:
+}
 
 /// Context passed to the command callbacks.
-pub struct CommandContext<'a> {
+pub struct RecordingContext<'a> {
     context: &'a Context,
 }
 
-impl<'a> Deref for CommandContext<'a> {
+impl<'a> Deref for RecordingContext<'a> {
     type Target = Context;
 
     fn deref(&self) -> &Context {
@@ -270,18 +276,19 @@ impl Context {
 }
 
 impl Context {
-    pub(crate) fn submit_frame(
+    pub(crate) fn submit_frame<EvalContext>(
         &mut self,
-        mut frame: FrameInner,
+        mut frame: FrameInner<EvalContext>,
+        eval_context: &mut EvalContext,
     ) -> QueueSerialNumbers {
-
         frame.build_span.exit();
 
         let _ = trace_span!("submit_frame").entered();
 
+        // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
         // Allocate and assign memory for all transient resources of this frame.
-        let transient_allocations =
-            allocate_memory_for_transients(self, frame.base_serial, &frame.passes, &frame.temporaries);
+        //let transient_allocations =
+        //    allocate_memory_for_transients(self, frame.base_serial, &frame.passes, &frame.temporaries);
 
         // current submission batches per queue
         let mut cmd_batches: [CommandBatch; MAX_QUEUES] = Default::default();
@@ -297,7 +304,8 @@ impl Context {
             // queue index
             let q = p.snn.queue();
 
-            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials {
+            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials
+            {
                 p.wait_serials.join(frame.wait_init)
             } else {
                 p.wait_serials
@@ -400,26 +408,26 @@ impl Context {
                 }
             }
 
-            match p.commands.take() {
-                Some(PassCommands::CommandBuffer(handler)) => {
+            match p.eval_callback.take() {
+                Some(PassEvaluationCallback::CommandBuffer(record_fn)) => {
                     // perform a command-buffer level operation
-                    let mut cctx = CommandContext { context: self };
-                    handler(&mut cctx, cb);
+                    let mut cctx = RecordingContext { context: self };
+                    record_fn(&mut cctx, eval_context, cb);
 
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
                     batch.signal_snn = p.snn;
                 }
-                Some(PassCommands::Queue(handler)) => {
+                Some(PassEvaluationCallback::Queue(submit_fn)) => {
                     // perform a queue-level operation:
                     // this terminates the current batch
                     self.submit_command_batch(q, batch, &mut used_semaphores);
                     batch.reset();
                     // call the handler
                     let queue = self.device.queues_info.queues[q as usize];
-                    let mut cctx = CommandContext { context: self };
-                    handler(&mut cctx, queue);
+                    let mut cctx = RecordingContext { context: self };
+                    submit_fn(&mut cctx, eval_context, queue);
                 }
-                Some(PassCommands::Present {
+                Some(PassEvaluationCallback::Present {
                     swapchain,
                     image_index,
                 }) => {
@@ -498,7 +506,7 @@ impl Context {
         // - descriptor sets
         self.in_flight.push_back(FrameInFlight {
             signalled_serials: self.last_signalled_serials,
-            transient_allocations,
+            //transient_allocations,
             command_pools,
             semaphores: used_semaphores,
         });

@@ -4,12 +4,12 @@ use glam::{Mat4, Vec4};
 use graal::{ash::version::DeviceV1_0, vk, FragmentOutputInterface, VertexInputInterfaceExt};
 use inline_spirv::include_spirv;
 use std::ptr;
+use egui::CursorIcon::Default;
 
 static GEOMETRY_PASS_SHADER_VERT: &[u32] = include_spirv!("shaders/mesh_vis.vert", vert);
 static GEOMETRY_PASS_SHADER_FRAG: &[u32] = include_spirv!("shaders/mesh_vis.frag", frag);
 
 // --- Uniforms ------------------------------------------------------------------------------------
-
 
 // --- Shader interfaces ---------------------------------------------------------------------------
 
@@ -27,7 +27,7 @@ struct SceneArguments {
 #[derive(mlr::ShaderArguments)]
 #[repr(C)]
 struct MaterialArguments {
-    u_color: Vec4
+    u_color: Vec4,
 }
 
 // draw<Push: PushConstants>(..., push_constants: Option<Push>, ...)
@@ -57,7 +57,7 @@ struct MaterialArguments {
 //      -> enum PendingDrawCall
 
 #[derive(mlr::ShaderArguments)]
-#[argument(dynamic_uniform_buffer)]  // use a dynamic uniform buffer
+#[argument(dynamic_uniform_buffer)] // use a dynamic uniform buffer
 #[repr(C)]
 struct ObjectDataUniform<'a> {
     matrix: Mat4,
@@ -68,7 +68,6 @@ struct ObjectDataUniform<'a> {
 // - will create/reuse one single descriptor set for the type, and for the current frame, that points to the upload buffer
 // - will upload the uniform data to an upload buffer
 // - on bind, set the buffer offset
-
 
 // draw<Push: PushConstants>(..., push_constants: Option<Push>, ...)
 #[derive(mlr::PushConstants)]
@@ -86,7 +85,7 @@ struct MeshVertexInput {
 #[derive(mlr::FragmentOutputInterface, Copy, Clone, Debug)]
 pub struct GBuffers<'a> {
     /// Color buffer
-    #[attachment(color, load_op="CLEAR", store_op="STORE")]
+    #[attachment(color, load_op = "CLEAR", store_op = "STORE")]
     pub color: &'a mlr::Image,
 
     /// Normals
@@ -363,38 +362,9 @@ impl GeometryPass {
             target_size,
         );
 
-        // setup uniforms & descriptors
-        let global_uniforms = frame.upload(
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            &Globals {
-                u_view_matrix: camera.view,
-                u_proj_matrix: camera.projection,
-                u_view_proj_matrix: camera.projection * camera.view,
-                u_inverse_proj_matrix: camera.projection.inverse(),
-            },
-            None,
-        );
-
-        let material_uniforms = frame.upload(
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            &Material {
-                u_color: Vec4::new(0.0, 1.0, 0.0, 1.0),
-            },
-            None,
-        );
-
-        let per_object_uniforms = frame.upload(
-            vk::BufferUsageFlags::UNIFORM_BUFFER,
-            &PerObject {
-                u_model_matrix: Mat4::IDENTITY,
-                u_model_it_matrix: Mat4::IDENTITY,
-            },
-            None,
-        );
-
         // setup the pass
         frame.add_graphics_pass("gbuffers", |pass| {
-            // we don't really need to register those
+            /*// we don't really need to register those
             pass.register_buffer_access(
                 global_uniforms.id,
                 graal::AccessType::AnyShaderReadUniformBuffer,
@@ -415,90 +385,49 @@ impl GeometryPass {
             pass.register_image_access(
                 g.depth.id,
                 graal::AccessType::DepthStencilAttachmentReadWrite,
-            );
-
-            let pipeline = self.pipeline;
-            let pipeline_layout = self.pipeline_layout;
-            let render_pass = self.render_pass;
+            );*/
 
             pass.set_commands(move |context, cb| unsafe {
-                let framebuffer = g.create_framebuffer(context, target_size);
 
-                let clear_values = &[
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.05, 0.1, 0.15, 1.0],
+                let fragment_output = FragmentOutput::builder()
+                    .add_color_attachment(
+                        &g.color,
+                        AttachmentLoadOp::Clear {
+                            value: vk::ClearValue {
+                                color: vk::ClearColorValue {
+                                    float32: [0.05, 0.1, 0.15, 1.0],
+                                },
+                            },
                         },
-                    },
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
+                    )
+                    .add_color_attachment(
+                        &g.normal,
+                        AttachmentLoadOp::Clear {
+                            value: vk::ClearValue {
+                                color: vk::ClearColorValue {
+                                    float32: [0.05, 0.1, 0.15, 1.0],
+                                },
+                            },
                         },
-                    },
-                    vk::ClearValue {
-                        color: vk::ClearColorValue {
-                            float32: [0.0, 0.0, 0.0, 1.0],
+                    )
+                    .add_color_attachment(
+                        &g.depth,
+                        AttachmentLoadOp::Clear {
+                            value: vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: 1.0,
+                                    stencil: 0,
+                                },
+                            },
                         },
-                    },
-                    vk::ClearValue {
-                        depth_stencil: vk::ClearDepthStencilValue {
-                            depth: 1.0,
-                            stencil: 0,
-                        },
-                    },
-                ];
+                    )
+                    .build();
 
-                let render_pass_begin_info = vk::RenderPassBeginInfo {
-                    render_pass,
-                    framebuffer,
-                    render_area: vk::Rect2D {
-                        offset: vk::Offset2D { x: 0, y: 0 },
-                        extent: vk::Extent2D {
-                            width: target_size.0,
-                            height: target_size.1,
-                        },
-                    },
-                    clear_value_count: 4,
-                    p_clear_values: clear_values.as_ptr(),
-                    ..Default::default()
-                };
-
-                context.vulkan_device().cmd_begin_render_pass(
-                    cb,
-                    &render_pass_begin_info,
-                    vk::SubpassContents::INLINE,
-                );
-
-                context.vulkan_device().cmd_set_viewport(
-                    cb,
-                    0,
-                    &[vk::Viewport {
-                        x: 0.0,
-                        y: 0.0,
-                        width: target_size.0 as f32,
-                        height: target_size.1 as f32,
-                        min_depth: 0.0,
-                        max_depth: 1.0,
-                    }],
-                );
-                context.vulkan_device().cmd_set_scissor(
-                    cb,
-                    0,
-                    &[vk::Rect2D {
-                        offset: Default::default(),
-                        extent: vk::Extent2D {
-                            width: target_size.0,
-                            height: target_size.1,
-                        },
-                    }],
-                );
-
-                context
-                    .vulkan_device()
-                    .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
-
-                let globals_set = context.create_descriptor_set(&GlobalsInterface {
-                    globals: global_uniforms.into(),
+                let globals = ArgumentBlock::new(Globals {
+                    u_view_matrix: camera.view,
+                    u_proj_matrix: camera.projection,
+                    u_view_proj_matrix: camera.projection * camera.view,
+                    u_inverse_proj_matrix: camera.projection.inverse(),
                 });
 
                 // loop over all objects in the scene
@@ -509,33 +438,29 @@ impl GeometryPass {
                         continue;
                     };
 
-                    let materials_set = context.create_descriptor_set(&MaterialsInterface {
-                        material: material_uniforms.into(),
+                    let material = ArgumentBlock::new(MaterialArguments {
+                        u_color: Vec4::new(0.0, 1.0, 0.0, 1.0),
                     });
 
-                    let per_object_set = context.create_descriptor_set(&PerObjectInterface {
-                        per_object: per_object_uniforms.into(),
+                    let per_object = ArgumentBlock::new(ObjectData {
+                        u_model_matrix: Mat4::IDENTITY,
+                        u_model_it_matrix: Mat4::IDENTITY,
                     });
 
-                    context.vulkan_device().cmd_bind_descriptor_sets(
-                        cb,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        pipeline_layout,
-                        0,
-                        &[globals_set, materials_set, per_object_set],
-                        &[],
+                    let vertex_input = VertexInput::new();
+
+                    ctx.draw(
+                        pipeline,
+                        // arguments
+                        &[&globals, &material, &per_object],
+                        // framebuffer
+                        fragment_output,
+                        // vertex input (vertex and index buffers)
+                        &[vertex_input],
+                        // draw params
+                        DrawParams { vertex_count: mesh.vertex_count, instance_count: 1, ..Default::default() }
                     );
 
-                    context.vulkan_device().cmd_bind_vertex_buffers(
-                        cb,
-                        0,
-                        &[mesh.vertex_buffer.handle],
-                        &[0],
-                    );
-
-                    context
-                        .vulkan_device()
-                        .cmd_draw(cb, mesh.vertex_count as u32, 1, 0, 0);
                 }
 
                 context.vulkan_device().cmd_end_render_pass(cb);

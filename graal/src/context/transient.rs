@@ -9,6 +9,61 @@ use fixedbitset::FixedBitSet;
 use slotmap::SecondaryMap;
 use tracing::trace_span;
 
+
+// --- Reachability matrix -------------------------------------------------------------------------
+
+
+/// Returns whether stage a comes logically earlier than stage b.
+#[rustfmt::skip]
+fn logically_earlier(a: vk::PipelineStageFlags, b: vk::PipelineStageFlags) -> bool {
+    const DI : vk::Flags64 = vk::PipelineStageFlags::DRAW_INDIRECT.as_raw() as u64;
+    const II : vk::Flags64 = vk::PipelineStageFlags2KHR::INDEX_INPUT.as_raw() as u64;
+    const VAI : vk::Flags64 = vk::PipelineStageFlags2KHR::VERTEX_ATTRIBUTE_INPUT.as_raw() as u64;
+    const VS : vk::Flags64 = vk::PipelineStageFlags::VERTEX_SHADER.as_raw() as u64;
+    const TCS : vk::Flags64 = vk::PipelineStageFlags::TESSELLATION_CONTROL_SHADER.as_raw() as u64;
+    const TES : vk::Flags64 = vk::PipelineStageFlags::TESSELLATION_EVALUATION_SHADER.as_raw() as u64;
+    const GS : vk::Flags64 = vk::PipelineStageFlags::GEOMETRY_SHADER.as_raw() as u64;
+    const TF : vk::Flags64 = vk::PipelineStageFlags::TRANSFORM_FEEDBACK_EXT.as_raw() as u64;
+    const FSR : vk::Flags64 = vk::PipelineStageFlags::FRAGMENT_SHADING_RATE_ATTACHMENT_KHR.as_raw() as u64;
+    const EFT : vk::Flags64 = vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS.as_raw() as u64;
+    const FS : vk::Flags64 = vk::PipelineStageFlags::FRAGMENT_SHADER.as_raw() as u64;
+    const LFT : vk::Flags64 = vk::PipelineStageFlags::LATE_FRAGMENT_TESTS.as_raw() as u64;
+    const CAO : vk::Flags64 = vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT.as_raw() as u64;
+    const CS : vk::Flags64 = vk::PipelineStageFlags::COMPUTE_SHADER.as_raw() as u64;
+    const TS : vk::Flags64 = 0x00080000; // VK_PIPELINE_STAGE_TASK_SHADER_BIT_NV
+    const MS : vk::Flags64 = 0x00100000; // VK_PIPELINE_STAGE_MESH_SHADER_BIT_NV
+    const TR : vk::Flags64 = vk::PipelineStageFlags::TRANSFER.as_raw() as u64;
+
+    fn test(flags: vk::Flags64, mask: vk::Flags64) -> bool { (flags & mask) != 0 }
+
+    let a = a.as_raw() as u64;
+    let b = b.as_raw() as u64;
+
+    match a {
+        // draw & compute pipeline ordering
+        DI  => test(b, DI | CS | TS | MS | II | VAI | VS | TCS | TES | GS | TF | FSR | EFT | FS | LFT | CAO),
+        CS  => test(b,      CS                                                                             ),
+        TS  => test(b,           TS | MS                                       | FSR | EFT | FS | LFT | CAO),
+        MS  => test(b,                MS                                       | FSR | EFT | FS | LFT | CAO),
+        II  => test(b,                     II | VAI | VS | TCS | TES | GS | TF | FSR | EFT | FS | LFT | CAO),
+        VAI => test(b,                          VAI | VS | TCS | TES | GS | TF | FSR | EFT | FS | LFT | CAO),
+        VS  => test(b,                                VS | TCS | TES | GS | TF | FSR | EFT | FS | LFT | CAO),
+        TCS => test(b,                                     TCS | TES | GS | TF | FSR | EFT | FS | LFT | CAO),
+        TES => test(b,                                           TES | GS | TF | FSR | EFT | FS | LFT | CAO),
+        GS  => test(b,                                                 GS | TF | FSR | EFT | FS | LFT | CAO),
+        TF  => test(b,                                                      TF | FSR | EFT | FS | LFT | CAO),
+        FSR => test(b,                                                           FSR | EFT | FS | LFT | CAO),
+        EFT => test(b,                                                                 EFT | FS | LFT | CAO),
+        FS  => test(b,                                                                       FS | LFT | CAO),
+        LFT => test(b,                                                                            LFT | CAO),
+        CAO => test(b,                                                                                  CAO),
+        // transfer
+        TR  => test(b, TR),
+        _ => false,
+    }
+}
+
+
 // --- Reachability matrix -------------------------------------------------------------------------
 struct Reachability {
     m: Vec<FixedBitSet>,
@@ -30,7 +85,7 @@ fn disjoint_index_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
     }
 }
 
-fn compute_reachability(passes: &[Pass]) -> Reachability {
+fn compute_reachability<EvalContext>(passes: &[Pass<EvalContext>]) -> Reachability {
     let len = passes.len();
     let mut m = Vec::new();
     m.resize_with(passes.len(), || FixedBitSet::with_capacity(len));
@@ -79,10 +134,10 @@ unsafe fn bind_resource_memory(
 
 /// Allocates memory for the resources specified in `temporaries`.
 /// If a resource is not used anymore, it might share its memory with another (aliasing).
-pub(crate) fn allocate_memory_for_transients(
+pub(crate) fn allocate_memory_for_transients<EvalContext>(
     context: &mut Context,
     base_serial: u64,
-    passes: &[Pass],
+    passes: &[Pass<EvalContext>],
     temporaries: &[ResourceId],
 ) -> Vec<gpu_allocator::vulkan::Allocation> {
     let _span = trace_span!("allocate_memory_for_transients").entered();

@@ -13,7 +13,7 @@ use winit::{
 };
 
 fn load_image(
-    frame: &mut graal::Frame,
+    frame: &mut graal::Frame<()>,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
     mipmaps: bool,
@@ -124,7 +124,7 @@ fn load_image(
         vk::AccessFlags::TRANSFER_READ,
         vk::PipelineStageFlags::TRANSFER,
     );
-    frame.pass_commands(move |context, command_buffer| unsafe {
+    frame.pass_set_record_callback(move |context, _, command_buffer| unsafe {
         let device = context.vulkan_device();
         let regions = &[vk::BufferImageCopy {
             buffer_offset: 0,
@@ -230,7 +230,7 @@ fn main() {
                 let blit_w = file_image_width.min(swapchain_size.0);
                 let blit_h = file_image_height.min(swapchain_size.1);
 
-                frame.pass_commands(move |context, command_buffer| {
+                frame.pass_set_record_callback(move |context, _, command_buffer| {
                     let dst_image_handle =
                         context.device().image_handle(swapchain_image.image_info.id);
                     let src_image_handle = context.device().image_handle(file_image_id);
@@ -281,7 +281,7 @@ fn main() {
                 frame.end_pass();
 
                 frame.present("P12", &swapchain_image);
-                frame.finish();
+                frame.finish(&mut ());
 
                 context.device().destroy_image(file_image_id);
                 context

@@ -7,7 +7,6 @@ use std::{
 };
 use std::cell::RefCell;
 use std::sync::Mutex;
-use slotmap::SlotMap;
 use crate::resource::DeviceResources;
 
 pub(crate) const MAX_QUEUES: usize = 4;

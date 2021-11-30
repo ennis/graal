@@ -1,8 +1,8 @@
-use crate::{vk, Context, ImageInfo};
+use crate::{vk, ImageInfo};
 use crate::context::Frame;
 
-pub fn blit_images(
-    frame: &mut Frame,
+pub fn blit_images<EvalContext>(
+    frame: &mut Frame<EvalContext>,
     src_image: ImageInfo,
     dst_image: ImageInfo,
     size: (u32, u32),
@@ -23,7 +23,7 @@ pub fn blit_images(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
-    frame.pass_commands(move |context, command_buffer| {
+    frame.pass_set_record_callback(move |context, _, command_buffer| {
         let regions = &[vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask,

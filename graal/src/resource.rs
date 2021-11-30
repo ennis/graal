@@ -105,9 +105,23 @@ slotmap::new_key_type! {
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct BufferId(pub(crate) ResourceId);
 
+impl BufferId {
+    /// Returns the underlying ResourceId.
+    pub fn resource_id(&self) -> ResourceId {
+        self.0
+    }
+}
+
 /// TODO docs
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub struct ImageId(pub(crate) ResourceId);
+
+impl ImageId {
+    /// Returns the underlying ResourceId.
+    pub fn resource_id(&self) -> ResourceId {
+        self.0
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct ImageResource {
@@ -202,6 +216,7 @@ pub enum ResourceOwnership {
     /// We own the resource and are responsible for its deletion.
     OwnedResource {
         requirements: AllocationRequirements,
+        // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
         allocation: Option<ResourceAllocation>,
     },
     /// We are referencing an external resource which we do not own (e.g. a swapchain image).
@@ -218,7 +233,8 @@ pub(crate) struct Resource {
     pub(crate) ownership: ResourceOwnership,
     /// Details specific to the kind of resource (buffer or image).
     pub(crate) kind: ResourceKind,
-    /// The group that the resource belongs to.
+    /// For frozen resources, the group that the resource belongs to. Otherwise `None` if the resource
+    /// is not frozen.
     pub(crate) group: Option<ResourceGroupId>,
     pub(crate) tracking: ResourceTrackingInfo,
 }
@@ -250,6 +266,10 @@ impl Resource {
             ResourceKind::Buffer(r) => r,
             _ => panic!("expected a buffer resource"),
         }
+    }
+
+    pub(crate) fn is_frozen(&self) -> bool {
+        self.group.is_some()
     }
 
     /// Sets the resource allocation for resources with delayed allocations.
@@ -357,6 +377,18 @@ pub(crate) struct ResourceGroup {
     // ignored if waiting on multiple queues
     pub(crate) src_access_mask: vk::AccessFlags,
     pub(crate) dst_access_mask: vk::AccessFlags,
+}
+
+/// Information about the current state of a frozen image resource.
+pub struct ImageResourceState {
+    pub group_id: ResourceGroupId,
+    // TODO include visibility information? or frozen resources should be visible to all stages?
+    pub layout: vk::ImageLayout,
+}
+
+/// Information about the current state of a frozen image resource.
+pub struct BufferResourceState {
+    pub group_id: ResourceGroupId,
 }
 
 /// Helper function to associate a debug name to a vulkan handle.
@@ -630,6 +662,37 @@ impl Device {
         resources.resource_groups.remove(group_id);
     }
 
+    /// Returns information about the current state of a frozen image resource.
+    pub fn get_image_state(&self, image_id: ImageId) -> Option<ImageResourceState> {
+        let resources = self.resources.lock().expect("failed to lock resources");
+        let image = resources
+            .resources
+            .get(image_id.0)
+            .expect("invalid resource");
+        if let Some(group_id) = image.group {
+            Some(ImageResourceState {
+                group_id,
+                layout: image.tracking.layout,
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Returns information about the current state of a frozen buffer resource.
+    pub fn get_buffer_state(&self, buffer_id: BufferId) -> Option<BufferResourceState> {
+        let resources = self.resources.lock().expect("failed to lock resources");
+        let buffer = resources
+            .resources
+            .get(buffer_id.0)
+            .expect("invalid resource");
+        if let Some(group_id) = buffer.group {
+            Some(BufferResourceState { group_id })
+        } else {
+            None
+        }
+    }
+
     /// Creates a new image resource.
     ///
     /// Returns an `ImageInfo` struct containing the image resource ID and the vulkan image handle.
@@ -696,6 +759,26 @@ impl Device {
                 .expect("failed to create image")
         };
         let mem_req = unsafe { self.device.get_image_memory_requirements(handle) };
+
+        // allocate immediately
+        // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
+        let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+            name,
+            requirements: mem_req,
+            location,
+            linear: true,
+        };
+        let allocation = self
+            .allocator
+            .borrow_mut()
+            .allocate(&allocation_create_desc)
+            .expect("failed to allocate device memory");
+        unsafe {
+            self.device
+                .bind_image_memory(handle, allocation.memory(), allocation.offset() as u64)
+                .unwrap();
+        }
+
         // register the resource in the context
         let id = unsafe {
             self.register_image_resource(ImageRegistrationInfo {
@@ -703,7 +786,7 @@ impl Device {
                     name,
                     ownership: ResourceOwnership::OwnedResource {
                         requirements: AllocationRequirements { mem_req, location },
-                        allocation: None,
+                        allocation: Some(ResourceAllocation::Default { allocation }),
                     },
                     initial_wait: None,
                 },
@@ -771,7 +854,8 @@ impl Device {
         // get its memory requirements
         let mem_req = unsafe { self.device.get_buffer_memory_requirements(handle) };
 
-        let (ownership, mapped_ptr) = if !buffer_create_info.map_on_create {
+        // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
+        let (ownership, mapped_ptr) = /*if !buffer_create_info.map_on_create {
             // We can delay allocation only if the user requests a transient resource and
             // if the resource does not need to be mapped immediately.
             let ownership = ResourceOwnership::OwnedResource {
@@ -779,7 +863,7 @@ impl Device {
                 allocation: None,
             };
             (/* ownership */ ownership, /* mapped_ptr */ None)
-        } else {
+        } else*/ {
             // caller requested a mapped pointer, must create and allocate immediately
             let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
                 name,
