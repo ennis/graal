@@ -1,8 +1,8 @@
 use crate::{vk, ImageInfo};
 use crate::context::Frame;
 
-pub fn blit_images<EvalContext>(
-    frame: &mut Frame<EvalContext>,
+pub fn blit_images<UserContext>(
+    frame: &mut Frame<UserContext>,
     src_image: ImageInfo,
     dst_image: ImageInfo,
     size: (u32, u32),

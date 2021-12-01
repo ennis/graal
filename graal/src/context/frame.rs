@@ -30,7 +30,7 @@ pub struct AccessTypeInfo {
     pub layout: vk::ImageLayout,
 }
 
-impl<'a, EvalContext> Frame<'a, EvalContext> {
+impl<'a, UserContext> Frame<'a, UserContext> {
     /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
     /// before starting.
     pub fn pass_external_semaphore_wait(
@@ -108,7 +108,7 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
     /// The handler will be called when building the command buffer, on batch submission.
     pub fn pass_set_record_callback(
         &mut self,
-        record_cb: impl FnOnce(&mut RecordingContext, &mut EvalContext, vk::CommandBuffer) + 'a,
+        record_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::CommandBuffer) + 'a,
     ) {
         self.current_pass
             .as_mut()
@@ -118,7 +118,7 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
 
     pub fn pass_set_submit_callback(
         &mut self,
-        submit_cb: impl FnOnce(&mut RecordingContext, &mut EvalContext, vk::Queue) + 'a,
+        submit_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::Queue) + 'a,
     ) {
         self.current_pass
             .as_mut()
@@ -160,9 +160,9 @@ struct PipelineBarrierDesc<'a> {
 /// * `frame`: the current frame
 /// * `pass`: the pass being built
 /// * `sources`: SNNs of the passes to synchronize with
-fn add_memory_dependency<'a, EvalContext>(
-    frame: &mut FrameInner<'a, EvalContext>,
-    dst_pass: &mut Pass<'a, EvalContext>,
+fn add_memory_dependency<'a, UserContext>(
+    frame: &mut FrameInner<'a, UserContext>,
+    dst_pass: &mut Pass<'a, UserContext>,
     sources: QueueSerialNumbers,
     barrier: PipelineBarrierDesc,
 ) {
@@ -175,7 +175,7 @@ fn add_memory_dependency<'a, EvalContext>(
     // -> if the source is just before, then use a pipeline barrier
     // -> if there's a gap, use an event?
 
-    if !sources.is_single_source_same_queue_and_frame(q, frame.base_serial) {
+    if !sources.is_single_source_same_queue_and_frame(q, frame.base_sn) {
         // Either:
         // - there are multiple sources across several queues
         // - the source is in a different queue
@@ -201,8 +201,8 @@ fn add_memory_dependency<'a, EvalContext>(
             dst_pass.wait_serials.0[iq] = sn;
             dst_pass.wait_dst_stages[iq] |= barrier.dst_stage_mask;
 
-            if sn > frame.base_serial {
-                let src_pass_index = local_pass_index(sn, frame.base_serial);
+            if sn > frame.base_sn {
+                let src_pass_index = local_pass_index(sn, frame.base_sn);
                 let src_pass = &mut frame.passes[src_pass_index];
                 src_pass.signal_queue_timelines = true;
                 // update in-frame predecessor list for this pass; used for transient allocation
@@ -225,7 +225,7 @@ fn add_memory_dependency<'a, EvalContext>(
             // not synced with a semaphore, see if there's already a pipeline barrier
             // that ensures the execution dependency between the source (src_sn) and us
 
-            let local_src_index = local_pass_index(src_sn, frame.base_serial);
+            let local_src_index = local_pass_index(src_sn, frame.base_sn);
 
             // The question we ask ourselves now is: is there already an execution dependency,
             // from the source pass, for the stages in `src_stage_mask`,
@@ -309,11 +309,10 @@ fn add_memory_dependency<'a, EvalContext>(
 }
 
 // ---------------------------------------------------------------------------------------
-impl<'a, EvalContext> Frame<'a, EvalContext> {
+impl<'a, UserContext> Frame<'a, UserContext> {
     /// Adds a resource to a resource group.
     fn add_resource_to_group(&mut self, resource_id: ResourceId, group_id: ResourceGroupId) {
         let mut resources = self
-            .context
             .device
             .resources
             .lock()
@@ -358,7 +357,6 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         let dst_pass = self.current_pass.as_mut().expect("not in a pass");
 
         let mut resources = self
-            .context
             .device
             .resources
             .lock()
@@ -394,7 +392,6 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         let mut dst_pass = self.current_pass.as_mut().expect("not in a pass");
 
         let mut resources = self
-            .context
             .device
             .resources
             .lock()
@@ -514,7 +511,7 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
                 },
             );
 
-            if sync_sources.is_single_source_same_queue_and_frame(q, self.inner.base_serial) {
+            if sync_sources.is_single_source_same_queue_and_frame(q, self.inner.base_sn) {
                 // TODO is this really necessary?
                 // I think it's just there so that we can return early when syncing on the same queue (see `writes_visible`).
                 // However even if we proceed, add_memory_dependency shouldn't emit a redundant barrier anyway.
@@ -597,16 +594,16 @@ impl PassType {
     }
 }
 
-impl<'a, EvalContext> fmt::Debug for Frame<'a, EvalContext> {
+impl<'a, UserContext> fmt::Debug for Frame<'a, UserContext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Frame")
-            .field("base_serial", &self.inner.base_serial)
+            .field("base_serial", &self.inner.base_sn)
             .field("frame_serial", &self.inner.frame_number)
             .finish()
     }
 }
 
-impl<'a, EvalContext> Frame<'a, EvalContext> {
+impl<'a, UserContext> Frame<'a, UserContext> {
     // Returns this frame's serial
     //pub fn serial(&self) -> FrameSerialNumber {
     //    self.frame_serial
@@ -658,7 +655,7 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         name: &str,
         ty: PassType,
         async_pass: bool,
-    ) -> &mut Pass<'a, EvalContext> {
+    ) -> &mut Pass<'a, UserContext> {
         let frame_index = self.inner.passes.len();
         assert!(
             self.current_pass.is_none(),
@@ -666,9 +663,9 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         );
 
         // not sure why we need to do it in this order
-        self.context.next_serial += 1;
-        let serial = self.context.next_serial;
-        let q = ty.queue_index(&self.context.device, async_pass);
+        self.inner.current_sn += 1;
+        let serial = self.inner.current_sn;
+        let q = ty.queue_index(&self.device, async_pass);
         let snn = SubmissionNumber::new(q, serial);
         self.current_pass.insert(Pass::new(name, frame_index, snn))
     }
@@ -682,7 +679,7 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
             let mut info = SyncDebugInfo::new();
 
             // current resource tracking info
-            let resources = self.context.device.resources.lock().unwrap();
+            let resources = self.device.resources.lock().unwrap();
             for (id, r) in resources.resources.iter() {
                 info.tracking.insert(id, r.tracking);
             }
@@ -698,7 +695,6 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         use std::fs::File;
 
         let resources = self
-            .context
             .device
             .resources
             .lock()
@@ -820,7 +816,7 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
 
         let frame_json = json!({
             "frameSerial": self.inner.frame_number.0,
-            "baseSerial": self.inner.base_serial,
+            "baseSerial": self.inner.base_sn,
             "passes": passes_json,
         });
 
@@ -833,9 +829,8 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         serde_json::to_writer_pretty(file, &frame_json).unwrap();
     }
 
-    fn print_frame_info(&self, passes: &[Pass<EvalContext>], temporaries: &[ResourceId]) {
+    fn print_frame_info(&self, passes: &[Pass<UserContext>], temporaries: &[ResourceId]) {
         let resources = self
-            .context
             .device
             .resources
             .lock()
@@ -964,26 +959,46 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
         }
     }
 
+    /// Returns the underlying `graal::Device`.
+    pub fn device(&self) -> &Arc<Device> {
+        &self.device
+    }
+
+    /// Returns this frame's number.
+    pub fn frame_number(&self) -> FrameNumber {
+        self.inner.frame_number
+    }
+}
+
+impl Context {
     /// Starts a new frame. The execution of the frame can optionally be synchronized
     /// with the given future in `happens_after`.
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn new(context: &'a mut Context, create_info: FrameCreateInfo) -> Frame<'a, EvalContext> {
-        let base_serial = context.next_serial;
+    pub fn start_frame<'a, UserContext>(
+        &mut self,
+        create_info: FrameCreateInfo,
+    ) -> Frame<'a, UserContext> {
+        // only build one frame at a time
+        assert!(!self.is_building_frame, "already building a frame");
+
+        let base_sn = self.last_sn;
         let wait_init = create_info.happens_after.serials;
 
         // Full CPU-side frame processing
-        let span = trace_span!("frame", base_serial).entered();
+        let span = trace_span!("frame", base_sn).entered();
         // DAG build only
         let build_span = trace_span!("DAG build").entered();
 
-        let frame_number = FrameNumber(context.submitted_frame_count + 1);
+        let frame_number = FrameNumber(self.submitted_frame_count + 1);
+        self.is_building_frame = true;
 
         Frame {
-            context,
+            device: self.device.clone(),
             inner: FrameInner {
-                base_serial,
+                base_sn,
+                current_sn: base_sn,
                 frame_number,
                 wait_init,
                 temporaries: vec![],
@@ -1000,23 +1015,41 @@ impl<'a, EvalContext> Frame<'a, EvalContext> {
     }
 
     /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn finish(mut self, eval_context: &mut EvalContext) -> GpuFuture {
-        assert!(self.current_pass.is_none(), "pass not finished");
+    pub fn finish_frame<UserContext, FrameCleanup>(
+        &mut self,
+        mut frame: Frame<UserContext>,
+        user_context: &mut UserContext,
+        user_frame_cleanup: FrameCleanup,
+    ) -> GpuFuture
+    where
+        FrameCleanup: FnOnce(&mut UserContext, &Device, FrameNumber),
+    {
+        assert!(frame.current_pass.is_none(), "pass not finished");
+        assert!(self.is_building_frame, "not building a frame");
 
-        self.dump(None);
+        frame.dump(None);
         //self.print_frame_info(&frame.passes, &frame.temporaries);
 
         // First, wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the frames that are not in use anymore.
-        self.context.wait_for_frames_in_flight();
+        self.wait_for_frames_in_flight();
+        // perform user cleanup
+        user_frame_cleanup(
+            user_context,
+            &self.device,
+            FrameNumber(self.completed_frame_count),
+        );
+
+        let last_sn = frame.inner.current_sn;
+        let frame_number = frame.inner.frame_number;
 
         // Submit the frame
-        let serials = self.context.submit_frame(self.inner, eval_context);
+        let serials = self.submit_frame(frame.inner, user_context);
+
+        // Update last submitted pass SN
+        self.last_sn = last_sn;
+        self.is_building_frame = false;
 
         GpuFuture { serials }
-    }
-
-    pub fn device(&self) -> &Arc<Device> {
-        &self.context.device
     }
 }

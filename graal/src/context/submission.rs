@@ -24,7 +24,7 @@ pub struct TransientObjects {
 
 /// Context passed to the command callbacks.
 pub struct RecordingContext<'a> {
-    context: &'a Context,
+    pub context: &'a Context,
 }
 
 impl<'a> Deref for RecordingContext<'a> {
@@ -276,10 +276,10 @@ impl Context {
 }
 
 impl Context {
-    pub(crate) fn submit_frame<EvalContext>(
+    pub(crate) fn submit_frame<UserContext>(
         &mut self,
-        mut frame: FrameInner<EvalContext>,
-        eval_context: &mut EvalContext,
+        mut frame: FrameInner<UserContext>,
+        user_context: &mut UserContext,
     ) -> QueueSerialNumbers {
         frame.build_span.exit();
 
@@ -412,7 +412,7 @@ impl Context {
                 Some(PassEvaluationCallback::CommandBuffer(record_fn)) => {
                     // perform a command-buffer level operation
                     let mut cctx = RecordingContext { context: self };
-                    record_fn(&mut cctx, eval_context, cb);
+                    record_fn(&mut cctx, user_context, cb);
 
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
                     batch.signal_snn = p.snn;
@@ -425,7 +425,7 @@ impl Context {
                     // call the handler
                     let queue = self.device.queues_info.queues[q as usize];
                     let mut cctx = RecordingContext { context: self };
-                    submit_fn(&mut cctx, eval_context, queue);
+                    submit_fn(&mut cctx, user_context, queue);
                 }
                 Some(PassEvaluationCallback::Present {
                     swapchain,

@@ -918,14 +918,14 @@ impl Device {
     /// Returns the handle of the corresponding image resource.
     /// Panics if `id` does not refer to an image resource.
     pub fn image_handle(&self, id: ImageId) -> vk::Image {
-        let mut resources = self.resources.lock().expect("failed to lock resources");
+        let resources = self.resources.lock().expect("failed to lock resources");
         resources.resources.get(id.0).unwrap().image().handle
     }
 
     /// Returns the handle of the corresponding buffer resource.
     /// Panics if `id` does not refer to a buffer resource.
     pub fn buffer_handle(&self, id: BufferId) -> vk::Buffer {
-        let mut resources = self.resources.lock().expect("failed to lock resources");
+        let resources = self.resources.lock().expect("failed to lock resources");
         resources.resources.get(id.0).unwrap().buffer().handle
     }
 }

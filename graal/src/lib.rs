@@ -17,7 +17,7 @@ pub use crate::{
         ImageResourceCreateInfo, ResourceGroupId, ResourceId, ResourceOwnership,
         ResourceRegistrationInfo,
     },
-    serial::{QueueSerialNumbers, SubmissionNumber},
+    serial::{QueueSerialNumbers, SubmissionNumber, FrameNumber},
 };
 pub use gpu_allocator::MemoryLocation;
 

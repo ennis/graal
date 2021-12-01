@@ -371,13 +371,13 @@ pub(crate) struct ResourceAccess {
     pub(crate) access_mask: vk::AccessFlags,
 }
 
-pub(crate) enum PassEvaluationCallback<'a, EvalContext> {
+pub(crate) enum PassEvaluationCallback<'a, UserContext> {
     Present {
         swapchain: vk::SwapchainKHR,
         image_index: u32,
     },
-    Queue(Box<dyn FnOnce(&mut RecordingContext, &mut EvalContext, vk::Queue) + 'a>),
-    CommandBuffer(Box<dyn FnOnce(&mut RecordingContext, &mut EvalContext, vk::CommandBuffer) + 'a>),
+    Queue(Box<dyn FnOnce(&mut RecordingContext, &mut UserContext, vk::Queue) + 'a>),
+    CommandBuffer(Box<dyn FnOnce(&mut RecordingContext, &mut UserContext, vk::CommandBuffer) + 'a>),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -413,7 +413,7 @@ pub(crate) struct SemaphoreSignal {
 }
 
 /// A pass within a frame.
-pub(crate) struct Pass<'a, EvalContext> {
+pub(crate) struct Pass<'a, UserContext> {
     name: String,
 
     /// Submission number of the pass.
@@ -448,10 +448,10 @@ pub(crate) struct Pass<'a, EvalContext> {
     pub(crate) external_semaphore_waits: Vec<SemaphoreWait>,
     pub(crate) external_semaphore_signals: Vec<SemaphoreSignal>,
 
-    pub(crate) eval_callback: Option<PassEvaluationCallback<'a, EvalContext>>,
+    pub(crate) eval_callback: Option<PassEvaluationCallback<'a, UserContext>>,
 }
 
-impl<'a, EvalContext> Pass<'a, EvalContext> {
+impl<'a, UserContext> Pass<'a, UserContext> {
     pub(crate) fn get_or_create_image_memory_barrier(
         &mut self,
         handle: vk::Image,
@@ -520,7 +520,7 @@ impl<'a, EvalContext> Pass<'a, EvalContext> {
         name: &str,
         frame_index: usize,
         snn: SubmissionNumber,
-    ) -> Pass<'a, EvalContext> {
+    ) -> Pass<'a, UserContext> {
         Pass {
             name: name.to_string(),
             snn,
@@ -560,17 +560,18 @@ impl SyncDebugInfo {
     }
 }
 
-pub(crate) struct FrameInner<'a, EvalContext> {
+pub(crate) struct FrameInner<'a, UserContext> {
     frame_number: FrameNumber,
     span: tracing::span::EnteredSpan,
     build_span: tracing::span::EnteredSpan,
-    base_serial: u64,
+    base_sn: u64,
+    current_sn: u64,
     /// Map temporary index -> resource
     temporaries: Vec<ResourceId>,
     /// Set of all resources referenced in the frame
     temporary_set: TemporarySet,
     /// List of passes
-    passes: Vec<Pass<'a, EvalContext>>,
+    passes: Vec<Pass<'a, UserContext>>,
     /// Serials to wait for before executing the frame.
     wait_init: QueueSerialNumbers,
 
@@ -644,10 +645,10 @@ pub(crate) struct FrameInner<'a, EvalContext> {
 }
 
 ///
-pub struct Frame<'a, EvalContext> {
-    context: &'a mut Context,
-    inner: FrameInner<'a, EvalContext>,
-    current_pass: Option<Pass<'a, EvalContext>>,
+pub struct Frame<'a, UserContext> {
+    device: Arc<Device>,
+    inner: FrameInner<'a, UserContext>,
+    current_pass: Option<Pass<'a, UserContext>>,
 }
 
 /// Graphics context
@@ -670,7 +671,7 @@ pub struct Context {
     completed_serials: QueueSerialNumbers,
 
     /// The serial to be used for the next pass (used by `Frame`)
-    next_serial: u64,
+    last_sn: u64,
 
     /// Frames that are currently executing on the GPU.
     in_flight: VecDeque<FrameInFlight>,
@@ -680,6 +681,9 @@ pub struct Context {
 
     /// Number of completed frames
     completed_frame_count: u64,
+
+    /// Whether we are between `start_frame`/`end_frame`.
+    is_building_frame: bool,
 }
 
 impl fmt::Debug for Context {
@@ -732,10 +736,11 @@ impl Context {
             available_command_pools: vec![],
             completed_serials: Default::default(),
             semaphore_pool: vec![],
-            next_serial: 0,
+            last_sn: 0,
             submitted_frame_count: 0,
             completed_frame_count: 0,
             in_flight: VecDeque::new(),
+            is_building_frame: false
         }
     }
 
@@ -853,8 +858,9 @@ impl Context {
         }*/
     }
 
-    pub fn current_frame_index(&self) -> u64 {
-        self.submitted_frame_count
+    pub fn current_frame_number(&self) -> FrameNumber {
+        assert!(self.is_building_frame, "not building a frame");
+        FrameNumber(self.submitted_frame_count+1)
     }
 
     pub fn wait_for(&mut self, future: GpuFuture) {

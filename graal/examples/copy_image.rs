@@ -3,7 +3,6 @@ use graal::{
     swapchain::Swapchain, vk, BufferResourceCreateInfo, Frame, FrameCreateInfo, ImageId, ImageInfo,
     ImageResourceCreateInfo, MemoryLocation, ResourceId,
 };
-use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
 use winit::{
@@ -84,7 +83,7 @@ fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = frame.device().create_buffer(
+    let staging_buffer = frame.device().create_buffer(
         "staging",
         MemoryLocation::CpuToGpu,
         &BufferResourceCreateInfo {
@@ -195,13 +194,10 @@ fn main() {
             Event::RedrawRequested(_) => {
                 let swapchain_image = unsafe { swapchain.acquire_next_image(&mut context) };
 
-                let mut frame = Frame::new(
-                    &mut context,
-                    FrameCreateInfo {
-                        collect_debug_info: true,
-                        happens_after: Default::default(),
-                    },
-                );
+                let mut frame = context.start_frame(FrameCreateInfo {
+                    collect_debug_info: true,
+                    happens_after: Default::default(),
+                });
 
                 let (file_image_id, file_image_width, file_image_height) = load_image(
                     &mut frame,
@@ -281,7 +277,8 @@ fn main() {
                 frame.end_pass();
 
                 frame.present("P12", &swapchain_image);
-                frame.finish(&mut ());
+
+                context.finish_frame(frame, &mut (), |_, _, _| {});
 
                 context.device().destroy_image(file_image_id);
                 context

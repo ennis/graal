@@ -85,7 +85,7 @@ fn disjoint_index_mut<T>(v: &mut [T], a: usize, b: usize) -> (&mut T, &mut T) {
     }
 }
 
-fn compute_reachability<EvalContext>(passes: &[Pass<EvalContext>]) -> Reachability {
+fn compute_reachability<UserContext>(passes: &[Pass<UserContext>]) -> Reachability {
     let len = passes.len();
     let mut m = Vec::new();
     m.resize_with(passes.len(), || FixedBitSet::with_capacity(len));
@@ -134,10 +134,10 @@ unsafe fn bind_resource_memory(
 
 /// Allocates memory for the resources specified in `temporaries`.
 /// If a resource is not used anymore, it might share its memory with another (aliasing).
-pub(crate) fn allocate_memory_for_transients<EvalContext>(
+pub(crate) fn allocate_memory_for_transients<UserContext>(
     context: &mut Context,
     base_serial: u64,
-    passes: &[Pass<EvalContext>],
+    passes: &[Pass<UserContext>],
     temporaries: &[ResourceId],
 ) -> Vec<gpu_allocator::vulkan::Allocation> {
     let _span = trace_span!("allocate_memory_for_transients").entered();
