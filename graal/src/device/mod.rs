@@ -1,13 +1,14 @@
-use crate::{platform_impl, VULKAN_ENTRY, VULKAN_INSTANCE};
+use crate::{platform_impl, resource::DeviceResources, VULKAN_ENTRY, VULKAN_INSTANCE};
 use ash::vk;
 use std::{
+    cell::RefCell,
     ffi::{CStr, CString},
+    fmt,
+    fmt::Formatter,
     os::raw::c_void,
     ptr,
+    sync::Mutex,
 };
-use std::cell::RefCell;
-use std::sync::Mutex;
-use crate::resource::DeviceResources;
 
 pub(crate) const MAX_QUEUES: usize = 4;
 
@@ -38,7 +39,6 @@ pub(crate) struct QueuesInfo {
     pub queues: [vk::Queue; MAX_QUEUES],
 }
 
-
 /// Wrapper around a vulkan device, associated queues and tracked resources.
 pub struct Device {
     /// Underlying vulkan device
@@ -47,15 +47,21 @@ pub struct Device {
     pub(crate) platform_extensions: platform_impl::PlatformExtensions,
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-    //pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
+    pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     //pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
     pub(crate) queues_info: QueuesInfo,
-    pub(crate) allocator: RefCell<gpu_allocator::vulkan::Allocator>,
+    pub(crate) allocator: Mutex<gpu_allocator::vulkan::Allocator>,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
     pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
     pub(crate) resources: Mutex<DeviceResources>,
+}
+
+impl fmt::Debug for Device {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Device").finish()
+    }
 }
 
 struct PhysicalDeviceAndProperties {
@@ -235,9 +241,9 @@ impl Device {
             memory_type_bits,
             required_memory_properties | preferred_memory_properties,
         )
-            .or_else(|| {
-                self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties)
-            })
+        .or_else(|| {
+            self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties)
+        })
     }
 
     /// Creates a new `Device` that can render to the specified `present_surface` if one is specified.
@@ -406,9 +412,9 @@ impl Device {
                 compute_queue_index,
                 transfer_queue_index,
             ]
-                .iter()
-                .max()
-                .unwrap() as usize
+            .iter()
+            .max()
+            .unwrap() as usize
                 + 1;
 
             let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -459,22 +465,27 @@ impl Device {
                 device,
                 platform_extensions,
                 physical_device: phy.phy,
-                //physical_device_properties: phy.properties,
+                physical_device_properties: phy.properties,
                 //physical_device_features: phy.features,
                 physical_device_memory_properties,
                 queues_info,
-                allocator: RefCell::new(allocator),
+                allocator: Mutex::new(allocator),
                 vk_khr_swapchain,
                 vk_khr_surface,
                 vk_ext_debug_utils,
                 debug_messenger,
-                resources: Mutex::new(DeviceResources::new())
+                resources: Mutex::new(DeviceResources::new()),
             }
         }
     }
     /// Returns the physical device that this device was created on.
     pub fn physical_device(&self) -> vk::PhysicalDevice {
         self.physical_device
+    }
+
+    /// Returns the physical device properties.
+    pub fn physical_device_properties(&self) -> &vk::PhysicalDeviceProperties {
+        &self.physical_device_properties
     }
 
     /// Returns the graphics queue handle and family index.

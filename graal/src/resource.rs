@@ -315,7 +315,7 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
             // free the memory associated to the object
             match allocation.take() {
                 Some(ResourceAllocation::Default { allocation }) => {
-                    device.allocator.borrow_mut().free(allocation).unwrap()
+                    device.allocator.lock().unwrap().free(allocation).unwrap()
                 }
                 _ => {
                     // External: the memory is freed elsewhere (?)
@@ -770,7 +770,8 @@ impl Device {
         };
         let allocation = self
             .allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .allocate(&allocation_create_desc)
             .expect("failed to allocate device memory");
         unsafe {
@@ -873,7 +874,8 @@ impl Device {
             };
             let allocation = self
                 .allocator
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
             unsafe {

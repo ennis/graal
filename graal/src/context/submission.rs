@@ -23,6 +23,7 @@ pub struct TransientObjects {
 }
 
 /// Context passed to the command callbacks.
+/// FIXME: not sure we need the context? maybe just directly pass a reference to the device
 pub struct RecordingContext<'a> {
     pub context: &'a Context,
 }

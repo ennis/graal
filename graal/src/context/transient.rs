@@ -9,9 +9,7 @@ use fixedbitset::FixedBitSet;
 use slotmap::SecondaryMap;
 use tracing::trace_span;
 
-
 // --- Reachability matrix -------------------------------------------------------------------------
-
 
 /// Returns whether stage a comes logically earlier than stage b.
 #[rustfmt::skip]
@@ -62,7 +60,6 @@ fn logically_earlier(a: vk::PipelineStageFlags, b: vk::PipelineStageFlags) -> bo
         _ => false,
     }
 }
-
 
 // --- Reachability matrix -------------------------------------------------------------------------
 struct Reachability {
@@ -302,7 +299,8 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
             let allocation = context
                 .device
                 .allocator
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .allocate(&allocation_create_desc)
                 .expect("failed to allocate device memory");
 
@@ -336,7 +334,8 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
         let allocation = context
             .device
             .allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .allocate(&allocation_create_desc)
             .expect("failed to allocate device memory");
         shared_allocations.push(allocation);
