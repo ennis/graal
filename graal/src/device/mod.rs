@@ -1,13 +1,16 @@
-use crate::{platform_impl, resource::DeviceResources, VULKAN_ENTRY, VULKAN_INSTANCE};
+use crate::{
+    context::ContextState, platform_impl, resource::DeviceObjects, Context, FrameNumber,
+    VULKAN_ENTRY, VULKAN_INSTANCE,
+};
 use ash::vk;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     ffi::{CStr, CString},
     fmt,
     fmt::Formatter,
     os::raw::c_void,
     ptr,
-    sync::Mutex,
+    sync::{Arc, Mutex},
 };
 
 pub(crate) const MAX_QUEUES: usize = 4;
@@ -55,7 +58,8 @@ pub struct Device {
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
     pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
-    pub(crate) resources: Mutex<DeviceResources>,
+    pub(crate) objects: Mutex<DeviceObjects>,
+    pub(crate) context_state: ContextState,
 }
 
 impl fmt::Debug for Device {
@@ -247,235 +251,235 @@ impl Device {
     }
 
     /// Creates a new `Device` that can render to the specified `present_surface` if one is specified.
-    pub fn new(present_surface: Option<vk::SurfaceKHR>) -> Device {
-        unsafe {
-            let instance = &*VULKAN_INSTANCE;
-            let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, instance);
+    pub unsafe fn new(present_surface: Option<vk::SurfaceKHR>) -> Device {
+        let instance = &*VULKAN_INSTANCE;
+        let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, instance);
 
-            let phy = select_physical_device(instance);
-            let queue_family_properties =
-                instance.get_physical_device_queue_family_properties(phy.phy);
+        let phy = select_physical_device(instance);
+        let queue_family_properties = instance.get_physical_device_queue_family_properties(phy.phy);
 
-            let graphics_queue_family = find_queue_family(
-                phy.phy,
-                &vk_khr_surface,
-                &queue_family_properties,
-                vk::QueueFlags::GRAPHICS,
-                present_surface,
-            );
-            let compute_queue_family = find_queue_family(
-                phy.phy,
-                &vk_khr_surface,
-                &queue_family_properties,
-                vk::QueueFlags::COMPUTE,
-                None,
-            );
-            let transfer_queue_family = find_queue_family(
-                phy.phy,
-                &vk_khr_surface,
-                &queue_family_properties,
-                vk::QueueFlags::TRANSFER,
-                None,
-            );
+        let graphics_queue_family = find_queue_family(
+            phy.phy,
+            &vk_khr_surface,
+            &queue_family_properties,
+            vk::QueueFlags::GRAPHICS,
+            present_surface,
+        );
+        let compute_queue_family = find_queue_family(
+            phy.phy,
+            &vk_khr_surface,
+            &queue_family_properties,
+            vk::QueueFlags::COMPUTE,
+            None,
+        );
+        let transfer_queue_family = find_queue_family(
+            phy.phy,
+            &vk_khr_surface,
+            &queue_family_properties,
+            vk::QueueFlags::TRANSFER,
+            None,
+        );
 
-            eprintln!(
-                "Selected physical device: {:?}",
-                CStr::from_ptr(phy.properties.device_name.as_ptr())
-            );
+        eprintln!(
+            "Selected physical device: {:?}",
+            CStr::from_ptr(phy.properties.device_name.as_ptr())
+        );
 
-            eprintln!(
-                "Graphics queue family: {} ({:?})",
-                graphics_queue_family,
-                queue_family_properties[graphics_queue_family as usize].queue_flags
-            );
-            eprintln!(
-                "Compute queue family: {} ({:?})",
-                compute_queue_family,
-                queue_family_properties[compute_queue_family as usize].queue_flags
-            );
-            eprintln!(
-                "Transfer queue family: {} ({:?})",
-                transfer_queue_family,
-                queue_family_properties[transfer_queue_family as usize].queue_flags
-            );
+        eprintln!(
+            "Graphics queue family: {} ({:?})",
+            graphics_queue_family,
+            queue_family_properties[graphics_queue_family as usize].queue_flags
+        );
+        eprintln!(
+            "Compute queue family: {} ({:?})",
+            compute_queue_family,
+            queue_family_properties[compute_queue_family as usize].queue_flags
+        );
+        eprintln!(
+            "Transfer queue family: {} ({:?})",
+            transfer_queue_family,
+            queue_family_properties[transfer_queue_family as usize].queue_flags
+        );
 
-            let mut device_queue_create_infos = Vec::<vk::DeviceQueueCreateInfo>::new();
-            let queue_priorities = [1.0f32];
-            for &f in &[
-                graphics_queue_family,
-                compute_queue_family,
-                transfer_queue_family,
-            ] {
-                let already_created = device_queue_create_infos
-                    .iter()
-                    .any(|ci| ci.queue_family_index == f);
-                if already_created {
-                    continue;
-                }
-
-                device_queue_create_infos.push(vk::DeviceQueueCreateInfo {
-                    flags: Default::default(),
-                    queue_family_index: f,
-                    queue_count: 1,
-                    p_queue_priorities: queue_priorities.as_ptr(),
-                    ..Default::default()
-                });
-            }
-
-            let mut timeline_features = vk::PhysicalDeviceTimelineSemaphoreFeatures {
-                timeline_semaphore: vk::TRUE,
-                ..Default::default()
-            };
-
-            let mut features2 = vk::PhysicalDeviceFeatures2 {
-                p_next: &mut timeline_features as *mut _ as *mut c_void,
-                features: vk::PhysicalDeviceFeatures {
-                    tessellation_shader: vk::TRUE,
-                    fill_mode_non_solid: vk::TRUE,
-                    sampler_anisotropy: vk::TRUE,
-                    shader_storage_image_extended_formats: vk::TRUE,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
-
-            // Convert extension strings into C-strings
-            let c_device_extensions: Vec<_> = DEVICE_EXTENSIONS
+        let mut device_queue_create_infos = Vec::<vk::DeviceQueueCreateInfo>::new();
+        let queue_priorities = [1.0f32];
+        for &f in &[
+            graphics_queue_family,
+            compute_queue_family,
+            transfer_queue_family,
+        ] {
+            let already_created = device_queue_create_infos
                 .iter()
-                .chain(platform_impl::PlatformExtensions::names().iter())
-                .map(|&s| CString::new(s).unwrap())
-                .collect();
-
-            let device_extensions: Vec<_> =
-                c_device_extensions.iter().map(|s| s.as_ptr()).collect();
-
-            let device_create_info = vk::DeviceCreateInfo {
-                p_next: &mut features2 as *mut _ as *mut c_void,
-                flags: Default::default(),
-                queue_create_info_count: device_queue_create_infos.len() as u32,
-                p_queue_create_infos: device_queue_create_infos.as_ptr(),
-                enabled_layer_count: 0,
-                pp_enabled_layer_names: ptr::null(),
-                enabled_extension_count: device_extensions.len() as u32,
-                pp_enabled_extension_names: device_extensions.as_ptr(),
-                p_enabled_features: ptr::null(),
-                ..Default::default()
-            };
-
-            let device = instance
-                .create_device(phy.phy, &device_create_info, None)
-                .expect("could not create vulkan device");
-            let graphics_queue = device.get_device_queue(graphics_queue_family, 0);
-            let compute_queue = device.get_device_queue(compute_queue_family, 0);
-            let transfer_queue = device.get_device_queue(transfer_queue_family, 0);
-
-            // queues are accessed by index. there are three different indices
-            // - graphics
-            // - compute
-            // - transfer
-            // (present is always == graphics)
-            // Some of those indices may be equal. E.g. the graphics and compute queues might be the
-            // same, and graphics == compute.
-            let graphics_queue_index: u8 = 0u8;
-            let compute_queue_index: u8 = if compute_queue == graphics_queue {
-                0
-            } else {
-                1
-            };
-            let transfer_queue_index: u8 = if transfer_queue == graphics_queue {
-                0
-            } else if transfer_queue == compute_queue {
-                1
-            } else {
-                2
-            };
-
-            let mut queues_info = QueuesInfo::default();
-
-            queues_info.queues[graphics_queue_index as usize] = graphics_queue;
-            queues_info.queues[compute_queue_index as usize] = compute_queue;
-            queues_info.queues[transfer_queue_index as usize] = transfer_queue;
-
-            queues_info.families[graphics_queue_index as usize] = graphics_queue_family;
-            queues_info.families[compute_queue_index as usize] = compute_queue_family;
-            queues_info.families[transfer_queue_index as usize] = transfer_queue_family;
-
-            queues_info.indices = QueueIndices {
-                graphics: graphics_queue_index,
-                compute: compute_queue_index,
-                present: graphics_queue_index,
-                transfer: transfer_queue_index,
-            };
-
-            queues_info.queue_count = *[
-                graphics_queue_index,
-                compute_queue_index,
-                transfer_queue_index,
-            ]
-            .iter()
-            .max()
-            .unwrap() as usize
-                + 1;
-
-            let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
-                physical_device: phy.phy,
-                debug_settings: Default::default(),
-                device: device.clone(),     // not cheap!
-                instance: instance.clone(), // not cheap!
-                buffer_device_address: false, /*flags: Default::default(),
-                                            preferred_large_heap_block_size: 0, // default
-                                            frame_in_use_count: 2,
-                                            heap_size_limits: None,*/
-            };
-
-            let allocator = gpu_allocator::vulkan::Allocator::new(&allocator_create_desc)
-                .expect("failed to create GPU allocator");
-
-            let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
-
-            // FIXME this should be created after the instance.
-            let vk_ext_debug_utils =
-                ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
-
-            let debug_utils_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
-                flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
-                message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
-                    | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
-                message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
-                    | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
-                    | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
-                pfn_user_callback: Some(debug_utils_message_callback),
-                p_user_data: ptr::null_mut(),
-                ..Default::default()
-            };
-
-            let debug_messenger = vk_ext_debug_utils
-                .create_debug_utils_messenger(&debug_utils_messenger_create_info, None)
-                .unwrap();
-
-            let physical_device_memory_properties =
-                VULKAN_INSTANCE.get_physical_device_memory_properties(phy.phy);
-
-            let platform_extensions =
-                platform_impl::PlatformExtensions::load(&*VULKAN_ENTRY, &*VULKAN_INSTANCE, &device);
-
-            Device {
-                device,
-                platform_extensions,
-                physical_device: phy.phy,
-                physical_device_properties: phy.properties,
-                //physical_device_features: phy.features,
-                physical_device_memory_properties,
-                queues_info,
-                allocator: Mutex::new(allocator),
-                vk_khr_swapchain,
-                vk_khr_surface,
-                vk_ext_debug_utils,
-                debug_messenger,
-                resources: Mutex::new(DeviceResources::new()),
+                .any(|ci| ci.queue_family_index == f);
+            if already_created {
+                continue;
             }
+
+            device_queue_create_infos.push(vk::DeviceQueueCreateInfo {
+                flags: Default::default(),
+                queue_family_index: f,
+                queue_count: 1,
+                p_queue_priorities: queue_priorities.as_ptr(),
+                ..Default::default()
+            });
+        }
+
+        let mut timeline_features = vk::PhysicalDeviceTimelineSemaphoreFeatures {
+            timeline_semaphore: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut features2 = vk::PhysicalDeviceFeatures2 {
+            p_next: &mut timeline_features as *mut _ as *mut c_void,
+            features: vk::PhysicalDeviceFeatures {
+                tessellation_shader: vk::TRUE,
+                fill_mode_non_solid: vk::TRUE,
+                sampler_anisotropy: vk::TRUE,
+                shader_storage_image_extended_formats: vk::TRUE,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Convert extension strings into C-strings
+        let c_device_extensions: Vec<_> = DEVICE_EXTENSIONS
+            .iter()
+            .chain(platform_impl::PlatformExtensions::names().iter())
+            .map(|&s| CString::new(s).unwrap())
+            .collect();
+
+        let device_extensions: Vec<_> = c_device_extensions.iter().map(|s| s.as_ptr()).collect();
+
+        let device_create_info = vk::DeviceCreateInfo {
+            p_next: &mut features2 as *mut _ as *mut c_void,
+            flags: Default::default(),
+            queue_create_info_count: device_queue_create_infos.len() as u32,
+            p_queue_create_infos: device_queue_create_infos.as_ptr(),
+            enabled_layer_count: 0,
+            pp_enabled_layer_names: ptr::null(),
+            enabled_extension_count: device_extensions.len() as u32,
+            pp_enabled_extension_names: device_extensions.as_ptr(),
+            p_enabled_features: ptr::null(),
+            ..Default::default()
+        };
+
+        let device = instance
+            .create_device(phy.phy, &device_create_info, None)
+            .expect("could not create vulkan device");
+        let graphics_queue = device.get_device_queue(graphics_queue_family, 0);
+        let compute_queue = device.get_device_queue(compute_queue_family, 0);
+        let transfer_queue = device.get_device_queue(transfer_queue_family, 0);
+
+        // queues are accessed by index. there are three different indices
+        // - graphics
+        // - compute
+        // - transfer
+        // (present is always == graphics)
+        // Some of those indices may be equal. E.g. the graphics and compute queues might be the
+        // same, and graphics == compute.
+        let graphics_queue_index: u8 = 0u8;
+        let compute_queue_index: u8 = if compute_queue == graphics_queue {
+            0
+        } else {
+            1
+        };
+        let transfer_queue_index: u8 = if transfer_queue == graphics_queue {
+            0
+        } else if transfer_queue == compute_queue {
+            1
+        } else {
+            2
+        };
+
+        let mut queues_info = QueuesInfo::default();
+
+        queues_info.queues[graphics_queue_index as usize] = graphics_queue;
+        queues_info.queues[compute_queue_index as usize] = compute_queue;
+        queues_info.queues[transfer_queue_index as usize] = transfer_queue;
+
+        queues_info.families[graphics_queue_index as usize] = graphics_queue_family;
+        queues_info.families[compute_queue_index as usize] = compute_queue_family;
+        queues_info.families[transfer_queue_index as usize] = transfer_queue_family;
+
+        queues_info.indices = QueueIndices {
+            graphics: graphics_queue_index,
+            compute: compute_queue_index,
+            present: graphics_queue_index,
+            transfer: transfer_queue_index,
+        };
+
+        queues_info.queue_count = *[
+            graphics_queue_index,
+            compute_queue_index,
+            transfer_queue_index,
+        ]
+        .iter()
+        .max()
+        .unwrap() as usize
+            + 1;
+
+        let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
+            physical_device: phy.phy,
+            debug_settings: Default::default(),
+            device: device.clone(),     // not cheap!
+            instance: instance.clone(), // not cheap!
+            buffer_device_address: false, /*flags: Default::default(),
+                                        preferred_large_heap_block_size: 0, // default
+                                        frame_in_use_count: 2,
+                                        heap_size_limits: None,*/
+        };
+
+        let allocator = gpu_allocator::vulkan::Allocator::new(&allocator_create_desc)
+            .expect("failed to create GPU allocator");
+
+        let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
+
+        // FIXME this should be created after the instance.
+        let vk_ext_debug_utils =
+            ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
+
+        let debug_utils_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
+            flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
+            message_severity: vk::DebugUtilsMessageSeverityFlagsEXT::VERBOSE
+                | vk::DebugUtilsMessageSeverityFlagsEXT::INFO
+                | vk::DebugUtilsMessageSeverityFlagsEXT::WARNING
+                | vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+            message_type: vk::DebugUtilsMessageTypeFlagsEXT::GENERAL
+                | vk::DebugUtilsMessageTypeFlagsEXT::PERFORMANCE
+                | vk::DebugUtilsMessageTypeFlagsEXT::VALIDATION,
+            pfn_user_callback: Some(debug_utils_message_callback),
+            p_user_data: ptr::null_mut(),
+            ..Default::default()
+        };
+
+        let debug_messenger = vk_ext_debug_utils
+            .create_debug_utils_messenger(&debug_utils_messenger_create_info, None)
+            .unwrap();
+
+        let physical_device_memory_properties =
+            VULKAN_INSTANCE.get_physical_device_memory_properties(phy.phy);
+
+        let platform_extensions =
+            platform_impl::PlatformExtensions::load(&*VULKAN_ENTRY, &*VULKAN_INSTANCE, &device);
+
+        Device {
+            device,
+            platform_extensions,
+            physical_device: phy.phy,
+            physical_device_properties: phy.properties,
+            //physical_device_features: phy.features,
+            physical_device_memory_properties,
+            queues_info,
+            allocator: Mutex::new(allocator),
+            vk_khr_swapchain,
+            vk_khr_surface,
+            vk_ext_debug_utils,
+            debug_messenger,
+            objects: Mutex::new(DeviceObjects::new()),
+            context_state: ContextState {
+                is_building_frame: Cell::new(false),
+                last_started_frame: Cell::new(Default::default()),
+            },
         }
     }
     /// Returns the physical device that this device was created on.
@@ -493,4 +497,12 @@ impl Device {
         let q = self.queues_info.indices.graphics as usize;
         (self.queues_info.queues[q], self.queues_info.families[q])
     }
+}
+
+pub unsafe fn create_device_and_context(
+    present_surface: Option<vk::SurfaceKHR>,
+) -> (Arc<Device>, Context) {
+    let device = Device::new(present_surface);
+    let context = Context::with_device(device);
+    (context.device().clone(), context)
 }

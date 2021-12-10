@@ -142,7 +142,7 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
     let reachability = compute_reachability(&passes);
     let mut resources = context
         .device
-        .resources
+        .objects
         .lock()
         .expect("could not lock resources");
 

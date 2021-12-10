@@ -12,6 +12,7 @@ use winit::{
 };
 
 fn load_image(
+    device: &graal::Device,
     frame: &mut graal::Frame<()>,
     path: &Path,
     usage: graal::vk::ImageUsageFlags,
@@ -61,7 +62,7 @@ fn load_image(
     let ImageInfo {
         handle: image_handle,
         id: image_id,
-    } = frame.device().create_image(
+    } = device.create_image(
         path.to_str().unwrap(),
         MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
@@ -83,7 +84,7 @@ fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let staging_buffer = frame.device().create_buffer(
+    let staging_buffer = device.create_buffer(
         "staging",
         MemoryLocation::CpuToGpu,
         &BufferResourceCreateInfo {
@@ -110,20 +111,20 @@ fn load_image(
     let staging_buffer_handle = staging_buffer.handle;
 
     // === upload pass ===
-    frame.start_graphics_pass("image upload");
-    frame.pass_image_dependency(
+    let mut pass = frame.start_graphics_pass("image upload");
+    pass.add_image_dependency(
         image_id,
         vk::AccessFlags::TRANSFER_WRITE,
         vk::PipelineStageFlags::TRANSFER,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
-    frame.pass_buffer_dependency(
+    pass.add_buffer_dependency(
         staging_buffer.id,
         vk::AccessFlags::TRANSFER_READ,
         vk::PipelineStageFlags::TRANSFER,
     );
-    frame.pass_set_record_callback(move |context, _, command_buffer| unsafe {
+    pass.set_record_callback(move |context, _, command_buffer| unsafe {
         let device = context.vulkan_device();
         let regions = &[vk::BufferImageCopy {
             buffer_offset: 0,
@@ -151,10 +152,8 @@ fn load_image(
             regions,
         );
     });
-    frame.end_pass();
-
-    frame.device().destroy_buffer(staging_buffer.id);
-
+    pass.finish();
+    device.destroy_buffer(staging_buffer.id);
     (image_id, width, height)
 }
 
@@ -169,9 +168,9 @@ fn main() {
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
-    let device = graal::Device::new(Some(surface));
-    let mut context = graal::Context::with_device(device);
-    let mut swapchain = unsafe { Swapchain::new(&context, surface, window.inner_size().into()) };
+
+    let (device, mut context) = unsafe { graal::create_device_and_context(Some(surface)) };
+    let mut swapchain = unsafe { Swapchain::new(&device, surface, window.inner_size().into()) };
     let mut swapchain_size = window.inner_size().into();
 
     event_loop.run(move |event, _, control_flow| {
@@ -184,7 +183,7 @@ fn main() {
                 }
                 WindowEvent::Resized(size) => unsafe {
                     swapchain_size = size.into();
-                    swapchain.resize(&context, swapchain_size);
+                    swapchain.resize(&device, swapchain_size);
                 },
                 _ => {}
             },
@@ -192,7 +191,7 @@ fn main() {
                 window.request_redraw();
             }
             Event::RedrawRequested(_) => {
-                let swapchain_image = unsafe { swapchain.acquire_next_image(&mut context) };
+                let swapchain_image = unsafe { swapchain.acquire_next_image(&device, context.create_semaphore()) };
 
                 let mut frame = context.start_frame(FrameCreateInfo {
                     collect_debug_info: true,
@@ -200,22 +199,23 @@ fn main() {
                 });
 
                 let (file_image_id, file_image_width, file_image_height) = load_image(
+                    &device,
                     &mut frame,
                     "data/haniyasushin_keiki.jpg".as_ref(),
                     vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
                     false,
                 );
 
-                frame.start_graphics_pass("blit to screen");
+                let mut pass = frame.start_graphics_pass("blit to screen");
 
-                frame.pass_image_dependency(
+                pass.add_image_dependency(
                     file_image_id,
                     vk::AccessFlags::TRANSFER_READ,
                     vk::PipelineStageFlags::TRANSFER,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                 );
-                frame.pass_image_dependency(
+                pass.add_image_dependency(
                     swapchain_image.image_info.id,
                     vk::AccessFlags::TRANSFER_WRITE,
                     vk::PipelineStageFlags::TRANSFER,
@@ -226,7 +226,7 @@ fn main() {
                 let blit_w = file_image_width.min(swapchain_size.0);
                 let blit_h = file_image_height.min(swapchain_size.1);
 
-                frame.pass_set_record_callback(move |context, _, command_buffer| {
+                pass.set_record_callback(move |context, _, command_buffer| {
                     let dst_image_handle =
                         context.device().image_handle(swapchain_image.image_info.id);
                     let src_image_handle = context.device().image_handle(file_image_id);
@@ -274,16 +274,11 @@ fn main() {
                         );
                     }
                 });
-                frame.end_pass();
-
+                pass.finish();
                 frame.present("P12", &swapchain_image);
-
-                context.finish_frame(frame, &mut (), |_, _, _| {});
-
-                context.device().destroy_image(file_image_id);
-                context
-                    .device()
-                    .destroy_image(swapchain_image.image_info.id);
+                frame.finish(&mut ());
+                device.destroy_image(file_image_id);
+                device.destroy_image(swapchain_image.image_info.id);
             }
             _ => (),
         }

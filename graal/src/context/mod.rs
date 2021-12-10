@@ -7,8 +7,11 @@ use crate::{
 };
 use ash::vk;
 use std::{collections::VecDeque, fmt, os::raw::c_void, sync::Arc};
+use std::cell::{Cell, RefCell};
+use std::sync::Mutex;
 pub use submission::RecordingContext;
 use tracing::{trace, trace_span};
+use crate::resource::DeviceObjects;
 
 pub(crate) mod frame;
 pub(crate) mod submission;
@@ -646,45 +649,40 @@ pub(crate) struct FrameInner<'a, UserContext> {
 
 ///
 pub struct Frame<'a, UserContext> {
-    device: Arc<Device>,
+    context: &'a mut Context,
     inner: FrameInner<'a, UserContext>,
-    current_pass: Option<Pass<'a, UserContext>>,
+    //current_pass: Option<Pass<'a, UserContext>>,
 }
 
-/// Graphics context
+pub(crate) struct ContextState {
+    /// Whether we are between `start_frame`/`end_frame`.
+    pub(crate) is_building_frame: Cell<bool>,
+    /// Last started frame
+    pub(crate) last_started_frame: Cell<FrameNumber>,
+}
+
 pub struct Context {
     pub(crate) device: Arc<Device>,
-
     /// Free semaphores guaranteed to be in the unsignalled state.
-    semaphore_pool: Vec<vk::Semaphore>,
-
+    pub(crate) semaphore_pool: Vec<vk::Semaphore>,
     /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
-    timelines: [vk::Semaphore; MAX_QUEUES],
-
+    pub(crate) timelines: [vk::Semaphore; MAX_QUEUES],
     /// Array containing the last submitted pass serials for each queue
-    last_signalled_serials: QueueSerialNumbers,
-
+    pub(crate) last_signalled_serials: QueueSerialNumbers,
     /// Pool of recycled command pools.
-    available_command_pools: Vec<CommandAllocator>,
-
+    pub(crate) available_command_pools: Vec<CommandAllocator>,
     /// Array containing the last completed pass serials for each queue
-    completed_serials: QueueSerialNumbers,
-
+    pub(crate) completed_serials: QueueSerialNumbers,
     /// The serial to be used for the next pass (used by `Frame`)
-    last_sn: u64,
-
+    pub(crate) last_sn: u64,
     /// Frames that are currently executing on the GPU.
     in_flight: VecDeque<FrameInFlight>,
-
     /// Number of submitted frames
-    submitted_frame_count: u64,
-
+    pub(crate) submitted_frame_count: u64,
     /// Number of completed frames
-    completed_frame_count: u64,
-
-    /// Whether we are between `start_frame`/`end_frame`.
-    is_building_frame: bool,
+    pub(crate) completed_frame_count: u64,
 }
+
 
 impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -694,16 +692,6 @@ impl fmt::Debug for Context {
 }
 
 impl Context {
-    /// Creates a new context with a default device.
-    pub fn new() -> Context {
-        Self::with_device(Device::new(None))
-    }
-
-    /// Creates a new context. A vulkan device that can present to the specified surface will be created.
-    pub fn with_surface(surface: vk::SurfaceKHR) -> Context {
-        let device = Device::new(Some(surface));
-        Self::with_device(device)
-    }
 
     /// Creates a new context with the given device.
     pub fn with_device(device: Device) -> Context {
@@ -740,7 +728,6 @@ impl Context {
             submitted_frame_count: 0,
             completed_frame_count: 0,
             in_flight: VecDeque::new(),
-            is_building_frame: false
         }
     }
 
@@ -859,8 +846,8 @@ impl Context {
     }
 
     pub fn current_frame_number(&self) -> FrameNumber {
-        assert!(self.is_building_frame, "not building a frame");
-        FrameNumber(self.submitted_frame_count+1)
+        //assert!(self.is_building_frame, "not building a frame");
+        FrameNumber(self.submitted_frame_count + 1)
     }
 
     pub fn wait_for(&mut self, future: GpuFuture) {

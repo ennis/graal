@@ -280,7 +280,7 @@ impl Context {
     pub(crate) fn submit_frame<UserContext>(
         &mut self,
         mut frame: FrameInner<UserContext>,
-        user_context: &mut UserContext,
+        user_context: &mut UserContext
     ) -> QueueSerialNumbers {
         frame.build_span.exit();
 

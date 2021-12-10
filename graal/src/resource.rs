@@ -3,7 +3,7 @@ use crate::{
     serial::{QueueSerialNumbers, SubmissionNumber},
     vk,
     vk::Handle,
-    Device,
+    Context, Device, FrameNumber,
 };
 use gpu_allocator::MemoryLocation;
 use slotmap::{Key, SlotMap};
@@ -72,9 +72,9 @@ pub struct ImageResourceCreateInfo {
     pub extent: vk::Extent3D,
     /// Number of mipmap levels. Note that the mipmaps contents must still be generated manually. Default is 1. 0 is *not* a valid value.
     pub mip_levels: u32,
-    /// Number of array layers. Default is 1. 0 is *not* a valid value.
+    /// Number of array layers. Default is `1`. `0` is *not* a valid value.
     pub array_layers: u32,
-    /// Number of samples. Default is 1. 0 is *not* a valid value.
+    /// Number of samples. Default is `1`. `0` is *not* a valid value.
     pub samples: u32,
     /// Tiling.
     pub tiling: vk::ImageTiling,
@@ -421,16 +421,267 @@ fn set_debug_object_name(
     }
 }
 
-pub(crate) struct DeviceResources {
-    pub(crate) resources: ResourceMap,
-    pub(crate) resource_groups: slotmap::SlotMap<ResourceGroupId, ResourceGroup>,
+slotmap::new_key_type! {
+    pub struct DescriptorSetLayoutId;
+    pub struct SamplerId;
+    pub struct PipelineId;
+    pub struct PipelineLayoutId;
+    pub struct ComputePipelineId;
 }
 
-impl DeviceResources {
-    pub(crate) fn new() -> DeviceResources {
-        DeviceResources {
+struct Tracked<T> {
+    frame: FrameNumber,
+    obj: T,
+}
+
+/// Vulkan object tracker.
+struct ObjectTracker<Id: slotmap::Key, Obj> {
+    objects: SlotMap<Id, Tracked<Obj>>,
+    pending_deletion: Vec<Tracked<Obj>>,
+}
+
+impl<Id: slotmap::Key, Obj> Default for ObjectTracker<Id, Obj> {
+    fn default() -> Self {
+        ObjectTracker {
+            objects: SlotMap::with_key(),
+            pending_deletion: vec![],
+        }
+    }
+}
+
+impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
+    fn insert(&mut self, obj: Obj) -> Id {
+        self.objects.insert(Tracked {
+            obj,
+            frame: Default::default(),
+        })
+    }
+
+    fn destroy(&mut self, id: Id) {
+        if let Some(id) = self.objects.remove(id) {
+            self.pending_deletion.push(id)
+        } else {
+            // TODO more debug
+            tracing::warn!("object already removed")
+        }
+    }
+
+    fn destroy_on_frame_completed(&mut self, frame: FrameNumber, id: Id) {
+        if let Some(t) = self.objects.remove(id) {
+            self.pending_deletion.push(Tracked { frame, obj: t.obj })
+        } else {
+            // TODO more debug
+            tracing::warn!("object already removed")
+        }
+    }
+
+    fn cleanup(&mut self, completed_frame: FrameNumber, mut f: impl FnMut(Obj)) {
+        let mut i = 0;
+        while i <= self.pending_deletion.len() {
+            if self.pending_deletion[i].frame <= completed_frame {
+                f(self.pending_deletion.swap_remove(i).obj)
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+/// Tracked device objects.
+///
+/// There are three strategies for destroying objects:
+/// 1. defer destruction until the current frame has finished execution. This is needed for:
+///     - descriptor sets
+///     - framebuffers
+///     - samplers
+///     - pipelines
+///     - image views
+/// 2. defer destruction until the current frame has been submitted (and all command buffers have been recorded). Needed for:
+///     - pipeline layouts
+
+pub(crate) struct DeviceObjects {
+    pub(crate) resources: ResourceMap,
+    pub(crate) resource_groups: slotmap::SlotMap<ResourceGroupId, ResourceGroup>,
+    descriptor_set_layouts:
+        slotmap::SlotMap<DescriptorSetLayoutId, vk::DescriptorSetLayout>,
+    samplers: ObjectTracker<SamplerId, vk::Sampler>,
+    pipelines: ObjectTracker<PipelineId, vk::Pipeline>,
+    descriptor_allocators:
+        slotmap::SecondaryMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
+    /// Pipeline layouts pending deletion after the current frame is submitted.
+    dead_pipeline_layouts: Vec<vk::PipelineLayout>,
+}
+
+/// Information about a newly created sampler object.
+pub struct SamplerInfo {
+    /// Vulkan handle of the sampler.
+    pub handle: vk::Sampler,
+    /// Tracking ID of the sampler object.
+    pub id: SamplerId,
+}
+
+/// Information about a newly created descriptor set layout object.
+pub struct DescriptorSetLayoutInfo {
+    /// Vulkan handle of the descriptor set layout.
+    pub handle: vk::DescriptorSetLayout,
+    /// Tracking ID of the descriptor set layout.
+    pub id: DescriptorSetLayoutId,
+}
+//-----------------------------------------------------------------------------------------
+const DESCRIPTOR_POOL_PER_TYPE_COUNT: u32 = 1024;
+const DESCRIPTOR_POOL_SET_COUNT: u32 = DESCRIPTOR_POOL_PER_TYPE_COUNT;
+
+/// Allocator for descriptor sets of a specific layout.
+#[derive(Debug)]
+pub struct DescriptorSetAllocator {
+    pub(crate) pool_size_count: u32,
+    pub(crate) pool_sizes: [vk::DescriptorPoolSize; 16],
+    pub(crate) full_pools: Vec<vk::DescriptorPool>,
+    ///
+    pub(crate) pool: Option<vk::DescriptorPool>,
+    /// Descriptor sets not currently in use.
+    pub(crate) free: Vec<vk::DescriptorSet>,
+}
+
+impl DescriptorSetAllocator {
+    pub fn new(
+        descriptor_set_layout_bindings: &[vk::DescriptorSetLayoutBinding],
+    ) -> DescriptorSetAllocator {
+        let mut pool_sizes: [vk::DescriptorPoolSize; 16] = Default::default();
+        // count the number of each type of descriptor
+        let mut sampler_desc_count = 0;
+        let mut combined_image_sampler_desc_count = 0;
+        let mut sampled_image_desc_count = 0;
+        let mut storage_image_desc_count = 0;
+        let mut uniform_texel_buffer_desc_count = 0;
+        let mut storage_texel_buffer_desc_count = 0;
+        let mut uniform_buffer_desc_count = 0;
+        let mut storage_buffer_desc_count = 0;
+        let mut uniform_buffer_dynamic_desc_count = 0;
+        let mut storage_buffer_dynamic_desc_count = 0;
+        let mut input_attachment_desc_count = 0;
+        let mut acceleration_structure_desc_count = 0;
+
+        for b in descriptor_set_layout_bindings.iter() {
+            match b.descriptor_type {
+                vk::DescriptorType::SAMPLER => sampler_desc_count += 1,
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
+                    combined_image_sampler_desc_count += 1
+                }
+                vk::DescriptorType::SAMPLED_IMAGE => sampled_image_desc_count += 1,
+                vk::DescriptorType::STORAGE_IMAGE => storage_image_desc_count += 1,
+                vk::DescriptorType::UNIFORM_TEXEL_BUFFER => uniform_texel_buffer_desc_count += 1,
+                vk::DescriptorType::STORAGE_TEXEL_BUFFER => storage_texel_buffer_desc_count += 1,
+                vk::DescriptorType::UNIFORM_BUFFER => uniform_buffer_desc_count += 1,
+                vk::DescriptorType::STORAGE_BUFFER => storage_buffer_desc_count += 1,
+                vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
+                    uniform_buffer_dynamic_desc_count += 1
+                }
+                vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
+                    storage_buffer_dynamic_desc_count += 1
+                }
+                vk::DescriptorType::INPUT_ATTACHMENT => input_attachment_desc_count += 1,
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {
+                    acceleration_structure_desc_count += 1
+                }
+                _ => {}
+            }
+        }
+
+        let mut pool_size_count = 0;
+        if sampler_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::SAMPLER;
+            pool_sizes[pool_size_count].descriptor_count =
+                sampler_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if combined_image_sampler_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+            pool_sizes[pool_size_count].descriptor_count =
+                combined_image_sampler_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if sampled_image_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::SAMPLED_IMAGE;
+            pool_sizes[pool_size_count].descriptor_count =
+                sampled_image_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if storage_image_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::STORAGE_IMAGE;
+            pool_sizes[pool_size_count].descriptor_count =
+                storage_image_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if uniform_texel_buffer_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::UNIFORM_TEXEL_BUFFER;
+            pool_sizes[pool_size_count].descriptor_count =
+                uniform_texel_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if storage_texel_buffer_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::STORAGE_TEXEL_BUFFER;
+            pool_sizes[pool_size_count].descriptor_count =
+                storage_texel_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if uniform_buffer_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::UNIFORM_BUFFER;
+            pool_sizes[pool_size_count].descriptor_count =
+                uniform_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if storage_buffer_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::STORAGE_BUFFER;
+            pool_sizes[pool_size_count].descriptor_count =
+                storage_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if uniform_buffer_dynamic_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC;
+            pool_sizes[pool_size_count].descriptor_count =
+                uniform_buffer_dynamic_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if storage_buffer_dynamic_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::STORAGE_BUFFER_DYNAMIC;
+            pool_sizes[pool_size_count].descriptor_count =
+                storage_buffer_dynamic_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if input_attachment_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::INPUT_ATTACHMENT;
+            pool_sizes[pool_size_count].descriptor_count =
+                input_attachment_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+        if acceleration_structure_desc_count != 0 {
+            pool_sizes[pool_size_count].ty = vk::DescriptorType::ACCELERATION_STRUCTURE_KHR;
+            pool_sizes[pool_size_count].descriptor_count =
+                acceleration_structure_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_size_count += 1;
+        }
+
+        DescriptorSetAllocator {
+            pool_sizes,
+            pool_size_count: pool_size_count as u32,
+            full_pools: vec![],
+            pool: None,
+            free: vec![],
+        }
+    }
+}
+
+impl DeviceObjects {
+    pub(crate) fn new() -> DeviceObjects {
+        DeviceObjects {
             resources: SlotMap::with_key(),
             resource_groups: SlotMap::with_key(),
+            descriptor_set_layouts: Default::default(),
+            samplers: Default::default(),
+            pipelines: Default::default(),
+            descriptor_allocators: slotmap::SecondaryMap::default(),
+            dead_pipeline_layouts: vec![],
         }
     }
 
@@ -525,18 +776,20 @@ impl DeviceResources {
 }
 
 impl Device {
+    /// TODO docs
     pub(crate) fn cleanup_resources(&self, completed_serials: QueueSerialNumbers) {
-        let mut resources = self.resources.lock().expect("failed to lock resources");
-        resources.cleanup_resources(&self, completed_serials)
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects.cleanup_resources(&self, completed_serials)
     }
 
+    /// Common helper function to register a buffer or image resource.
     unsafe fn register_resource(
         &self,
         info: ResourceRegistrationInfo,
         kind: ResourceKind,
     ) -> ResourceId {
-        let mut resources = self.resources.lock().expect("failed to lock resources");
-        resources.register_resource(&self, info, kind)
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects.register_resource(&self, info, kind)
     }
 
     /// Registers an existing buffer resource in the context.
@@ -560,6 +813,163 @@ impl Device {
             }),
         );
         ImageId(id)
+    }
+
+    /// Creates a sampler object.
+    pub fn create_sampler(&self, create_info: &vk::SamplerCreateInfo) -> SamplerInfo {
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        unsafe {
+            let handle = self
+                .device
+                .create_sampler(create_info, None)
+                .expect("failed to create sampler");
+            let id = objects.samplers.insert(handle);
+            SamplerInfo { handle, id }
+        }
+    }
+
+    /// Schedules destruction of the specified sampler.
+    pub fn destroy_sampler(&self, id: SamplerId) {
+        let mut objects = self.objects.lock().unwrap();
+        objects
+            .samplers
+            .destroy_on_frame_completed(self.context_state.last_started_frame.get(), id);
+    }
+
+    /// Creates a descriptor set layout object.
+    pub fn create_descriptor_set_layout(
+        &self,
+        bindings: &[vk::DescriptorSetLayoutBinding],
+    ) -> DescriptorSetLayoutInfo {
+        // --- create layout ---
+        let descriptor_set_layout_create_info = vk::DescriptorSetLayoutCreateInfo {
+            binding_count: bindings.len() as u32,
+            p_bindings: bindings.as_ptr(),
+            ..Default::default()
+        };
+
+        let layout = unsafe {
+            self.device
+                .create_descriptor_set_layout(&descriptor_set_layout_create_info, None)
+                .expect("failed to create descriptor set layout")
+        };
+
+        // also create an allocator for it
+        let allocator = DescriptorSetAllocator::new(bindings);
+
+        let mut objects = self.objects.lock().unwrap();
+        let id = objects.descriptor_set_layouts.insert(layout);
+        objects.descriptor_allocators.insert(id, allocator);
+        DescriptorSetLayoutInfo { handle: layout, id }
+    }
+
+    /// Destroys a descriptor set layout object.
+    pub fn destroy_descriptor_set_layout(&self, id: DescriptorSetLayoutId) {
+        // nothing "in-flight" really needs to keep the descriptor set layout alive, so just destroy it right now.
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        if let Some(layout) = objects.descriptor_set_layouts.remove(id) {
+            // TODO Safety
+            unsafe {
+                self.device.destroy_descriptor_set_layout(layout, None);
+            }
+        } else {
+            tracing::warn!("unknown object id {:?}", id);
+        }
+
+        // also destroy the associated descriptor set allocator if there is one
+        if let Some(allocator) = objects.descriptor_allocators.remove(id) {
+            unsafe {
+                for pool in allocator.full_pools {
+                    self.device.destroy_descriptor_pool(pool, None)
+                }
+                if let Some(pool) = allocator.pool {
+                    self.device.destroy_descriptor_pool(pool, None)
+                }
+                // no need to destroy the individual descriptor sets
+            }
+        }
+    }
+
+    /// Creates a pipeline layout object.
+    pub fn create_pipeline_layout(
+        &self,
+        create_info: &vk::PipelineLayoutCreateInfo,
+    ) -> vk::PipelineLayout {
+        unsafe {
+            self.device
+                .create_pipeline_layout(create_info, None)
+                .expect("failed to create pipeline layout")
+        }
+    }
+
+    pub fn destroy_pipeline_layout(&self, layout: vk::PipelineLayout) {
+        // if not recording a frame, then we can destroy it immediately
+        // otherwise,
+        // destroy when
+    }
+
+    /// Allocates a descriptor set.
+    pub fn allocate_descriptor_set(&self, layout: DescriptorSetLayoutId) -> vk::DescriptorSet {
+        let mut objects = self.objects.lock().unwrap();
+        let layout_handle = *objects.descriptor_set_layouts.get(layout).unwrap();
+        let allocator = objects.descriptor_allocators.get_mut(layout).unwrap();
+
+        let handle = loop {
+            // get or create descriptor pool
+            let descriptor_pool = {
+                if let Some(pool) = allocator.pool {
+                    pool
+                } else {
+                    let pool = unsafe {
+                        let descriptor_pool_create_info = vk::DescriptorPoolCreateInfo {
+                            flags: vk::DescriptorPoolCreateFlags::default(),
+                            max_sets: DESCRIPTOR_POOL_SET_COUNT,
+                            pool_size_count: allocator.pool_size_count,
+                            p_pool_sizes: allocator.pool_sizes.as_ptr(),
+                            ..Default::default()
+                        };
+                        self.device
+                            .create_descriptor_pool(&descriptor_pool_create_info, None)
+                            .unwrap()
+                    };
+                    allocator.pool = Some(pool);
+                    pool
+                }
+            };
+
+            let result = unsafe {
+                let descriptor_set_allocate_info = vk::DescriptorSetAllocateInfo {
+                    descriptor_pool,
+                    descriptor_set_count: 1,
+                    p_set_layouts: &layout_handle,
+                    ..Default::default()
+                };
+                self.device
+                    .allocate_descriptor_sets(&descriptor_set_allocate_info)
+            };
+
+            match result {
+                Ok(d) => break *d.first().unwrap(),
+                Err(vk::Result::ERROR_OUT_OF_POOL_MEMORY) => {
+                    // pool is full, retire the current one and loop
+                    // it will allocate a new one on the next iteration
+                    if let Some(pool) = mem::replace(&mut allocator.pool, None) {
+                        allocator.full_pools.push(pool);
+                    }
+                    continue;
+                }
+                Err(e) => panic!("error allocating descriptor sets: {}", e),
+            }
+        };
+
+        handle
+    }
+
+    /// Frees the specified descriptor set.
+    pub fn free_descriptor_set(&mut self, layout: DescriptorSetLayoutId, ds: vk::DescriptorSet) {
+        let mut objects = self.objects.lock().unwrap();
+        let allocator = objects.descriptor_allocators.get_mut(layout).unwrap();
+        allocator.free.push(ds);
     }
 
     /// Marks the image as ready to be deleted.
@@ -598,8 +1008,8 @@ impl Device {
     pub fn destroy_image(&self, id: ImageId) {
         // resources are really destroyed during `Context::cleanup_resources`, which checks that
         // all passes referencing this resource have finished executing.
-        let mut resources = self.resources.lock().expect("failed to lock resources");
-        resources.resources.get_mut(id.0).unwrap().discarded = true;
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects.resources.get_mut(id.0).unwrap().discarded = true;
     }
 
     /// Marks the buffer as unused and ready to be deleted.
@@ -634,8 +1044,8 @@ impl Device {
     /// context.end_frame();
     /// ```
     pub fn destroy_buffer(&self, id: BufferId) {
-        let mut resources = self.resources.lock().expect("failed to lock resources");
-        resources.resources.get_mut(id.0).unwrap().discarded = true;
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects.resources.get_mut(id.0).unwrap().discarded = true;
     }
 
     /// Creates a resource group.
@@ -646,8 +1056,8 @@ impl Device {
     ) -> ResourceGroupId {
         // resource groups are for read-only resources
         assert!(!is_write_access(dst_access_mask));
-        let mut resources = self.resources.lock().expect("failed to lock resources");
-        resources.resource_groups.insert(ResourceGroup {
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects.resource_groups.insert(ResourceGroup {
             wait_serials: Default::default(),
             src_stage_mask: Default::default(),
             dst_stage_mask,
@@ -658,17 +1068,14 @@ impl Device {
 
     /// Destroys a resource group.
     pub fn destroy_resource_group(&self, group_id: ResourceGroupId) {
-        let mut resources = self.resources.lock().expect("failed to lock resources");
-        resources.resource_groups.remove(group_id);
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects.resource_groups.remove(group_id);
     }
 
     /// Returns information about the current state of a frozen image resource.
     pub fn get_image_state(&self, image_id: ImageId) -> Option<ImageResourceState> {
-        let resources = self.resources.lock().expect("failed to lock resources");
-        let image = resources
-            .resources
-            .get(image_id.0)
-            .expect("invalid resource");
+        let objects = self.objects.lock().expect("failed to lock resources");
+        let image = objects.resources.get(image_id.0).expect("invalid resource");
         if let Some(group_id) = image.group {
             Some(ImageResourceState {
                 group_id,
@@ -681,8 +1088,8 @@ impl Device {
 
     /// Returns information about the current state of a frozen buffer resource.
     pub fn get_buffer_state(&self, buffer_id: BufferId) -> Option<BufferResourceState> {
-        let resources = self.resources.lock().expect("failed to lock resources");
-        let buffer = resources
+        let objects = self.objects.lock().expect("failed to lock resources");
+        let buffer = objects
             .resources
             .get(buffer_id.0)
             .expect("invalid resource");
@@ -920,14 +1327,14 @@ impl Device {
     /// Returns the handle of the corresponding image resource.
     /// Panics if `id` does not refer to an image resource.
     pub fn image_handle(&self, id: ImageId) -> vk::Image {
-        let resources = self.resources.lock().expect("failed to lock resources");
-        resources.resources.get(id.0).unwrap().image().handle
+        let objects = self.objects.lock().expect("failed to lock resources");
+        objects.resources.get(id.0).unwrap().image().handle
     }
 
     /// Returns the handle of the corresponding buffer resource.
     /// Panics if `id` does not refer to a buffer resource.
     pub fn buffer_handle(&self, id: BufferId) -> vk::Buffer {
-        let resources = self.resources.lock().expect("failed to lock resources");
+        let resources = self.objects.lock().expect("failed to lock resources");
         resources.resources.get(id.0).unwrap().buffer().handle
     }
 }

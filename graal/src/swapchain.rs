@@ -1,7 +1,9 @@
-use crate::{Context, ImageInfo, ImageRegistrationInfo, ResourceOwnership, ResourceRegistrationInfo};
+use crate::{
+    context::{SemaphoreWait, SemaphoreWaitKind},
+    Context, Device, ImageInfo, ImageRegistrationInfo, ResourceOwnership, ResourceRegistrationInfo,
+};
 use ash::vk;
 use std::ptr;
-use crate::context::{SemaphoreWait, SemaphoreWaitKind};
 
 /// Chooses a swapchain surface format among a list of supported formats.
 fn get_preferred_swapchain_surface_format(
@@ -73,33 +75,29 @@ pub struct SwapchainImage {
 
 impl Swapchain {
     /// Creates a swapchain object.
-    pub unsafe fn new(
-        context: &Context,
-        surface: vk::SurfaceKHR,
-        size: (u32, u32),
-    ) -> Swapchain {
+    pub unsafe fn new(device: &Device, surface: vk::SurfaceKHR, size: (u32, u32)) -> Swapchain {
         let mut swapchain = Swapchain {
             handle: Default::default(),
             surface,
             images: vec![],
             format: Default::default(),
         };
-        swapchain.resize(context, size);
+        swapchain.resize(device, size);
         swapchain
     }
 
     /// Resizes a swapchain.
-    pub unsafe fn resize(&mut self, context: &Context, size: (u32, u32)) {
-        let phy = context.device.physical_device;
-        let capabilities = context.device
+    pub unsafe fn resize(&mut self, device: &Device, size: (u32, u32)) {
+        let phy = device.physical_device;
+        let capabilities = device
             .vk_khr_surface
             .get_physical_device_surface_capabilities(phy, self.surface)
             .unwrap();
-        let formats = context.device
+        let formats = device
             .vk_khr_surface
             .get_physical_device_surface_formats(phy, self.surface)
             .unwrap();
-        let present_modes = context.device
+        let present_modes = device
             .vk_khr_surface
             .get_physical_device_surface_present_modes(phy, self.surface)
             .unwrap();
@@ -135,18 +133,17 @@ impl Swapchain {
             ..Default::default()
         };
 
-        let new_handle = context.device
+        let new_handle = device
             .vk_khr_swapchain
             .create_swapchain(&create_info, None)
             .expect("failed to create swapchain");
         if self.handle != vk::SwapchainKHR::null() {
             // FIXME what if the images are in use?
-            context.device.vk_khr_swapchain.destroy_swapchain(self.handle, None);
+            device.vk_khr_swapchain.destroy_swapchain(self.handle, None);
         }
 
-
         self.handle = new_handle;
-        self.images = context.device
+        self.images = device
             .vk_khr_swapchain
             .get_swapchain_images(self.handle)
             .unwrap();
@@ -154,12 +151,15 @@ impl Swapchain {
     }
 
     /// Acquires the next image in the swapchain.
+    ///
     /// See `vkAcquireNextImageKHR`.
-    pub unsafe fn acquire_next_image(&self, context: &mut Context) -> SwapchainImage
-    {
-        let image_available = context.create_semaphore();
-
-        let (image_index, _suboptimal) = context.device
+    /// Takes ownership of the semaphore.
+    pub unsafe fn acquire_next_image(
+        &self,
+        device: &Device,
+        image_available: vk::Semaphore,
+    ) -> SwapchainImage {
+        let (image_index, _suboptimal) = device
             .vk_khr_swapchain
             .acquire_next_image(
                 self.handle,
@@ -171,29 +171,24 @@ impl Swapchain {
 
         let handle = self.images[image_index as usize];
         let name = format!("swapchain {:?} image #{}", handle, image_index);
-        let id = context.device.register_image_resource(
-            ImageRegistrationInfo {
-                resource: ResourceRegistrationInfo {
-                    name: &name,
-                    initial_wait: Some(SemaphoreWait {
-                        semaphore: image_available,
-                        owned: true,
-                        dst_stage: Default::default(),
-                        wait_kind: SemaphoreWaitKind::Binary
-                    }),
-                    ownership: ResourceOwnership::External
-                },
-                handle,
-                format: self.format
-            }
-        );
+        let id = device.register_image_resource(ImageRegistrationInfo {
+            resource: ResourceRegistrationInfo {
+                name: &name,
+                initial_wait: Some(SemaphoreWait {
+                    semaphore: image_available,
+                    owned: true,
+                    dst_stage: Default::default(),
+                    wait_kind: SemaphoreWaitKind::Binary,
+                }),
+                ownership: ResourceOwnership::External,
+            },
+            handle,
+            format: self.format,
+        });
 
         SwapchainImage {
             swapchain_handle: self.handle,
-            image_info: ImageInfo {
-                id,
-                handle,
-            },
+            image_info: ImageInfo { id, handle },
             image_index,
         }
     }

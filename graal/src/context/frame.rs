@@ -31,100 +31,15 @@ pub struct AccessTypeInfo {
 }
 
 impl<'a, UserContext> Frame<'a, UserContext> {
-    /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
-    /// before starting.
-    pub fn pass_external_semaphore_wait(
-        &mut self,
-        semaphore: vk::Semaphore,
-        dst_stage: vk::PipelineStageFlags,
-        wait_kind: SemaphoreWaitKind,
-    ) {
-        self.current_pass
-            .as_mut()
-            .expect("not in a pass")
-            .external_semaphore_waits
-            .push(SemaphoreWait {
-                semaphore,
-                owned: false,
-                dst_stage,
-                wait_kind,
-            })
+    /// Returns this frame's number.
+    pub fn frame_number(&self) -> FrameNumber {
+        self.inner.frame_number
     }
+}
 
-    /// Adds a semaphore signal operation: when finished, the pass will signal the specified semaphore.
-    pub fn pass_external_semaphore_signal(
-        &mut self,
-        semaphore: vk::Semaphore,
-        signal_kind: SemaphoreSignalKind,
-    ) {
-        self.current_pass
-            .as_mut()
-            .expect("not in a pass")
-            .external_semaphore_signals
-            .push(SemaphoreSignal {
-                semaphore,
-                signal_kind,
-            })
-    }
-
-    /// Registers an image access made by this pass.
-    pub fn pass_image_dependency(
-        &mut self,
-        id: ImageId,
-        access_mask: vk::AccessFlags,
-        stage_mask: vk::PipelineStageFlags,
-        initial_layout: vk::ImageLayout,
-        final_layout: vk::ImageLayout,
-    ) {
-        self.reference_resource(
-            id.0,
-            &ResourceAccessDetails {
-                initial_layout,
-                final_layout,
-                access_mask,
-                stage_mask,
-            },
-        )
-    }
-
-    pub fn pass_buffer_dependency(
-        &mut self,
-        id: BufferId,
-        access_mask: vk::AccessFlags,
-        stage_mask: vk::PipelineStageFlags,
-    ) {
-        self.reference_resource(
-            id.0,
-            &ResourceAccessDetails {
-                initial_layout: vk::ImageLayout::UNDEFINED,
-                final_layout: vk::ImageLayout::UNDEFINED,
-                access_mask,
-                stage_mask,
-            },
-        )
-    }
-
-    /// Sets the command buffer recording function for this pass.
-    /// The handler will be called when building the command buffer, on batch submission.
-    pub fn pass_set_record_callback(
-        &mut self,
-        record_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::CommandBuffer) + 'a,
-    ) {
-        self.current_pass
-            .as_mut()
-            .expect("not in a pass")
-            .eval_callback = Some(PassEvaluationCallback::CommandBuffer(Box::new(record_cb)));
-    }
-
-    pub fn pass_set_submit_callback(
-        &mut self,
-        submit_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::Queue) + 'a,
-    ) {
-        self.current_pass
-            .as_mut()
-            .expect("not in a pass")
-            .eval_callback = Some(PassEvaluationCallback::Queue(Box::new(submit_cb)));
-    }
+pub struct PassBuilder<'a, 'b, UserContext> {
+    frame: &'a mut Frame<'b, UserContext>,
+    pass: Pass<'b, UserContext>,
 }
 
 enum MemoryBarrierKind<'a> {
@@ -308,79 +223,86 @@ fn add_memory_dependency<'a, UserContext>(
     }
 }
 
-// ---------------------------------------------------------------------------------------
-impl<'a, UserContext> Frame<'a, UserContext> {
-    /// Adds a resource to a resource group.
-    fn add_resource_to_group(&mut self, resource_id: ResourceId, group_id: ResourceGroupId) {
-        let mut resources = self
-            .device
-            .resources
-            .lock()
-            .expect("could not lock resources");
-        let mut resources = &mut *resources;
-        let mut group = resources
-            .resource_groups
-            .get_mut(group_id)
-            .expect("invalid or expired resource group");
-        let mut resource = resources
-            .resources
-            .get_mut(resource_id)
-            .expect("invalid resource");
-        assert!(resource.group.is_none());
-
-        // set group
-        resource.group = Some(group_id);
-        // set additional serials and stages to wait for in this group
-        group
-            .wait_serials
-            .join_assign(QueueSerialNumbers::from_submission_number(
-                resource.tracking.writer,
-            ));
-        group.src_stage_mask |= resource.tracking.stages;
-        group.src_access_mask |= resource.tracking.availability_mask;
+impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
+    /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
+    /// before starting.
+    pub fn add_external_semaphore_wait(
+        &mut self,
+        semaphore: vk::Semaphore,
+        dst_stage: vk::PipelineStageFlags,
+        wait_kind: SemaphoreWaitKind,
+    ) {
+        self.pass.external_semaphore_waits.push(SemaphoreWait {
+            semaphore,
+            owned: false,
+            dst_stage,
+            wait_kind,
+        })
     }
 
-    /// Adds an image to a resource group.
-    pub fn freeze_image(&mut self, image_id: ImageId, group_id: ResourceGroupId) {
-        self.add_resource_to_group(image_id.0, group_id)
+    /// Adds a semaphore signal operation: when finished, the pass will signal the specified semaphore.
+    pub fn add_external_semaphore_signal(
+        &mut self,
+        semaphore: vk::Semaphore,
+        signal_kind: SemaphoreSignalKind,
+    ) {
+        self.pass.external_semaphore_signals.push(SemaphoreSignal {
+            semaphore,
+            signal_kind,
+        })
     }
 
-    /// Adds a buffer to a resource group.
-    pub fn freeze_buffer(&mut self, buffer_id: BufferId, group_id: ResourceGroupId) {
-        self.add_resource_to_group(buffer_id.0, group_id)
-    }
-
-    /// Registers an access to a resource group
-    // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
-    // more than one execution and visibility barrier
-    fn reference_group(&mut self, id: ResourceGroupId) {
-        let dst_pass = self.current_pass.as_mut().expect("not in a pass");
-
-        let mut resources = self
-            .device
-            .resources
-            .lock()
-            .expect("could not lock resources");
-
-        // we just have to wait for the SNNs and stages of the group.
-        let group = resources
-            .resource_groups
-            .get(id)
-            .expect("invalid or expired resource group");
-
-        add_memory_dependency(
-            &mut self.inner,
-            dst_pass,
-            group.wait_serials,
-            PipelineBarrierDesc {
-                src_stage_mask: group.src_stage_mask, // the mask will be big (combined stages of all writes)
-                dst_stage_mask: group.dst_stage_mask,
-                memory_barrier: Some(MemoryBarrierKind::Global {
-                    src_access_mask: group.src_access_mask,
-                    dst_access_mask: group.dst_access_mask,
-                }),
+    /// Registers an image access made by this pass.
+    pub fn add_image_dependency(
+        &mut self,
+        id: ImageId,
+        access_mask: vk::AccessFlags,
+        stage_mask: vk::PipelineStageFlags,
+        initial_layout: vk::ImageLayout,
+        final_layout: vk::ImageLayout,
+    ) {
+        self.reference_resource(
+            id.0,
+            &ResourceAccessDetails {
+                initial_layout,
+                final_layout,
+                access_mask,
+                stage_mask,
             },
-        );
+        )
+    }
+
+    pub fn add_buffer_dependency(
+        &mut self,
+        id: BufferId,
+        access_mask: vk::AccessFlags,
+        stage_mask: vk::PipelineStageFlags,
+    ) {
+        self.reference_resource(
+            id.0,
+            &ResourceAccessDetails {
+                initial_layout: vk::ImageLayout::UNDEFINED,
+                final_layout: vk::ImageLayout::UNDEFINED,
+                access_mask,
+                stage_mask,
+            },
+        )
+    }
+
+    /// Sets the command buffer recording function for this pass.
+    /// The handler will be called when building the command buffer, on batch submission.
+    pub fn set_record_callback(
+        &mut self,
+        record_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::CommandBuffer) + 'b,
+    ) {
+        self.pass.eval_callback = Some(PassEvaluationCallback::CommandBuffer(Box::new(record_cb)));
+    }
+
+    pub fn set_submit_callback(
+        &mut self,
+        submit_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::Queue) + 'b,
+    ) {
+        self.pass.eval_callback = Some(PassEvaluationCallback::Queue(Box::new(submit_cb)));
     }
 
     /// Registers an access to a resource within the specified pass and updates the dependency graph.
@@ -389,15 +311,12 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     /// this function infers the necessary execution barriers, memory barriers, and layout transitions,
     /// and updates the state of the resources.
     fn reference_resource(&mut self, id: ResourceId, access: &ResourceAccessDetails) {
-        let mut dst_pass = self.current_pass.as_mut().expect("not in a pass");
+        let mut objects = self.frame.context.device.objects.lock().unwrap();
+        let resources = &mut objects.resources;
+        let resource = resources.get_mut(id).unwrap();
 
-        let mut resources = self
-            .device
-            .resources
-            .lock()
-            .expect("could not lock resources");
-
-        let resource = resources.resources.get_mut(id).unwrap();
+        let frame = &mut self.frame.inner;
+        let dst_pass = &mut self.pass;
 
         assert!(!resource.discarded, "referenced a discarded resource");
         // we can't synchronize on a resource that belongs to a group: we synchronize on the group instead
@@ -405,8 +324,8 @@ impl<'a, UserContext> Frame<'a, UserContext> {
 
         //------------------------
         // first, add the resource into the set of temporaries used within this frame
-        if self.inner.temporary_set.insert(id) {
-            self.inner.temporaries.push(id);
+        if frame.temporary_set.insert(id) {
+            frame.temporaries.push(id);
         }
 
         // set first use
@@ -488,7 +407,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             };
 
             add_memory_dependency(
-                &mut self.inner,
+                frame,
                 dst_pass,
                 sync_sources,
                 PipelineBarrierDesc {
@@ -511,7 +430,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 },
             );
 
-            if sync_sources.is_single_source_same_queue_and_frame(q, self.inner.base_sn) {
+            if sync_sources.is_single_source_same_queue_and_frame(q, frame.base_sn) {
                 // TODO is this really necessary?
                 // I think it's just there so that we can return early when syncing on the same queue (see `writes_visible`).
                 // However even if we proceed, add_memory_dependency shouldn't emit a redundant barrier anyway.
@@ -555,6 +474,91 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             id,
             access_mask: access.access_mask,
         });
+    }
+
+    /// Ends the current pass.
+    pub fn finish(mut self) {
+        self.frame.inner.passes.push(self.pass);
+
+        if self.frame.inner.collect_sync_debug_info {
+            let mut info = SyncDebugInfo::new();
+
+            // current resource tracking info
+            let objects = self.frame.context.device.objects.lock().unwrap();
+            for (id, r) in objects.resources.iter() {
+                info.tracking.insert(id, r.tracking);
+            }
+            // current sync table
+            info.xq_sync_table = self.frame.inner.xq_sync_table;
+            self.frame.inner.sync_debug_info.push(info);
+        }
+    }
+
+    /// Adds a resource to a resource group.
+    fn add_resource_to_group(
+        &self,
+        resource_id: ResourceId,
+        group_id: ResourceGroupId,
+    ) {
+        let mut objects = self.frame.context.device.objects.lock().unwrap();
+        let objects = &mut *objects;
+        let mut group = objects
+            .resource_groups
+            .get_mut(group_id)
+            .expect("invalid or expired resource group");
+        let mut resource = objects
+            .resources
+            .get_mut(resource_id)
+            .expect("invalid resource");
+        assert!(resource.group.is_none());
+
+        // set group
+        resource.group = Some(group_id);
+        // set additional serials and stages to wait for in this group
+        group
+            .wait_serials
+            .join_assign(QueueSerialNumbers::from_submission_number(
+                resource.tracking.writer,
+            ));
+        group.src_stage_mask |= resource.tracking.stages;
+        group.src_access_mask |= resource.tracking.availability_mask;
+    }
+
+    /// Adds an image to a resource group.
+    pub fn freeze_image(&self, image_id: ImageId, group_id: ResourceGroupId) {
+        self.add_resource_to_group(image_id.0, group_id)
+    }
+
+    /// Adds a buffer to a resource group.
+    pub fn freeze_buffer(&self, buffer_id: BufferId, group_id: ResourceGroupId) {
+        self.add_resource_to_group(buffer_id.0, group_id)
+    }
+
+    /// Registers an access to a resource group
+    // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
+    // more than one execution and visibility barrier
+    fn reference_group(&mut self, id: ResourceGroupId) {
+        let mut objects = self.frame.context.device.objects.lock().unwrap();
+
+        // we just have to wait for the SNNs and stages of the group.
+        let group = objects
+            .resource_groups
+            .get(id)
+            .expect("invalid or expired resource group");
+
+        add_memory_dependency(
+            &mut self.frame.inner,
+            &mut self.pass,
+            group.wait_serials,
+            PipelineBarrierDesc {
+                src_stage_mask: group.src_stage_mask, // the mask will be big (combined stages of all writes)
+                dst_stage_mask: group.dst_stage_mask,
+                memory_barrier: Some(MemoryBarrierKind::Global {
+                    src_access_mask: group.src_access_mask,
+                    dst_access_mask: group.dst_access_mask,
+                }),
+            },
+        );
     }
 }
 
@@ -604,88 +608,70 @@ impl<'a, UserContext> fmt::Debug for Frame<'a, UserContext> {
 }
 
 impl<'a, UserContext> Frame<'a, UserContext> {
-    // Returns this frame's serial
-    //pub fn serial(&self) -> FrameSerialNumber {
-    //    self.frame_serial
-    //}
-
     /// Adds a dependency on a GPU future object.
     ///
     /// Execution of the *whole* frame will wait for the operation represented by the future to complete.
-    pub fn add_frame_dependency(&mut self, future: GpuFuture) {
+    pub fn add_dependency(&mut self, future: GpuFuture) {
         self.inner.wait_init = self.inner.wait_init.join(future.serials);
     }
 
     /// Starts a graphics pass.
-    pub fn start_graphics_pass(&mut self, name: &str) {
-        self.start_pass(name, PassType::Graphics, false);
+    pub fn start_graphics_pass<'frame>(&'frame mut self, name: &str) -> PassBuilder<'frame, 'a, UserContext> {
+        self.start_pass(name, PassType::Graphics, false)
     }
 
     /// Starts a compute pass
-    pub fn start_compute_pass(&mut self, name: &str, async_compute: bool) {
-        self.start_pass(name, PassType::Compute, async_compute);
+    pub fn start_compute_pass<'frame>(
+        &'frame mut self,
+        name: &str,
+        async_compute: bool,
+    ) -> PassBuilder<'frame, 'a, UserContext> {
+        self.start_pass(name, PassType::Compute, async_compute)
     }
 
     /// Starts a transfer pass
-    pub fn start_transfer_pass(&mut self, name: &str, async_transfer: bool) {
-        self.start_pass(name, PassType::Transfer, async_transfer);
+    pub fn start_transfer_pass<'frame>(
+        &'frame mut self,
+        name: &str,
+        async_transfer: bool,
+    ) -> PassBuilder<'frame, 'a, UserContext> {
+        self.start_pass(name, PassType::Transfer, async_transfer)
     }
 
     /// Presents a swapchain image to the associated swapchain.
     pub fn present(&mut self, name: &str, image: &SwapchainImage) {
         let mut pass = self.start_pass(name, PassType::Present, false);
 
-        pass.eval_callback = Some(PassEvaluationCallback::Present {
+        pass.pass.eval_callback = Some(PassEvaluationCallback::Present {
             swapchain: image.swapchain_handle,
             image_index: image.image_index,
         });
-        self.pass_image_dependency(
+        pass.add_image_dependency(
             image.image_info.id,
             vk::AccessFlags::MEMORY_READ,
             vk::PipelineStageFlags::ALL_COMMANDS, // ?
             vk::ImageLayout::PRESENT_SRC_KHR,
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
-        self.end_pass();
+        pass.finish();
     }
 
     /// Common code for `start_xxx_pass`
-    fn start_pass(
-        &mut self,
+    fn start_pass<'frame>(
+        &'frame mut self,
         name: &str,
         ty: PassType,
         async_pass: bool,
-    ) -> &mut Pass<'a, UserContext> {
+    ) -> PassBuilder<'frame, 'a, UserContext> {
         let frame_index = self.inner.passes.len();
-        assert!(
-            self.current_pass.is_none(),
-            "`start_pass` called while already in a pass"
-        );
-
         // not sure why we need to do it in this order
         self.inner.current_sn += 1;
         let serial = self.inner.current_sn;
-        let q = ty.queue_index(&self.device, async_pass);
+        let q = ty.queue_index(&self.context.device, async_pass);
         let snn = SubmissionNumber::new(q, serial);
-        self.current_pass.insert(Pass::new(name, frame_index, snn))
-    }
-
-    /// Ends the current pass.
-    pub fn end_pass(&mut self) {
-        let pass = self.current_pass.take().expect("not in a pass");
-        self.inner.passes.push(pass);
-
-        if self.inner.collect_sync_debug_info {
-            let mut info = SyncDebugInfo::new();
-
-            // current resource tracking info
-            let resources = self.device.resources.lock().unwrap();
-            for (id, r) in resources.resources.iter() {
-                info.tracking.insert(id, r.tracking);
-            }
-            // current sync table
-            info.xq_sync_table = self.inner.xq_sync_table;
-            self.inner.sync_debug_info.push(info);
+        PassBuilder {
+            frame: self,
+            pass: Pass::new(name, frame_index, snn),
         }
     }
 
@@ -694,11 +680,8 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         use serde_json::json;
         use std::fs::File;
 
-        let resources = self
-            .device
-            .resources
-            .lock()
-            .expect("could not lock resources");
+        let objects = self.context.device.objects.lock().unwrap();
+        let resources = &objects.resources;
 
         // passes
         let mut passes_json = Vec::new();
@@ -707,8 +690,8 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 .image_memory_barriers
                 .iter()
                 .map(|imb| {
-                    let id = resources.image_resource_by_handle(imb.image);
-                    let name = &resources.resources.get(id).unwrap().name;
+                    let id = objects.image_resource_by_handle(imb.image);
+                    let name = &resources.get(id).unwrap().name;
                     json!({
                         "type": "image",
                         "srcAccessMask": format!("{:?}", imb.src_access_mask),
@@ -726,8 +709,8 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 .buffer_memory_barriers
                 .iter()
                 .map(|bmb| {
-                    let id = resources.buffer_resource_by_handle(bmb.buffer);
-                    let name = &resources.resources.get(id).unwrap().name;
+                    let id = objects.buffer_resource_by_handle(bmb.buffer);
+                    let name = &resources.get(id).unwrap().name;
                     json!({
                         "type": "buffer",
                         "srcAccessMask": format!("{:?}", bmb.src_access_mask),
@@ -743,7 +726,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 .accesses
                 .iter()
                 .map(|a| {
-                    let r = resources.resources.get(a.id).unwrap();
+                    let r = resources.get(a.id).unwrap();
                     let name = &r.name;
                     let (ty, handle) = match r.kind {
                         ResourceKind::Buffer(ref buf) => ("buffer", buf.handle.as_raw()),
@@ -784,7 +767,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
 
                 let mut resource_tracking_json = Vec::new();
                 for (id, tracking) in sync_debug_info.tracking.iter() {
-                    let name = &resources.resources.get(id).unwrap().name;
+                    let name = &resources.get(id).unwrap().name;
                     resource_tracking_json.push(json!({
                         "id": format!("{:?}", id.data()),
                         "name": name,
@@ -830,11 +813,8 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     }
 
     fn print_frame_info(&self, passes: &[Pass<UserContext>], temporaries: &[ResourceId]) {
-        let resources = self
-            .device
-            .resources
-            .lock()
-            .expect("could not lock resources");
+        let objects = self.context.device.objects.lock().unwrap();
+        let resources = &objects.resources;
 
         println!("=============================================================");
         println!("Passes:");
@@ -861,13 +841,13 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             );
             println!("    input memory barriers:");
             for imb in p.image_memory_barriers.iter() {
-                let id = resources.image_resource_by_handle(imb.image);
+                let id = objects.image_resource_by_handle(imb.image);
                 print!("        image handle={:?} ", imb.image);
                 if !id.is_null() {
                     print!(
                         "(id={:?}, name={})",
                         id,
-                        resources.resources.get(id).unwrap().name
+                        resources.get(id).unwrap().name
                     );
                 } else {
                     print!("(unknown resource)");
@@ -878,13 +858,13 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 );
             }
             for bmb in p.buffer_memory_barriers.iter() {
-                let id = resources.buffer_resource_by_handle(bmb.buffer);
+                let id = objects.buffer_resource_by_handle(bmb.buffer);
                 print!("        buffer handle={:?} ", bmb.buffer);
                 if !id.is_null() {
                     print!(
                         "(id={:?}, name={})",
                         id,
-                        resources.resources.get(id).unwrap().name
+                        resources.get(id).unwrap().name
                     );
                 } else {
                     print!("(unknown resource)");
@@ -904,7 +884,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         println!("Final resource states: ");
 
         for &id in temporaries.iter() {
-            let resource = resources.resources.get(id).unwrap();
+            let resource = resources.get(id).unwrap();
             println!("`{}`", resource.name);
             println!("    stages={:?}", resource.tracking.stages);
             println!("    avail={:?}", resource.tracking.availability_mask);
@@ -959,14 +939,27 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         }
     }
 
-    /// Returns the underlying `graal::Device`.
-    pub fn device(&self) -> &Arc<Device> {
-        &self.device
-    }
+    /// Finishes building the frame and submits all the passes to the command queues.
+    pub fn finish(mut self, user_context: &mut UserContext) -> GpuFuture {
+        //assert!(self.device.context_state.is_building_frame, "not building a frame");
 
-    /// Returns this frame's number.
-    pub fn frame_number(&self) -> FrameNumber {
-        self.inner.frame_number
+        self.dump(None);
+        //self.print_frame_info(&frame.passes, &frame.temporaries);
+
+        // First, wait for the frames submitted before the last one to finish, for pacing.
+        // This also reclaims the resources referenced by the frames that are not in use anymore.
+        self.context.wait_for_frames_in_flight();
+
+        let last_sn = self.inner.current_sn;
+
+        // Submit the frame
+        let serials = self.context.submit_frame(self.inner, user_context);
+
+        // Update last submitted pass SN
+        self.context.last_sn = last_sn;
+        self.context.device.context_state.is_building_frame.set(false);
+
+        GpuFuture { serials }
     }
 }
 
@@ -976,13 +969,7 @@ impl Context {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn start_frame<'a, UserContext>(
-        &mut self,
-        create_info: FrameCreateInfo,
-    ) -> Frame<'a, UserContext> {
-        // only build one frame at a time
-        assert!(!self.is_building_frame, "already building a frame");
-
+    pub fn start_frame<'a, UserContext>(&'a mut self, create_info: FrameCreateInfo) -> Frame<'a, UserContext> {
         let base_sn = self.last_sn;
         let wait_init = create_info.happens_after.serials;
 
@@ -992,10 +979,13 @@ impl Context {
         let build_span = trace_span!("DAG build").entered();
 
         let frame_number = FrameNumber(self.submitted_frame_count + 1);
-        self.is_building_frame = true;
+
+        // update the context state in the device
+        self.device.context_state.is_building_frame.set(true);
+        self.device.context_state.last_started_frame.set(frame_number);
 
         Frame {
-            device: self.device.clone(),
+            context: self,
             inner: FrameInner {
                 base_sn,
                 current_sn: base_sn,
@@ -1010,46 +1000,6 @@ impl Context {
                 span,
                 build_span,
             },
-            current_pass: None,
         }
-    }
-
-    /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn finish_frame<UserContext, FrameCleanup>(
-        &mut self,
-        mut frame: Frame<UserContext>,
-        user_context: &mut UserContext,
-        user_frame_cleanup: FrameCleanup,
-    ) -> GpuFuture
-    where
-        FrameCleanup: FnOnce(&mut UserContext, &Device, FrameNumber),
-    {
-        assert!(frame.current_pass.is_none(), "pass not finished");
-        assert!(self.is_building_frame, "not building a frame");
-
-        frame.dump(None);
-        //self.print_frame_info(&frame.passes, &frame.temporaries);
-
-        // First, wait for the frames submitted before the last one to finish, for pacing.
-        // This also reclaims the resources referenced by the frames that are not in use anymore.
-        self.wait_for_frames_in_flight();
-        // perform user cleanup
-        user_frame_cleanup(
-            user_context,
-            &self.device,
-            FrameNumber(self.completed_frame_count),
-        );
-
-        let last_sn = frame.inner.current_sn;
-        let frame_number = frame.inner.frame_number;
-
-        // Submit the frame
-        let serials = self.submit_frame(frame.inner, user_context);
-
-        // Update last submitted pass SN
-        self.last_sn = last_sn;
-        self.is_building_frame = false;
-
-        GpuFuture { serials }
     }
 }

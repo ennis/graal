@@ -1,5 +1,4 @@
-use crate::{vk, ImageInfo};
-use crate::context::Frame;
+use crate::{context::Frame, vk, ImageInfo};
 
 pub fn blit_images<UserContext>(
     frame: &mut Frame<UserContext>,
@@ -8,22 +7,22 @@ pub fn blit_images<UserContext>(
     size: (u32, u32),
     aspect_mask: vk::ImageAspectFlags,
 ) {
-    frame.start_graphics_pass("blit_images");
-    frame.pass_image_dependency(
+    let mut pass = frame.start_graphics_pass("blit_images");
+    pass.add_image_dependency(
         src_image.id,
         vk::AccessFlags::TRANSFER_READ,
         vk::PipelineStageFlags::TRANSFER,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     );
-    frame.pass_image_dependency(
+    pass.add_image_dependency(
         dst_image.id,
         vk::AccessFlags::TRANSFER_WRITE,
         vk::PipelineStageFlags::TRANSFER,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
-    frame.pass_set_record_callback(move |context, _, command_buffer| {
+    pass.set_record_callback(move |context, _, command_buffer| {
         let regions = &[vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask,
@@ -67,5 +66,5 @@ pub fn blit_images<UserContext>(
             );
         }
     });
-    frame.end_pass();
+    pass.finish();
 }
