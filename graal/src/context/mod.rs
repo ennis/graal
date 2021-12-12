@@ -8,6 +8,7 @@ use crate::{
 use ash::vk;
 use std::{collections::VecDeque, fmt, os::raw::c_void, sync::Arc};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::sync::Mutex;
 pub use submission::RecordingContext;
 use tracing::{trace, trace_span};
@@ -368,7 +369,7 @@ impl GpuFuture {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) struct ResourceAccess {
     pub(crate) id: ResourceId,
     pub(crate) access_mask: vk::AccessFlags,
@@ -434,7 +435,7 @@ pub(crate) struct Pass<'a, UserContext> {
     /// List of accesses made by the pass to resources.
     // FIXME Right now, this is used only for debugging purposes, and when allocating memory for the resources.
     // It probably could be removed.
-    pub(crate) accesses: Vec<ResourceAccess>,
+    pub(crate) accesses: HashSet<ResourceAccess>,
 
     /// Whether the queue timeline semaphores must be signalled after the pass.
     pub(crate) signal_queue_timelines: bool,
@@ -529,7 +530,7 @@ impl<'a, UserContext> Pass<'a, UserContext> {
             snn,
             preds: vec![],
             //succs: vec![],
-            accesses: vec![],
+            accesses: HashSet::new(),
             signal_queue_timelines: false,
             src_stage_mask: Default::default(),
             dst_stage_mask: Default::default(),

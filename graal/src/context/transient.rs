@@ -8,6 +8,7 @@ use crate::{
 use fixedbitset::FixedBitSet;
 use slotmap::SecondaryMap;
 use tracing::trace_span;
+use crate::resource::AccessTracker;
 
 // --- Reachability matrix -------------------------------------------------------------------------
 
@@ -131,6 +132,7 @@ unsafe fn bind_resource_memory(
 
 /// Allocates memory for the resources specified in `temporaries`.
 /// If a resource is not used anymore, it might share its memory with another (aliasing).
+// FIXME: this is broken and wrong, replace with v2; it's not currently used anyway
 pub(crate) fn allocate_memory_for_transients<UserContext>(
     context: &mut Context,
     base_serial: u64,
@@ -191,11 +193,12 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
             // try to find a suitable resource to alias with (the "target")
             let mut aliased = false;
             'alias: for &target_id in temporaries.iter() {
-                let target_resource = resources.resources.get(id).unwrap();
                 if target_id == id {
                     // don't alias with the same resource...
                     continue;
                 }
+
+                let target_resource = resources.resources.get(target_id).unwrap();
 
                 // get the index of the shared allocation for this resource, or skip if not allocated
                 let (target_alloc_entry, target_requirements) =
@@ -224,7 +227,21 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
                 // ----- now for the complicated part, we need to check that the pass that first accesses
                 // the resource does not overlap with the passes that access the target resource
 
-                let src_first_access = target_resource.tracking.first_access.serial();
+                let src_first_access = match target_resource.tracking.first_access {
+                    None => {
+                        // the resource is never accessed? which means that in theory we can alias
+                        // it with anything
+                        tracing::warn!("aliasable resource {:?}({}) is never accessed by the device", target_id, target_resource.name);
+                        0
+                    }
+                    Some(AccessTracker::Device(snn)) => {
+                        snn.serial()
+                    }
+                    Some(AccessTracker::Host) => {
+                        // trying to alias the memory of a host-visible resource: not possible
+                        panic!("tried to alias the memory of a host-visible resource")
+                    }
+                };
 
                 // To re-use the memory of SRC in DST, SRC must be _dead_ before the first use of DST.
                 // A resource is dead from the point of view of a pass if this pass has an execution
@@ -241,7 +258,19 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
                     }
                 }
 
-                let writer = target_resource.tracking.writer.serial();
+                let writer = match target_resource.tracking.writer {
+                    None => {
+                        0
+                    }
+                    Some(AccessTracker::Device(writer)) => {
+                        writer.serial()
+                    }
+                    Some(AccessTracker::Host) => {
+                        // don't alias with a host-visible resource
+                        // FIXME should we even be able to reach this line?
+                        continue 'alias;
+                    }
+                };
                 if writer != 0
                     && (writer >= src_first_access
                         || !reachability.is_reachable(

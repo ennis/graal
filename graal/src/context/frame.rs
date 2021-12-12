@@ -6,7 +6,7 @@ use crate::{
         ResourceAccessDetails, ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind,
         SemaphoreWait, SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
     },
-    resource::{BufferResource, ImageResource, ResourceAllocation},
+    resource::{AccessTracker, BufferResource, ImageResource, ResourceAllocation},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
     swapchain::SwapchainImage,
     vk,
@@ -323,14 +323,19 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
         assert!(resource.group.is_none(), "cannot synchronize on a resource belonging to a group; synchronize on the group instead");
 
         //------------------------
+        // handle the special case of upload buffers: when the last access is a write in the host domain,
+        // and only reading from the resource.
+        // In this case, we don't need to add an execution dependency, as the spec guarantees that host writes are made visible.
+
+        //------------------------
         // first, add the resource into the set of temporaries used within this frame
         if frame.temporary_set.insert(id) {
             frame.temporaries.push(id);
         }
 
-        // set first use
-        if !resource.tracking.first_access.is_valid() {
-            resource.tracking.first_access = dst_pass.snn;
+        // set first access
+        if resource.tracking.first_access.is_none() {
+            resource.tracking.first_access = Some(AccessTracker::Device(dst_pass.snn));
         }
 
         // First, some definitions:
@@ -371,17 +376,30 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
         let is_write = is_write_access(access.access_mask) || need_layout_transition;
 
         // can we ensure that all previous writes are visible?
-        // note: the visibility mask is only valid if this access and the last write is in the same queue
-        // for cross-queue accesses, we never skip
-        let writes_visible = resource.tracking.writer.queue() == dst_pass.snn.queue()
-            && (resource
-                .tracking
-                .visibility_mask
-                .contains(access.access_mask)
-                || resource
-                    .tracking
-                    .visibility_mask
-                    .contains(vk::AccessFlags::MEMORY_READ));
+        let writes_visible = match resource.tracking.writer {
+            None => {
+                // no writes, no data to see, no barrier necessary.
+                true
+            }
+            Some(AccessTracker::Host) => {
+                // no need for a barrier if host write
+                // https://www.khronos.org/registry/vulkan/specs/1.2-extensions/html/vkspec.html#synchronization-submission-host-writes
+                true
+            }
+            Some(AccessTracker::Device(writer)) => {
+                // the visibility mask is only valid if this access and the last write is in the same queue
+                // for cross-queue accesses, we never skip
+                writer.queue() == dst_pass.snn.queue()
+                    && (resource
+                        .tracking
+                        .visibility_mask
+                        .contains(access.access_mask)
+                        || resource
+                            .tracking
+                            .visibility_mask
+                            .contains(vk::AccessFlags::MEMORY_READ))
+            }
+        };
 
         // --- (1) skip to the end if no barrier is needed
         // No barrier is needed if we waited on an external semaphore, or all writes are visible and no layout transition is necessary
@@ -403,7 +421,21 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
                 resource.tracking.readers
             } else {
                 // Write-after-write, read-after-write
-                QueueSerialNumbers::from_submission_number(resource.tracking.writer)
+                match resource.tracking.writer {
+                    None => {
+                        // no sources
+                        QueueSerialNumbers::default()
+                    }
+                    Some(AccessTracker::Device(writer)) => {
+                        QueueSerialNumbers::from_submission_number(writer)
+                    }
+                    Some(AccessTracker::Host) => {
+                        // Shouldn't happen: WAW or RAW with the write being host access.
+                        // FIXME: actually, it's possible when a host-mapped image, with linear storage
+                        // and in the GENERAL layout is requested access with a different layout.
+                        panic!("unsupported dependency")
+                    }
+                }
             };
 
             add_memory_dependency(
@@ -463,14 +495,15 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
         if is_write {
             resource.tracking.stages = access.stage_mask;
             resource.tracking.clear_readers();
-            resource.tracking.writer = dst_pass.snn;
+            resource.tracking.writer = Some(AccessTracker::Device(dst_pass.snn));
         } else {
             // update the resource readers
             resource.tracking.readers = resource.tracking.readers.join_serial(dst_pass.snn);
         }
 
         // record the access in the pass
-        dst_pass.accesses.push(ResourceAccess {
+        //
+        dst_pass.accesses.insert(ResourceAccess {
             id,
             access_mask: access.access_mask,
         });
@@ -495,11 +528,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
     }
 
     /// Adds a resource to a resource group.
-    fn add_resource_to_group(
-        &self,
-        resource_id: ResourceId,
-        group_id: ResourceGroupId,
-    ) {
+    fn add_resource_to_group(&self, resource_id: ResourceId, group_id: ResourceGroupId) {
         let mut objects = self.frame.context.device.objects.lock().unwrap();
         let objects = &mut *objects;
         let mut group = objects
@@ -515,11 +544,19 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
         // set group
         resource.group = Some(group_id);
         // set additional serials and stages to wait for in this group
-        group
-            .wait_serials
-            .join_assign(QueueSerialNumbers::from_submission_number(
-                resource.tracking.writer,
-            ));
+        match resource.tracking.writer {
+            Some(AccessTracker::Device(writer)) => group
+                .wait_serials
+                .join_assign(QueueSerialNumbers::from_submission_number(writer)),
+            Some(AccessTracker::Host) => {
+                panic!("host-accessible resources cannot be added to a group")
+            }
+            None => {
+                // FIXME this might not warrant a panic: the resource will simply be
+                // frozen in an uninitialized state.
+                panic!("tried to add an unwritten resource to a group")
+            }
+        }
         group.src_stage_mask |= resource.tracking.stages;
         group.src_access_mask |= resource.tracking.availability_mask;
     }
@@ -616,7 +653,10 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     }
 
     /// Starts a graphics pass.
-    pub fn start_graphics_pass<'frame>(&'frame mut self, name: &str) -> PassBuilder<'frame, 'a, UserContext> {
+    pub fn start_graphics_pass<'frame>(
+        &'frame mut self,
+        name: &str,
+    ) -> PassBuilder<'frame, 'a, UserContext> {
         self.start_pass(name, PassType::Graphics, false)
     }
 
@@ -768,12 +808,26 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 let mut resource_tracking_json = Vec::new();
                 for (id, tracking) in sync_debug_info.tracking.iter() {
                     let name = &resources.get(id).unwrap().name;
+
+                    let (host_write, writer_queue, writer_serial) = match tracking.writer {
+                        None => {
+                            (false, 0, 0)
+                        }
+                        Some(AccessTracker::Device(snn)) => {
+                            (false, snn.queue(), snn.serial())
+                        }
+                        Some(AccessTracker::Host) => {
+                            (true, 0, 0)
+                        }
+                    };
+
                     resource_tracking_json.push(json!({
                         "id": format!("{:?}", id.data()),
                         "name": name,
                         "readers": tracking.readers.0,
-                        "writerQueue": tracking.writer.queue(),
-                        "writerSerial": tracking.writer.serial(),
+                        "hostWrite": host_write,
+                        "writerQueue": writer_queue,
+                        "writerSerial": writer_serial,
                         "layout": format!("{:?}", tracking.layout),
                         "availabilityMask": format!("{:?}", tracking.availability_mask),
                         "visibilityMask": format!("{:?}", tracking.visibility_mask),
@@ -844,11 +898,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 let id = objects.image_resource_by_handle(imb.image);
                 print!("        image handle={:?} ", imb.image);
                 if !id.is_null() {
-                    print!(
-                        "(id={:?}, name={})",
-                        id,
-                        resources.get(id).unwrap().name
-                    );
+                    print!("(id={:?}, name={})", id, resources.get(id).unwrap().name);
                 } else {
                     print!("(unknown resource)");
                 }
@@ -861,11 +911,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 let id = objects.buffer_resource_by_handle(bmb.buffer);
                 print!("        buffer handle={:?} ", bmb.buffer);
                 if !id.is_null() {
-                    print!(
-                        "(id={:?}, name={})",
-                        id,
-                        resources.get(id).unwrap().name
-                    );
+                    print!("(id={:?}, name={})", id, resources.get(id).unwrap().name);
                 } else {
                     print!("(unknown resource)");
                 }
@@ -957,7 +1003,11 @@ impl<'a, UserContext> Frame<'a, UserContext> {
 
         // Update last submitted pass SN
         self.context.last_sn = last_sn;
-        self.context.device.context_state.is_building_frame.set(false);
+        self.context
+            .device
+            .context_state
+            .is_building_frame
+            .set(false);
 
         GpuFuture { serials }
     }
@@ -969,7 +1019,10 @@ impl Context {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn start_frame<'a, UserContext>(&'a mut self, create_info: FrameCreateInfo) -> Frame<'a, UserContext> {
+    pub fn start_frame<'a, UserContext>(
+        &'a mut self,
+        create_info: FrameCreateInfo,
+    ) -> Frame<'a, UserContext> {
         let base_sn = self.last_sn;
         let wait_init = create_info.happens_after.serials;
 
@@ -982,7 +1035,10 @@ impl Context {
 
         // update the context state in the device
         self.device.context_state.is_building_frame.set(true);
-        self.device.context_state.last_started_frame.set(frame_number);
+        self.device
+            .context_state
+            .last_started_frame
+            .set(frame_number);
 
         Frame {
             context: self,

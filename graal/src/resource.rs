@@ -141,11 +141,22 @@ pub(crate) enum ResourceKind {
 }
 
 #[derive(Copy, Clone, Debug)]
+pub(crate) enum AccessTracker {
+    Host,
+    Device(SubmissionNumber),
+}
+
+#[derive(Copy, Clone, Debug)]
 pub(crate) struct ResourceTrackingInfo {
-    pub(crate) first_access: SubmissionNumber,
+    /// SNN of the first pass accessing the resource.
+    pub(crate) first_access: Option<AccessTracker>,
+    /// Unused?
     pub(crate) owner_queue_family: u32,
+    /// Current readers of the resource.
     pub(crate) readers: QueueSerialNumbers,
-    pub(crate) writer: SubmissionNumber,
+    /// Current writer of the resource.
+    pub(crate) writer: Option<AccessTracker>,
+    /// Current image layout if the resource is an image. Ignored otherwise.
     pub(crate) layout: vk::ImageLayout,
     /// Access types for the last write to this resource that have yet to be made available.
     /// This is only relevant for the writer queue, as accesses from concurrent queues are synchronized
@@ -162,14 +173,13 @@ pub(crate) struct ResourceTrackingInfo {
 }
 
 impl ResourceTrackingInfo {
+    // TODO remove this?
     pub(crate) fn has_writer(&self) -> bool {
-        self.writer.is_valid()
+        self.writer.is_some()
     }
-
     pub(crate) fn has_readers(&self) -> bool {
         self.readers.iter().any(|&x| x != 0)
     }
-
     pub(crate) fn clear_readers(&mut self) {
         self.readers = Default::default();
     }
@@ -181,7 +191,7 @@ impl Default for ResourceTrackingInfo {
             first_access: Default::default(),
             owner_queue_family: vk::QUEUE_FAMILY_IGNORED,
             readers: Default::default(),
-            writer: Default::default(),
+            writer: None,
             layout: Default::default(),
             availability_mask: Default::default(),
             visibility_mask: Default::default(),
@@ -498,16 +508,13 @@ impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
 ///     - image views
 /// 2. defer destruction until the current frame has been submitted (and all command buffers have been recorded). Needed for:
 ///     - pipeline layouts
-
 pub(crate) struct DeviceObjects {
     pub(crate) resources: ResourceMap,
     pub(crate) resource_groups: slotmap::SlotMap<ResourceGroupId, ResourceGroup>,
-    descriptor_set_layouts:
-        slotmap::SlotMap<DescriptorSetLayoutId, vk::DescriptorSetLayout>,
+    descriptor_set_layouts: slotmap::SlotMap<DescriptorSetLayoutId, vk::DescriptorSetLayout>,
     samplers: ObjectTracker<SamplerId, vk::Sampler>,
     pipelines: ObjectTracker<PipelineId, vk::Pipeline>,
-    descriptor_allocators:
-        slotmap::SecondaryMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
+    descriptor_allocators: slotmap::SecondaryMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
     /// Pipeline layouts pending deletion after the current frame is submitted.
     dead_pipeline_layouts: Vec<vk::PipelineLayout>,
 }
@@ -724,7 +731,17 @@ impl DeviceObjects {
             // refcount != 0 OR any reader not completed OR writer not completed
             let keep = !r.discarded
                 || r.tracking.readers > completed_serials
-                || r.tracking.writer.serial() > completed_serials.serial(r.tracking.writer.queue());
+                || match r.tracking.writer {
+                    None => false,
+                    Some(AccessTracker::Device(writer)) => {
+                        writer.serial() > completed_serials.serial(writer.queue())
+                    }
+                    Some(AccessTracker::Host) => {
+                        // nothing to wait for
+                        false
+                    }
+                };
+
             if !keep {
                 trace!(?id, name = r.name.as_str(), tracking=?r.tracking, "destroy_resource");
                 unsafe {
@@ -965,8 +982,14 @@ impl Device {
         handle
     }
 
-    /// Frees the specified descriptor set.
-    pub fn free_descriptor_set(&mut self, layout: DescriptorSetLayoutId, ds: vk::DescriptorSet) {
+    /// Frees the specified descriptor set immediately.
+    ///
+    /// This assumes that the descriptor set is not in use anymore.
+    pub unsafe fn free_descriptor_set(
+        &mut self,
+        layout: DescriptorSetLayoutId,
+        ds: vk::DescriptorSet,
+    ) {
         let mut objects = self.objects.lock().unwrap();
         let allocator = objects.descriptor_allocators.get_mut(layout).unwrap();
         allocator.free.push(ds);
