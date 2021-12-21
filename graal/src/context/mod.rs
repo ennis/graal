@@ -1,18 +1,20 @@
 use crate::{
     context::submission::CommandAllocator,
     device::Device,
-    resource::{ResourceKind, ResourceTrackingInfo},
+    resource::{DeviceObjects, ResourceKind, ResourceTrackingInfo},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
     BufferId, ImageId, ResourceId, MAX_QUEUES,
 };
 use ash::vk;
-use std::{collections::VecDeque, fmt, os::raw::c_void, sync::Arc};
-use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
-use std::sync::Mutex;
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashSet, VecDeque},
+    fmt,
+    os::raw::c_void,
+    sync::{Arc, Mutex},
+};
 pub use submission::RecordingContext;
 use tracing::{trace, trace_span};
-use crate::resource::DeviceObjects;
 
 pub(crate) mod frame;
 pub(crate) mod submission;
@@ -684,7 +686,6 @@ pub struct Context {
     pub(crate) completed_frame_count: u64,
 }
 
-
 impl fmt::Debug for Context {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         // TODO good luck with that
@@ -693,7 +694,6 @@ impl fmt::Debug for Context {
 }
 
 impl Context {
-
     /// Creates a new context with the given device.
     pub fn with_device(device: Device) -> Context {
         let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
@@ -808,7 +808,13 @@ impl Context {
         }
 
         // given the new completed serials, free resources that have expired
-        self.device.cleanup_resources(self.completed_serials);
+        unsafe {
+            // SAFETY: we just waited for the passes to finish
+            self.device.cleanup_resources(
+                self.completed_serials,
+                FrameNumber(self.completed_frame_count),
+            )
+        }
     }
 
     fn dump_state(&self) {

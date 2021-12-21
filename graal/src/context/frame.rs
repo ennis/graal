@@ -549,6 +549,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
                 .wait_serials
                 .join_assign(QueueSerialNumbers::from_submission_number(writer)),
             Some(AccessTracker::Host) => {
+                // FIXME why? it would make sense to add all upload buffers in a frame to a single group
                 panic!("host-accessible resources cannot be added to a group")
             }
             None => {

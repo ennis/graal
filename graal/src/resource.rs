@@ -380,6 +380,8 @@ pub struct BufferRegistrationInfo<'a> {
 }
 
 pub(crate) struct ResourceGroup {
+    /// The serials that a pass needs to wait for to ensure an execution dependency between the pass
+    /// and all writers of the resources in the group.
     pub(crate) wait_serials: QueueSerialNumbers,
     // ignored if waiting on multiple queues
     pub(crate) src_stage_mask: vk::PipelineStageFlags,
@@ -439,9 +441,40 @@ slotmap::new_key_type! {
     pub struct ComputePipelineId;
 }
 
+/// A tracked object and the last frame that referenced it.
 struct Tracked<T> {
     frame: FrameNumber,
     obj: T,
+}
+
+struct ZombieList<T> {
+    pending_deletion: Vec<Tracked<T>>,
+}
+
+impl<T> ZombieList<T> {
+    /// Schedules the object for cleanup once the specified frame has completed.
+    fn delete_later(&mut self, obj: T, frame: FrameNumber) {
+        self.pending_deletion.push(Tracked { frame, obj })
+    }
+
+    fn cleanup(&mut self, completed_frame: FrameNumber, mut f: impl FnMut(T)) {
+        let mut i = 0;
+        while i < self.pending_deletion.len() {
+            if self.pending_deletion[i].frame <= completed_frame {
+                f(self.pending_deletion.swap_remove(i).obj)
+            } else {
+                i += 1;
+            }
+        }
+    }
+}
+
+impl<T> Default for ZombieList<T> {
+    fn default() -> Self {
+        ZombieList {
+            pending_deletion: vec![],
+        }
+    }
 }
 
 /// Vulkan object tracker.
@@ -460,6 +493,7 @@ impl<Id: slotmap::Key, Obj> Default for ObjectTracker<Id, Obj> {
 }
 
 impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
+    /// Inserts a new object in the tracker and returns its ID.
     fn insert(&mut self, obj: Obj) -> Id {
         self.objects.insert(Tracked {
             obj,
@@ -467,6 +501,7 @@ impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
         })
     }
 
+    /// Adds the specified object to the list of objects to be deleted.
     fn destroy(&mut self, id: Id) {
         if let Some(id) = self.objects.remove(id) {
             self.pending_deletion.push(id)
@@ -476,6 +511,7 @@ impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
         }
     }
 
+    /// Adds the specified object to the list of objects to be deleted.
     fn destroy_on_frame_completed(&mut self, frame: FrameNumber, id: Id) {
         if let Some(t) = self.objects.remove(id) {
             self.pending_deletion.push(Tracked { frame, obj: t.obj })
@@ -512,11 +548,13 @@ pub(crate) struct DeviceObjects {
     pub(crate) resources: ResourceMap,
     pub(crate) resource_groups: slotmap::SlotMap<ResourceGroupId, ResourceGroup>,
     descriptor_set_layouts: slotmap::SlotMap<DescriptorSetLayoutId, vk::DescriptorSetLayout>,
-    samplers: ObjectTracker<SamplerId, vk::Sampler>,
-    pipelines: ObjectTracker<PipelineId, vk::Pipeline>,
     descriptor_allocators: slotmap::SecondaryMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
-    /// Pipeline layouts pending deletion after the current frame is submitted.
-    dead_pipeline_layouts: Vec<vk::PipelineLayout>,
+
+    discarded_pipeline_layouts: ZombieList<vk::PipelineLayout>,
+    discarded_samplers: ZombieList<vk::Sampler>,
+    discarded_descriptor_sets: ZombieList<(DescriptorSetLayoutId, vk::DescriptorSet)>,
+    discarded_pipelines: ZombieList<vk::Pipeline>,
+    discarded_image_views: ZombieList<vk::ImageView>,
 }
 
 /// Information about a newly created sampler object.
@@ -685,10 +723,11 @@ impl DeviceObjects {
             resources: SlotMap::with_key(),
             resource_groups: SlotMap::with_key(),
             descriptor_set_layouts: Default::default(),
-            samplers: Default::default(),
-            pipelines: Default::default(),
             descriptor_allocators: slotmap::SecondaryMap::default(),
-            dead_pipeline_layouts: vec![],
+            discarded_pipeline_layouts: Default::default(),
+            discarded_samplers: Default::default(),
+            discarded_descriptor_sets: Default::default(),
+            discarded_pipelines: Default::default(),
         }
     }
 
@@ -719,10 +758,11 @@ impl DeviceObjects {
 
     /// Frees or recycles resources used by frames that have completed and that have no user
     /// references.
-    pub(crate) fn cleanup_resources(
+    pub(crate) unsafe fn cleanup_resources(
         &mut self,
         device: &Device,
         completed_serials: QueueSerialNumbers,
+        completed_frame: FrameNumber,
     ) {
         let _ = trace_span!("cleanup_resources");
         // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
@@ -750,7 +790,29 @@ impl DeviceObjects {
                 }
             }
             keep
-        })
+        });
+
+        let descriptor_allocators = &mut self.descriptor_allocators;
+        self.discarded_descriptor_sets
+            .cleanup(completed_frame, |(layout, set)| {
+                descriptor_allocators
+                    .get_mut(layout)
+                    .unwrap()
+                    .free
+                    .push(set)
+            });
+        self.discarded_samplers
+            .cleanup(completed_frame, |sampler| unsafe {
+                device.device.destroy_sampler(sampler, None);
+            });
+        self.discarded_pipeline_layouts
+            .cleanup(completed_frame, |pipeline_layout| unsafe {
+                device.device.destroy_pipeline_layout(pipeline_layout, None);
+            });
+        self.discarded_pipelines
+            .cleanup(completed_frame, |pipeline| unsafe {
+                device.device.destroy_pipeline(pipeline, None);
+            });
     }
 
     /// Finds the ID of the resource that corresponds to the specified image handle.
@@ -794,9 +856,13 @@ impl DeviceObjects {
 
 impl Device {
     /// TODO docs
-    pub(crate) fn cleanup_resources(&self, completed_serials: QueueSerialNumbers) {
+    pub(crate) unsafe fn cleanup_resources(
+        &self,
+        completed_serials: QueueSerialNumbers,
+        completed_frame: FrameNumber,
+    ) {
         let mut objects = self.objects.lock().expect("failed to lock resources");
-        objects.cleanup_resources(&self, completed_serials)
+        objects.cleanup_resources(&self, completed_serials, completed_frame)
     }
 
     /// Common helper function to register a buffer or image resource.
@@ -833,24 +899,21 @@ impl Device {
     }
 
     /// Creates a sampler object.
-    pub fn create_sampler(&self, create_info: &vk::SamplerCreateInfo) -> SamplerInfo {
-        let mut objects = self.objects.lock().expect("failed to lock resources");
+    pub fn create_sampler(&self, create_info: &vk::SamplerCreateInfo) -> vk::Sampler {
         unsafe {
-            let handle = self
-                .device
+            // SAFETY: what are the requirements?
+            self.device
                 .create_sampler(create_info, None)
-                .expect("failed to create sampler");
-            let id = objects.samplers.insert(handle);
-            SamplerInfo { handle, id }
+                .expect("failed to create sampler")
         }
     }
 
     /// Schedules destruction of the specified sampler.
-    pub fn destroy_sampler(&self, id: SamplerId) {
+    pub fn destroy_sampler(&self, sampler: vk::Sampler) {
         let mut objects = self.objects.lock().unwrap();
         objects
-            .samplers
-            .destroy_on_frame_completed(self.context_state.last_started_frame.get(), id);
+            .discarded_samplers
+            .delete_later(sampler, self.context_state.last_started_frame.get());
     }
 
     /// Creates a descriptor set layout object.
@@ -920,9 +983,10 @@ impl Device {
     }
 
     pub fn destroy_pipeline_layout(&self, layout: vk::PipelineLayout) {
-        // if not recording a frame, then we can destroy it immediately
-        // otherwise,
-        // destroy when
+        let mut objects = self.objects.lock().expect("failed to lock resources");
+        objects
+            .discarded_pipeline_layouts
+            .delete_later(layout, self.context_state.last_started_frame.get());
     }
 
     /// Allocates a descriptor set.
@@ -982,17 +1046,39 @@ impl Device {
         handle
     }
 
+    /// Schedules the deletion of a descriptor set.
+    pub unsafe fn destroy_descriptor_set(
+        &self,
+        layout: DescriptorSetLayoutId,
+        ds: vk::DescriptorSet,
+    ) {
+        let mut objects = self.objects.lock().unwrap();
+        // Since we don't track the uses of descriptor sets in individual frame, the best thing we
+        // can do here is assume that it was used in the last frame. So schedule deletion for the
+        // end of the current frame.
+        objects
+            .discarded_descriptor_sets
+            .delete_later((layout, ds), self.context_state.last_started_frame.get());
+    }
+
     /// Frees the specified descriptor set immediately.
     ///
     /// This assumes that the descriptor set is not in use anymore.
     pub unsafe fn free_descriptor_set(
-        &mut self,
+        &self,
         layout: DescriptorSetLayoutId,
         ds: vk::DescriptorSet,
     ) {
         let mut objects = self.objects.lock().unwrap();
         let allocator = objects.descriptor_allocators.get_mut(layout).unwrap();
         allocator.free.push(ds);
+    }
+
+    pub unsafe fn destroy_image_view(&self, image_view: vk::ImageView) {
+        let mut objects = self.objects.lock().unwrap();
+        objects
+            .discarded_image_views
+            .delete_later(image_view, self.context_state.last_started_frame.get());
     }
 
     /// Marks the image as ready to be deleted.
