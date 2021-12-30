@@ -158,8 +158,9 @@ fn add_memory_dependency<'a, UserContext>(
             // The impact of this approximation is currently unknown.
 
             // find a pipeline barrier that already takes care of our execution dependency
-            let barrier_pass = frame.passes[local_src_index + 1..]
+            let barrier_pass = frame.passes[local_src_index..]
                 .iter_mut()
+                .skip(1)
                 .find_map(|p| {
                     if p.snn.queue() == q
                         && p.src_stage_mask.contains(barrier.src_stage_mask)

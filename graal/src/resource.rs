@@ -728,6 +728,7 @@ impl DeviceObjects {
             discarded_samplers: Default::default(),
             discarded_descriptor_sets: Default::default(),
             discarded_pipelines: Default::default(),
+            discarded_image_views: Default::default()
         }
     }
 
