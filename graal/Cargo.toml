@@ -9,7 +9,7 @@ ash = "0.33.3"
 bitflags = "1.2.1"
 gpu-allocator = "0.10.0"
 lazy_static = "1.4.0"
-raw-window-handle = "0.3.3"
+raw-window-handle = "0.4"
 slotmap = "1.0.2"
 fixedbitset = "0.3.2"
 graal-spirv = { path = "../graal-spirv" }

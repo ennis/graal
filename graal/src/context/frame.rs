@@ -19,6 +19,7 @@ use std::{
     fmt,
     fmt::Formatter,
     mem,
+    mem::ManuallyDrop,
     sync::Arc,
 };
 use tracing::trace_span;
@@ -39,7 +40,13 @@ impl<'a, UserContext> Frame<'a, UserContext> {
 
 pub struct PassBuilder<'a, 'b, UserContext> {
     frame: &'a mut Frame<'b, UserContext>,
-    pass: Pass<'b, UserContext>,
+    pass: ManuallyDrop<Pass<'b, UserContext>>,
+}
+
+impl<'a, 'b, UserContext> Drop for PassBuilder<'a, 'b, UserContext> {
+    fn drop(&mut self) {
+        panic!("PassBuilder object dropped. Use `PassBuilder::finished` instead")
+    }
 }
 
 enum MemoryBarrierKind<'a> {
@@ -512,7 +519,11 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
 
     /// Ends the current pass.
     pub fn finish(mut self) {
-        self.frame.inner.passes.push(self.pass);
+        let pass = unsafe {
+            // SAFETY: self.pass not used afterwards, including Drop
+            ManuallyDrop::take(&mut self.pass)
+        };
+        self.frame.inner.passes.push(pass);
 
         if self.frame.inner.collect_sync_debug_info {
             let mut info = SyncDebugInfo::new();
@@ -526,6 +537,9 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
             info.xq_sync_table = self.frame.inner.xq_sync_table;
             self.frame.inner.sync_debug_info.push(info);
         }
+
+        // skip running the panicking destructor
+        mem::forget(self)
     }
 
     /// Adds a resource to a resource group.
@@ -713,7 +727,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         let snn = SubmissionNumber::new(q, serial);
         PassBuilder {
             frame: self,
-            pass: Pass::new(name, frame_index, snn),
+            pass: ManuallyDrop::new(Pass::new(name, frame_index, snn)),
         }
     }
 
@@ -812,15 +826,9 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                     let name = &resources.get(id).unwrap().name;
 
                     let (host_write, writer_queue, writer_serial) = match tracking.writer {
-                        None => {
-                            (false, 0, 0)
-                        }
-                        Some(AccessTracker::Device(snn)) => {
-                            (false, snn.queue(), snn.serial())
-                        }
-                        Some(AccessTracker::Host) => {
-                            (true, 0, 0)
-                        }
+                        None => (false, 0, 0),
+                        Some(AccessTracker::Device(snn)) => (false, snn.queue(), snn.serial()),
+                        Some(AccessTracker::Host) => (true, 0, 0),
                     };
 
                     resource_tracking_json.push(json!({

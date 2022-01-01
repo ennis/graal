@@ -13,7 +13,7 @@ mod platform {
 
     pub fn get_vulkan_surface(handle: RawWindowHandle) -> vk::SurfaceKHR {
         let win32_handle = match handle {
-            RawWindowHandle::Windows(h) => h,
+            RawWindowHandle::Win32(h) => h,
             _ => panic!("incompatible window handle"),
         };
 
