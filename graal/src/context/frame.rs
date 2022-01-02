@@ -999,7 +999,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     pub fn finish(mut self, user_context: &mut UserContext) -> GpuFuture {
         //assert!(self.device.context_state.is_building_frame, "not building a frame");
 
-        self.dump(None);
+        //self.dump(None);
         //self.print_frame_info(&frame.passes, &frame.temporaries);
 
         // First, wait for the frames submitted before the last one to finish, for pacing.
