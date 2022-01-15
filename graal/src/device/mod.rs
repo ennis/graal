@@ -250,9 +250,22 @@ impl Device {
         })
     }
 
+    /// Returns whether this device is compatible for presentation on the specified surface.
+    ///
+    /// More precisely, it checks that the graphics queue created for this device can present to the given surface.
+    pub unsafe fn is_compatible_for_presentation(&self, surface: vk::SurfaceKHR) -> bool {
+        self.vk_khr_surface
+            .get_physical_device_surface_support(
+                self.physical_device,
+                self.graphics_queue().1,
+                surface,
+            )
+            .unwrap()
+    }
+
     /// Creates a new `Device` that can render to the specified `present_surface` if one is specified.
     pub unsafe fn new(present_surface: Option<vk::SurfaceKHR>) -> Device {
-        let instance = &*VULKAN_INSTANCE;
+        let instance: &ash::Instance = &*VULKAN_INSTANCE;
         let vk_khr_surface = ash::extensions::khr::Surface::new(&*VULKAN_ENTRY, instance);
 
         let phy = select_physical_device(instance);
@@ -363,7 +376,7 @@ impl Device {
             ..Default::default()
         };
 
-        let device = instance
+        let device: ash::Device = instance
             .create_device(phy.phy, &device_create_info, None)
             .expect("could not create vulkan device");
         let graphics_queue = device.get_device_queue(graphics_queue_family, 0);

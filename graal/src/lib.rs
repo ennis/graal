@@ -36,4 +36,3 @@ pub mod serial;
 pub mod surface;
 pub mod swapchain;
 pub mod utils;
-pub mod descriptor;

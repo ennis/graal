@@ -1,7 +1,7 @@
 //! Contains code related to the construction of frames and passes.
 use crate::{
     context::{
-        is_write_access, local_pass_index, BufferId, Frame, FrameInFlight, FrameInner, GpuFuture,
+        is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture,
         ImageId, Pass, PassEvaluationCallback, RecordingContext, ResourceAccess,
         ResourceAccessDetails, ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind,
         SemaphoreWait, SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
@@ -11,16 +11,13 @@ use crate::{
     swapchain::SwapchainImage,
     vk,
     vk::Handle,
-    Context, Device, ResourceGroupId, ResourceOwnership, MAX_QUEUES,
+    Context, Device, ResourceGroupId, ResourceOwnership,
 };
 use slotmap::Key;
 use std::{
-    cell::{RefCell, RefMut},
     fmt,
-    fmt::Formatter,
     mem,
     mem::ManuallyDrop,
-    sync::Arc,
 };
 use tracing::trace_span;
 
@@ -441,6 +438,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
                         // Shouldn't happen: WAW or RAW with the write being host access.
                         // FIXME: actually, it's possible when a host-mapped image, with linear storage
                         // and in the GENERAL layout is requested access with a different layout.
+                        // TODO better panic message
                         panic!("unsupported dependency")
                     }
                 }
@@ -590,7 +588,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
     /// Registers an access to a resource group
     // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
     // more than one execution and visibility barrier
-    fn reference_group(&mut self, id: ResourceGroupId) {
+    pub fn reference_group(&mut self, id: ResourceGroupId) {
         let mut objects = self.frame.context.device.objects.lock().unwrap();
 
         // we just have to wait for the SNNs and stages of the group.
@@ -968,7 +966,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             match resource.ownership {
                 ResourceOwnership::External => {}
                 ResourceOwnership::OwnedResource { ref allocation, .. } => match allocation {
-                    Some(ResourceAllocation::Default { allocation }) => {
+                    Some(ResourceAllocation::Default { allocation: _ }) => {
                         println!("    allocation: exclusive");
                     }
                     Some(ResourceAllocation::External { device_memory }) => {

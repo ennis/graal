@@ -1,7 +1,7 @@
 //! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
     context::{
-        transient::allocate_memory_for_transients, FrameInFlight, FrameInner,
+        FrameInFlight, FrameInner,
         PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
         SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
     },
@@ -10,17 +10,10 @@ use crate::{
 };
 use std::{
     ffi::{c_void, CString},
-    ops::{Deref, DerefMut},
+    ops::Deref,
     ptr,
 };
 use tracing::trace_span;
-
-/// Frame transient objects.
-pub struct TransientObjects {
-    image_views: Vec<vk::ImageView>,
-    framebuffers: Vec<vk::Framebuffer>,
-    //descriptor_sets:
-}
 
 /// Context passed to the command callbacks.
 /// FIXME: not sure we need the context? maybe just directly pass a reference to the device

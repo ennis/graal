@@ -3,7 +3,7 @@ use crate::{
     serial::{QueueSerialNumbers, SubmissionNumber},
     vk,
     vk::Handle,
-    Context, Device, FrameNumber,
+    Device, FrameNumber,
 };
 use gpu_allocator::MemoryLocation;
 use slotmap::{Key, SlotMap};

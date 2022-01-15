@@ -1,20 +1,20 @@
 use crate::{
     context::submission::CommandAllocator,
     device::Device,
-    resource::{DeviceObjects, ResourceKind, ResourceTrackingInfo},
+    resource::{ResourceKind, ResourceTrackingInfo},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
     BufferId, ImageId, ResourceId, MAX_QUEUES,
 };
 use ash::vk;
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::{HashSet, VecDeque},
     fmt,
     os::raw::c_void,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
 pub use submission::RecordingContext;
-use tracing::{trace, trace_span};
+use tracing::trace_span;
 
 pub(crate) mod frame;
 pub(crate) mod submission;
@@ -405,6 +405,7 @@ pub struct SemaphoreWait {
     pub(crate) semaphore: vk::Semaphore,
     /// Whether the semaphore is internally managed (owned by the context).
     /// If true, the semaphore will be reclaimed by the context after it is consumed (waited on).
+    /// FIXME this is never read?
     pub(crate) owned: bool,
     /// Destination stage
     pub(crate) dst_stage: vk::PipelineStageFlags,
