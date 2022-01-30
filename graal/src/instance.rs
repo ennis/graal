@@ -7,7 +7,7 @@ use std::{
 };
 
 /// List of validation layers to enable
-const VALIDATION_LAYERS: &[&str] = &["VK_LAYER_KHRONOS_validation"];
+const VALIDATION_LAYERS: &[&str] = &[/*"VK_LAYER_KHRONOS_validation"*/];
 
 lazy_static! {
     pub(crate) static ref VULKAN_ENTRY: ash::Entry = initialize_vulkan_entry();
