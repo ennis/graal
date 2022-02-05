@@ -191,7 +191,8 @@ fn main() {
                 window.request_redraw();
             }
             Event::RedrawRequested(_) => {
-                let swapchain_image = unsafe { swapchain.acquire_next_image(&device, context.create_semaphore()) };
+                let swapchain_image =
+                    unsafe { swapchain.acquire_next_image(&device, context.create_semaphore()) };
 
                 let mut frame = context.start_frame(FrameCreateInfo {
                     collect_debug_info: true,

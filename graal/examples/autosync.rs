@@ -125,7 +125,7 @@ impl DepMatrix {
     pub fn propagate(&mut self) {
         for i in (1..self.num_passes).rev() {
             for j in i..self.num_passes {
-                for m in i+1..j {
+                for m in i + 1..j {
                     let a = self.get(i, m);
                     let b = self.get(m, j);
                     if logically_earlier(a.1, b.0) {

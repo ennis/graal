@@ -2,8 +2,8 @@
 use crate::shader::create_shader_module;
 use glam::{Mat4, Vec2, Vec4};
 use graal::{
-    ash::version::DeviceV1_0, vk, FragmentOutputInterface, ImageInfo, Norm,
-    TypedBufferInfo, VertexInputInterfaceExt,
+    ash::version::DeviceV1_0, vk, FragmentOutputInterface, ImageInfo, Norm, TypedBufferInfo,
+    VertexInputInterfaceExt,
 };
 use inline_spirv::include_spirv;
 use std::ptr;
@@ -504,8 +504,14 @@ impl EguiRenderer {
             let sampler = self.sampler;
 
             pass.register_image_access(target.id, graal::AccessType::ColorAttachmentReadWrite);
-            pass.register_image_access(texture.id, graal::AccessType::FragmentShaderReadSampledImage);
-            pass.register_buffer_access(global_uniforms.id, graal::AccessType::AnyShaderReadUniformBuffer);
+            pass.register_image_access(
+                texture.id,
+                graal::AccessType::FragmentShaderReadSampledImage,
+            );
+            pass.register_buffer_access(
+                global_uniforms.id,
+                graal::AccessType::AnyShaderReadUniformBuffer,
+            );
 
             // FIXME this needs to disappear
             for m in meshes.iter() {

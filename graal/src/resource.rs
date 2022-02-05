@@ -728,7 +728,7 @@ impl DeviceObjects {
             discarded_samplers: Default::default(),
             discarded_descriptor_sets: Default::default(),
             discarded_pipelines: Default::default(),
-            discarded_image_views: Default::default()
+            discarded_image_views: Default::default(),
         }
     }
 
@@ -1065,11 +1065,7 @@ impl Device {
     /// Frees the specified descriptor set immediately.
     ///
     /// This assumes that the descriptor set is not in use anymore.
-    pub unsafe fn free_descriptor_set(
-        &self,
-        layout: DescriptorSetLayoutId,
-        ds: vk::DescriptorSet,
-    ) {
+    pub unsafe fn free_descriptor_set(&self, layout: DescriptorSetLayoutId, ds: vk::DescriptorSet) {
         let mut objects = self.objects.lock().unwrap();
         let allocator = objects.descriptor_allocators.get_mut(layout).unwrap();
         allocator.free.push(ds);

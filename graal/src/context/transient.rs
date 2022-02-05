@@ -2,13 +2,12 @@
 use crate::{
     ash::vk,
     context::{local_pass_index, Pass},
-    resource::{Resource, ResourceAllocation, ResourceKind},
+    resource::{AccessTracker, Resource, ResourceAllocation, ResourceKind},
     AllocationRequirements, Context, ResourceId, ResourceOwnership,
 };
 use fixedbitset::FixedBitSet;
 use slotmap::SecondaryMap;
 use tracing::trace_span;
-use crate::resource::AccessTracker;
 
 // --- Reachability matrix -------------------------------------------------------------------------
 
@@ -231,12 +230,14 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
                     None => {
                         // the resource is never accessed? which means that in theory we can alias
                         // it with anything
-                        tracing::warn!("aliasable resource {:?}({}) is never accessed by the device", target_id, target_resource.name);
+                        tracing::warn!(
+                            "aliasable resource {:?}({}) is never accessed by the device",
+                            target_id,
+                            target_resource.name
+                        );
                         0
                     }
-                    Some(AccessTracker::Device(snn)) => {
-                        snn.serial()
-                    }
+                    Some(AccessTracker::Device(snn)) => snn.serial(),
                     Some(AccessTracker::Host) => {
                         // trying to alias the memory of a host-visible resource: not possible
                         panic!("tried to alias the memory of a host-visible resource")
@@ -259,12 +260,8 @@ pub(crate) fn allocate_memory_for_transients<UserContext>(
                 }
 
                 let writer = match target_resource.tracking.writer {
-                    None => {
-                        0
-                    }
-                    Some(AccessTracker::Device(writer)) => {
-                        writer.serial()
-                    }
+                    None => 0,
+                    Some(AccessTracker::Device(writer)) => writer.serial(),
                     Some(AccessTracker::Host) => {
                         // don't alias with a host-visible resource
                         // FIXME should we even be able to reach this line?

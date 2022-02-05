@@ -40,7 +40,6 @@ const I_LFT: usize = 10;
 const I_CAO: usize = 11;
 const I_TR: usize = 12;
 
-
 const STAGES_COUNT: usize = 13;
 
 fn stage_index(flags: vk::PipelineStageFlags) -> usize {
@@ -134,7 +133,6 @@ fn logically_later_stages(a: vk::PipelineStageFlags) -> &'static [usize] {
     }
 }
 
-
 /// Per-stage sync tracking info.
 ///
 /// Tells the source passes+stages that a particular destination stage is known to be synced with.
@@ -152,14 +150,13 @@ struct PerStageTrackingInfo {
 }
 
 /// Execution dependency tracker.
-#[derive(Copy,Clone)]
+#[derive(Copy, Clone)]
 struct DependencyTracker {
     snn: SubmissionNumber,
     table: [PerStageTrackingInfo; STAGES_COUNT],
 }
 
 impl DependencyTracker {
-
     fn empty() -> DependencyTracker {
         DependencyTracker {
             snn: Default::default(),
@@ -167,42 +164,42 @@ impl DependencyTracker {
                 draw: (0, vk::PipelineStageFlags::empty()),
                 compute: 0,
                 transfer: 0,
-                foreign: Default::default()
-            }; STAGES_COUNT]
+                foreign: Default::default(),
+            }; STAGES_COUNT],
         }
     }
 
     /// Creates a new dependency tracker from the last known state.
-    pub fn new(last_known_state: &[DependencyTracker], this_snn: SubmissionNumber) -> DependencyTracker {
-        let mut tracker = last_known_state.last().cloned().unwrap_or(DependencyTracker::empty());
+    pub fn new(
+        last_known_state: &[DependencyTracker],
+        this_snn: SubmissionNumber,
+    ) -> DependencyTracker {
+        let mut tracker = last_known_state
+            .last()
+            .cloned()
+            .unwrap_or(DependencyTracker::empty());
         tracker.snn = this_snn;
         tracker
-    } 
-    
+    }
+
     /// Registers an execution dependency for the specified destination stage.
     ///
     /// Returns whether the execution dependency was already satisfied.
-    pub fn add_execution_dependency(&mut self,
-                                    prev_trackers: &[DependencyTracker],
-                                    src_snn: SubmissionNumber,
-                                    src_stage: vk::PipelineStageFlags,
-                                    dst_stage: vk::PipelineStageFlags,
-    ) -> bool
-    {
+    pub fn add_execution_dependency(
+        &mut self,
+        prev_trackers: &[DependencyTracker],
+        src_snn: SubmissionNumber,
+        src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags,
+    ) -> bool {
         if src_snn.queue() != self.snn.queue() {
             // cross-queue dependency
-
         } else {
-
         }
-        
-        
 
         todo!()
     }
-
 }
-
 
 // 8+8+8+8 == 32b
 // x20 stages => 640bytes per pass
@@ -240,8 +237,7 @@ impl fmt::Debug for PerStageTrackingInfo {
 }
 
 #[derive(Copy, Clone)]
-struct PipelineSyncState {
-}
+struct PipelineSyncState {}
 
 impl PipelineSyncState {
     pub fn new() -> PipelineSyncState {
@@ -290,8 +286,8 @@ impl PipelineSyncState {
                         if prev_tables[src as usize].table[i_src].draw.0 > stage.draw.0
                             && ((stage.draw.1 == vk::PipelineStageFlags::empty())
                                 || is_logically_earlier(
-                            stage.draw.1,
-                            prev_tables[src as usize].table[i_src].draw.1,
+                                    stage.draw.1,
+                                    prev_tables[src as usize].table[i_src].draw.1,
                                 ))
                         {
                             stage.draw = prev_tables[src as usize].table[i_src].draw;
@@ -311,8 +307,8 @@ impl PipelineSyncState {
                         if prev_tables[src as usize].table[i_src].draw.0 > stage.draw.0
                             && ((stage.draw.1 == vk::PipelineStageFlags::empty())
                                 || is_logically_earlier(
-                            stage.draw.1,
-                            prev_tables[src as usize].table[i_src].draw.1,
+                                    stage.draw.1,
+                                    prev_tables[src as usize].table[i_src].draw.1,
                                 ))
                         {
                             stage.draw = prev_tables[src as usize].table[i_src].draw;
@@ -572,10 +568,7 @@ fn bench_exec_dependencies_propagation(b: &mut Bencher) {
     let mut tables = Vec::new();
 
     for (i, p) in passes.iter().enumerate() {
-        let mut table = tables
-            .last()
-            .cloned()
-            .unwrap_or(PipelineSyncState::new());
+        let mut table = tables.last().cloned().unwrap_or(PipelineSyncState::new());
         for &(src, dst_stage) in p.deps.iter() {
             table.add_execution_dependency(
                 &tables,

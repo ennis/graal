@@ -1,10 +1,10 @@
 //! Contains code related to the construction of frames and passes.
 use crate::{
     context::{
-        is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture,
-        ImageId, Pass, PassEvaluationCallback, RecordingContext, ResourceAccess,
-        ResourceAccessDetails, ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind,
-        SemaphoreWait, SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
+        is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture, ImageId, Pass,
+        PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails,
+        ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+        SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
     },
     resource::{AccessTracker, BufferResource, ImageResource, ResourceAllocation},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
@@ -14,11 +14,7 @@ use crate::{
     Context, Device, ResourceGroupId, ResourceOwnership,
 };
 use slotmap::Key;
-use std::{
-    fmt,
-    mem,
-    mem::ManuallyDrop,
-};
+use std::{fmt, mem, mem::ManuallyDrop};
 use tracing::trace_span;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

@@ -9,8 +9,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-use graal::swapchain::Swapchain;
-use graal::vk;
+use graal::{swapchain::Swapchain, vk};
 
 use crate::{
     background::BackgroundPass,
@@ -21,8 +20,11 @@ use crate::{
 
 mod background;
 mod bounding_box;
+pub mod buffer;
 mod camera;
+pub mod descriptor;
 mod egui_renderer;
+pub mod fragment_output;
 mod geometry_pass;
 mod load_image;
 mod mesh;
@@ -31,9 +33,6 @@ mod scene;
 mod shader;
 mod taa;
 pub mod vertex;
-pub mod fragment_output;
-pub mod descriptor;
-pub mod buffer;
 
 fn main() {
     tracing_subscriber::fmt()
@@ -122,7 +121,7 @@ fn main() {
                     },
                     _ => {}
                 }
-            },
+            }
             Event::MainEventsCleared => {
                 window.request_redraw();
             }
@@ -178,9 +177,15 @@ fn main() {
                         });
                 });
 
-                let (_output , clipped_shapes) = egui_ctx.end_frame();
+                let (_output, clipped_shapes) = egui_ctx.end_frame();
                 let clipped_meshes = egui_ctx.tessellate(clipped_shapes);
-                egui_renderer.render(&frame, swapchain_image.image_info, swapchain_size, clipped_meshes, &egui_ctx.texture());
+                egui_renderer.render(
+                    &frame,
+                    swapchain_image.image_info,
+                    swapchain_size,
+                    clipped_meshes,
+                    &egui_ctx.texture(),
+                );
 
                 // present
                 frame.present("present", &swapchain_image);

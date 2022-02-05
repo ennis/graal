@@ -2,7 +2,12 @@ use ash::{
     version::DeviceV1_0,
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
-use graal::{ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk, BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId, ImageInfo, ImageResourceCreateInfo, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo, VertexBufferView, VertexData, VertexInputInterface, MemoryLocation};
+use graal::{
+    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk,
+    BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId,
+    ImageInfo, ImageResourceCreateInfo, MemoryLocation, Norm, PipelineShaderStage, ResourceId,
+    ResourceMemoryInfo, VertexBufferView, VertexData, VertexInputInterface,
+};
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -252,8 +257,10 @@ impl BackgroundPass {
             ..Default::default()
         };
 
-        let render_pass =
-            create_single_color_target_render_pass(context.vulkan_device(), vk::Format::B8G8R8A8_SRGB);
+        let render_pass = create_single_color_target_render_pass(
+            context.vulkan_device(),
+            vk::Format::B8G8R8A8_SRGB,
+        );
 
         let gpci = vk::GraphicsPipelineCreateInfo {
             flags: Default::default(),
@@ -715,7 +722,7 @@ fn main() {
 
                 let mut frame = context.start_frame(FrameCreateInfo {
                     collect_debug_info: false,
-                    .. Default::default()
+                    ..Default::default()
                 });
 
                 test_pass(&frame, "P0", &[color_attachment_output(img_a)]);

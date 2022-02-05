@@ -1,6 +1,4 @@
-use ash::{
-    vk::{KhrExternalMemoryWin32Fn, KhrExternalSemaphoreWin32Fn},
-};
+use ash::vk::{KhrExternalMemoryWin32Fn, KhrExternalSemaphoreWin32Fn};
 use std::mem;
 
 const PLATFORM_DEVICE_EXTENSIONS: &[&str] = &[

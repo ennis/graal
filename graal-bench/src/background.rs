@@ -194,8 +194,10 @@ impl BackgroundPass {
             ..Default::default()
         };
 
-        let render_pass =
-            create_single_color_target_render_pass(context.vulkan_device(), vk::Format::B8G8R8A8_SRGB);
+        let render_pass = create_single_color_target_render_pass(
+            context.vulkan_device(),
+            vk::Format::B8G8R8A8_SRGB,
+        );
 
         let gpci = vk::GraphicsPipelineCreateInfo {
             flags: Default::default(),

@@ -1,10 +1,10 @@
 //! Generic geometry (G-buffer) generation pass
 use crate::{camera::Camera, mesh::Vertex3D, scene::Scene, shader::create_shader_module};
+use egui::CursorIcon::Default;
 use glam::{Mat4, Vec4};
 use graal::{ash::version::DeviceV1_0, vk, FragmentOutputInterface, VertexInputInterfaceExt};
 use inline_spirv::include_spirv;
 use std::ptr;
-use egui::CursorIcon::Default;
 
 static GEOMETRY_PASS_SHADER_VERT: &[u32] = include_spirv!("shaders/mesh_vis.vert", vert);
 static GEOMETRY_PASS_SHADER_FRAG: &[u32] = include_spirv!("shaders/mesh_vis.frag", frag);
@@ -388,7 +388,6 @@ impl GeometryPass {
             );*/
 
             pass.set_commands(move |context, cb| unsafe {
-
                 let fragment_output = FragmentOutput::builder()
                     .add_color_attachment(
                         &g.color,
@@ -458,9 +457,12 @@ impl GeometryPass {
                         // vertex input (vertex and index buffers)
                         &[vertex_input],
                         // draw params
-                        DrawParams { vertex_count: mesh.vertex_count, instance_count: 1, ..Default::default() }
+                        DrawParams {
+                            vertex_count: mesh.vertex_count,
+                            instance_count: 1,
+                            ..Default::default()
+                        },
                     );
-
                 }
 
                 context.vulkan_device().cmd_end_render_pass(cb);

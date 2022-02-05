@@ -28,10 +28,12 @@
 //! value 120 to be signalled on the timeline semaphore of queue 1. When that value is reached, we can
 //! be certain that pass SN 120 has finished executing.
 //!
-use std::cmp::Ordering;
-use std::fmt;
-use std::ops::{Deref, DerefMut};
 use crate::MAX_QUEUES;
+use std::{
+    cmp::Ordering,
+    fmt,
+    ops::{Deref, DerefMut},
+};
 
 /// A submission number.
 ///
@@ -173,7 +175,6 @@ impl PartialOrd for QueueSerialNumbers {
         }
     }
 }
-
 
 /// A number that uniquely identifies a frame.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Default)]

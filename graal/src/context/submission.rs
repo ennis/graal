@@ -1,9 +1,8 @@
 //! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
     context::{
-        FrameInFlight, FrameInner,
-        PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
-        SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
+        FrameInFlight, FrameInner, PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind,
+        SemaphoreWait, SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
     },
     serial::{QueueSerialNumbers, SubmissionNumber},
     vk, Context, MAX_QUEUES,
@@ -273,7 +272,7 @@ impl Context {
     pub(crate) fn submit_frame<UserContext>(
         &mut self,
         mut frame: FrameInner<UserContext>,
-        user_context: &mut UserContext
+        user_context: &mut UserContext,
     ) -> QueueSerialNumbers {
         frame.build_span.exit();
 
