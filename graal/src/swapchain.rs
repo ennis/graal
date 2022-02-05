@@ -1,6 +1,6 @@
 use crate::{
     context::{SemaphoreWait, SemaphoreWaitKind},
-    Context, Device, ImageInfo, ImageRegistrationInfo, ResourceOwnership, ResourceRegistrationInfo,
+    Device, ImageInfo, ImageRegistrationInfo, ResourceOwnership, ResourceRegistrationInfo,
 };
 use ash::vk;
 use std::ptr;

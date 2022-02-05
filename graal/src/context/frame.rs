@@ -540,7 +540,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
     fn add_resource_to_group(&self, resource_id: ResourceId, group_id: ResourceGroupId) {
         let mut objects = self.frame.context.device.objects.lock().unwrap();
         let objects = &mut *objects;
-        let mut group = objects
+        let group = objects
             .resource_groups
             .get_mut(group_id)
             .expect("invalid or expired resource group");
@@ -585,7 +585,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
     // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
     // more than one execution and visibility barrier
     pub fn reference_group(&mut self, id: ResourceGroupId) {
-        let mut objects = self.frame.context.device.objects.lock().unwrap();
+        let objects = self.frame.context.device.objects.lock().unwrap();
 
         // we just have to wait for the SNNs and stages of the group.
         let group = objects
@@ -990,7 +990,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     }
 
     /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn finish(mut self, user_context: &mut UserContext) -> GpuFuture {
+    pub fn finish(self, user_context: &mut UserContext) -> GpuFuture {
         //assert!(self.device.context_state.is_building_frame, "not building a frame");
 
         //self.dump(None);

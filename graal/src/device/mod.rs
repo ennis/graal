@@ -1,13 +1,12 @@
 use crate::{
-    context::ContextState, platform_impl, resource::DeviceObjects, Context, FrameNumber,
+    context::ContextState, platform_impl, resource::DeviceObjects, Context,
     VULKAN_ENTRY, VULKAN_INSTANCE,
 };
 use ash::vk;
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     ffi::{CStr, CString},
     fmt,
-    fmt::Formatter,
     os::raw::c_void,
     ptr,
     sync::{Arc, Mutex},
