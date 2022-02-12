@@ -1,6 +1,6 @@
 use crate::{
-    context::ContextState, platform_impl, resource::DeviceObjects, Context,
-    VULKAN_ENTRY, VULKAN_INSTANCE,
+    context::ContextState, platform_impl, resource::DeviceObjects, Context, VULKAN_ENTRY,
+    VULKAN_INSTANCE,
 };
 use ash::vk;
 use std::{
