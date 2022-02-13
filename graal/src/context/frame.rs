@@ -1,18 +1,10 @@
 //! Contains code related to the construction of frames and passes.
-use crate::{
-    context::{
-        is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture, ImageId, Pass,
-        PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails,
-        ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
-        SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
-    },
-    resource::{AccessTracker, BufferResource, ImageResource, ResourceAllocation},
-    serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
-    swapchain::SwapchainImage,
-    vk,
-    vk::Handle,
-    Context, Device, ResourceGroupId, ResourceOwnership,
-};
+use crate::{context::{
+    is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture, ImageId, Pass,
+    PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails,
+    ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+    SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
+}, resource::{AccessTracker, BufferResource, ImageResource, ResourceAllocation}, serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber}, vk, vk::Handle, Context, Device, ResourceGroupId, ResourceOwnership, SwapchainImage};
 use slotmap::Key;
 use std::{fmt, mem, mem::ManuallyDrop};
 use tracing::trace_span;
@@ -645,6 +637,21 @@ impl PassType {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PresentOperationResult {
+    pub swapchain: vk::SwapchainKHR,
+    pub result: vk::Result,
+}
+
+#[derive(Clone, Debug)]
+/// The result of a frame submission
+pub struct FrameSubmitResult {
+    /// GPU future for the frame.
+    pub future: GpuFuture,
+    /// Results of present operations.
+    pub present_results: Vec<PresentOperationResult>,
+}
+
 impl<'a, UserContext> fmt::Debug for Frame<'a, UserContext> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Frame")
@@ -990,7 +997,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     }
 
     /// Finishes building the frame and submits all the passes to the command queues.
-    pub fn finish(self, user_context: &mut UserContext) -> GpuFuture {
+    pub fn finish(self, user_context: &mut UserContext) -> FrameSubmitResult {
         //assert!(self.device.context_state.is_building_frame, "not building a frame");
 
         //self.dump(None);
@@ -1003,7 +1010,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         let last_sn = self.inner.current_sn;
 
         // Submit the frame
-        let serials = self.context.submit_frame(self.inner, user_context);
+        let submit_result = self.context.submit_frame(self.inner, user_context);
 
         // Update last submitted pass SN
         self.context.last_sn = last_sn;
@@ -1013,7 +1020,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             .is_building_frame
             .set(false);
 
-        GpuFuture { serials }
+        submit_result
     }
 }
 

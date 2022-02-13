@@ -194,6 +194,14 @@ fn main() {
                 let swapchain_image =
                     unsafe { swapchain.acquire_next_image(&device, context.create_semaphore()) };
 
+                let swapchain_image = match swapchain_image {
+                    Ok(image) => image,
+                    Err(err) => {
+                        eprintln!("vkAcquireNextImage failed: {}", err);
+                        return;
+                    }
+                };
+
                 let mut frame = context.start_frame(FrameCreateInfo {
                     collect_debug_info: true,
                     happens_after: Default::default(),

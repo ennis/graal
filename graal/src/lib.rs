@@ -1,4 +1,4 @@
-#![feature(maybe_uninit_slice)]
+//#![feature(maybe_uninit_slice)]
 
 pub use ash::{self, vk};
 
@@ -7,11 +7,11 @@ pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instanc
 pub use crate::{
     context::{
         format_aspect_mask,
-        frame::{FrameCreateInfo, PassBuilder},
+        frame::{FrameCreateInfo, FrameSubmitResult, PassBuilder, PresentOperationResult},
         is_depth_and_stencil_format, is_depth_only_format, is_stencil_only_format, is_write_access,
         Context, Frame, GpuFuture, RecordingContext,
     },
-    device::{create_device_and_context, Device},
+    device::{create_device_and_context, Device, Swapchain, SwapchainImage},
     resource::{
         get_mip_level_count, AllocationRequirements, BufferId, BufferInfo, BufferRegistrationInfo,
         BufferResourceCreateInfo, DescriptorSetLayoutId, ImageId, ImageInfo, ImageRegistrationInfo,
@@ -35,5 +35,4 @@ mod platform_impl;
 mod resource;
 pub mod serial;
 pub mod surface;
-pub mod swapchain;
 pub mod utils;

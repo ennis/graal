@@ -1,12 +1,14 @@
 //! Code related to the submission of commands contained in frames to GPU queues (`vkQueueSubmit`, presentation).
 use crate::{
     context::{
+        frame::{FrameSubmitResult, PresentOperationResult},
         FrameInFlight, FrameInner, PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind,
         SemaphoreWait, SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
     },
     serial::{QueueSerialNumbers, SubmissionNumber},
-    vk, Context, MAX_QUEUES,
+    vk, Context, GpuFuture, MAX_QUEUES,
 };
+use ash::prelude::VkResult;
 use std::{
     ffi::{c_void, CString},
     ops::Deref,
@@ -273,10 +275,12 @@ impl Context {
         &mut self,
         mut frame: FrameInner<UserContext>,
         user_context: &mut UserContext,
-    ) -> QueueSerialNumbers {
+    ) -> FrameSubmitResult {
         frame.build_span.exit();
 
         let _ = trace_span!("submit_frame").entered();
+
+        let mut present_results = vec![];
 
         // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
         // Allocate and assign memory for all transient resources of this frame.
@@ -455,10 +459,41 @@ impl Context {
                         // TODO safety
                         // TODO handle ERROR_OUT_OF_DATE_KHR
                         let queue = self.device.queues_info.queues[q as usize];
-                        self.device
+                        let result = self
+                            .device
                             .vk_khr_swapchain
-                            .queue_present(queue, &present_info)
-                            .expect("present failed");
+                            .queue_present(queue, &present_info);
+
+                        match result {
+                            Ok(suboptimal) => {
+                                // nothing
+                                if suboptimal {
+                                    present_results.push(PresentOperationResult {
+                                        swapchain,
+                                        result: vk::Result::SUBOPTIMAL_KHR,
+                                    })
+                                }
+                            }
+                            Err(err @ vk::Result::ERROR_OUT_OF_DATE_KHR) => {
+                                // The docs say:
+                                //
+                                //      However, if the presentation request is rejected by the presentation engine with an error VK_ERROR_OUT_OF_DATE_KHR, VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT,
+                                //      or VK_ERROR_SURFACE_LOST_KHR, the set of queue operations are still considered to be enqueued and thus any semaphore wait operation specified in VkPresentInfoKHR
+                                //      will execute when the corresponding queue operation is complete.
+                                //
+                                // So we can just report the error and continue since the semaphores
+                                // will be left in a consistent state.
+
+                                present_results.push(PresentOperationResult {
+                                    swapchain,
+                                    result: err,
+                                });
+                            }
+                            Err(err) => {
+                                // TODO handle more complicated errors
+                                panic!("vkQueuePresent failed: {}", err)
+                            }
+                        }
                     }
                     // we signalled and waited on the semaphore, consider it consumed
                     used_semaphores.push(render_finished_semaphore);
@@ -507,7 +542,12 @@ impl Context {
         // one more frame submitted
         self.submitted_frame_count += 1;
 
-        self.last_signalled_serials
+        FrameSubmitResult {
+            future: GpuFuture {
+                serials: self.last_signalled_serials,
+            },
+            present_results,
+        }
     }
 
     /// Recycles command pools returned by `submit_frame`.

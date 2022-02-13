@@ -555,6 +555,7 @@ pub(crate) struct DeviceObjects {
     discarded_descriptor_sets: ZombieList<(DescriptorSetLayoutId, vk::DescriptorSet)>,
     discarded_pipelines: ZombieList<vk::Pipeline>,
     discarded_image_views: ZombieList<vk::ImageView>,
+    discarded_semaphores: ZombieList<vk::Semaphore>,
 }
 
 /// Information about a newly created sampler object.
@@ -729,6 +730,7 @@ impl DeviceObjects {
             discarded_descriptor_sets: Default::default(),
             discarded_pipelines: Default::default(),
             discarded_image_views: Default::default(),
+            discarded_semaphores: Default::default()
         }
     }
 

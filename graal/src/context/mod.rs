@@ -3,7 +3,8 @@ use crate::{
     device::Device,
     resource::{ResourceKind, ResourceTrackingInfo},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
-    BufferId, ImageId, ResourceId, MAX_QUEUES,
+    BufferId, ImageId, ImageInfo, ImageRegistrationInfo, ResourceId, ResourceOwnership,
+    ResourceRegistrationInfo, Swapchain, SwapchainImage, MAX_QUEUES,
 };
 use ash::vk;
 use std::{
@@ -765,6 +766,50 @@ impl Context {
     /// be guaranteed to be in the unsignalled state the next time `create_semaphore` is called.
     fn recycle_semaphores(&mut self, mut semaphores: Vec<vk::Semaphore>) {
         self.semaphore_pool.append(&mut semaphores)
+    }
+
+    /// Acquires the next image in the swapchain.
+    pub unsafe fn acquire_next_image(
+        &mut self,
+        swapchain: &Swapchain,
+    ) -> Result<SwapchainImage, vk::Result> {
+        let image_available = self.create_semaphore();
+        let (image_index, _suboptimal) = match self.device.vk_khr_swapchain.acquire_next_image(
+            swapchain.handle,
+            1_000_000_000,
+            image_available,
+            vk::Fence::null(),
+        ) {
+            Ok(result) => result,
+            Err(err) => {
+                // recycle the semaphore before returning
+                self.semaphore_pool.push(image_available);
+                return Err(err);
+            }
+        };
+
+        let handle = swapchain.images[image_index as usize];
+        let name = format!("swapchain {:?} image #{}", handle, image_index);
+        let id = self.device.register_image_resource(ImageRegistrationInfo {
+            resource: ResourceRegistrationInfo {
+                name: &name,
+                initial_wait: Some(SemaphoreWait {
+                    semaphore: image_available,
+                    owned: true,
+                    dst_stage: Default::default(),
+                    wait_kind: SemaphoreWaitKind::Binary,
+                }),
+                ownership: ResourceOwnership::External,
+            },
+            handle,
+            format: swapchain.format,
+        });
+
+        Ok(SwapchainImage {
+            swapchain_handle: swapchain.handle,
+            image_info: ImageInfo { id, handle },
+            image_index,
+        })
     }
 
     /// Returns whether the given frame, identified by its serial, has completed execution.
