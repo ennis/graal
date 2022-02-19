@@ -8,7 +8,6 @@ use crate::{
     serial::{QueueSerialNumbers, SubmissionNumber},
     vk, Context, GpuFuture, MAX_QUEUES,
 };
-use ash::prelude::VkResult;
 use std::{
     ffi::{c_void, CString},
     ops::Deref,

@@ -1,14 +1,12 @@
 use crate::{
     context::submission::CommandAllocator,
-    device::Device,
-    resource::{ResourceKind, ResourceTrackingInfo},
+    device::{Device, ResourceKind, ResourceTrackingInfo},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
     BufferId, ImageId, ImageInfo, ImageRegistrationInfo, ResourceId, ResourceOwnership,
     ResourceRegistrationInfo, Swapchain, SwapchainImage, MAX_QUEUES,
 };
 use ash::vk;
 use std::{
-    cell::Cell,
     collections::{HashSet, VecDeque},
     fmt,
     os::raw::c_void,
@@ -657,13 +655,6 @@ pub struct Frame<'a, UserContext> {
     context: &'a mut Context,
     inner: FrameInner<'a, UserContext>,
     //current_pass: Option<Pass<'a, UserContext>>,
-}
-
-pub(crate) struct ContextState {
-    /// Whether we are between `start_frame`/`end_frame`.
-    pub(crate) is_building_frame: Cell<bool>,
-    /// Last started frame
-    pub(crate) last_started_frame: Cell<FrameNumber>,
 }
 
 pub struct Context {

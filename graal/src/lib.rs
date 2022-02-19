@@ -11,12 +11,12 @@ pub use crate::{
         is_depth_and_stencil_format, is_depth_only_format, is_stencil_only_format, is_write_access,
         Context, Frame, GpuFuture, RecordingContext,
     },
-    device::{create_device_and_context, Device, Swapchain, SwapchainImage},
-    resource::{
-        get_mip_level_count, AllocationRequirements, BufferId, BufferInfo, BufferRegistrationInfo,
-        BufferResourceCreateInfo, DescriptorSetLayoutId, ImageId, ImageInfo, ImageRegistrationInfo,
-        ImageResourceCreateInfo, PipelineId, PipelineLayoutId, ResourceGroupId, ResourceId,
-        ResourceOwnership, ResourceRegistrationInfo, SamplerId,
+    device::{
+        create_device_and_context, get_mip_level_count, AllocationRequirements, BufferId,
+        BufferInfo, BufferRegistrationInfo, BufferResourceCreateInfo, DescriptorSetLayoutId,
+        Device, ImageId, ImageInfo, ImageRegistrationInfo, ImageResourceCreateInfo, PipelineId,
+        PipelineLayoutId, ResourceGroupId, ResourceId, ResourceOwnership, ResourceRegistrationInfo,
+        SamplerId, Swapchain, SwapchainImage,
     },
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
 };
@@ -32,7 +32,6 @@ pub mod device;
 mod instance;
 pub mod platform;
 mod platform_impl;
-mod resource;
 pub mod serial;
 pub mod surface;
 pub mod utils;

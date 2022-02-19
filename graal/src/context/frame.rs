@@ -1,10 +1,17 @@
 //! Contains code related to the construction of frames and passes.
-use crate::{context::{
-    is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture, ImageId, Pass,
-    PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails,
-    ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
-    SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
-}, resource::{AccessTracker, BufferResource, ImageResource, ResourceAllocation}, serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber}, vk, vk::Handle, Context, Device, ResourceGroupId, ResourceOwnership, SwapchainImage};
+use crate::{
+    context::{
+        is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture, ImageId, Pass,
+        PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails,
+        ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+        SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
+    },
+    device::{AccessTracker, BufferResource, ImageResource, ResourceAllocation},
+    serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
+    vk,
+    vk::Handle,
+    Context, Device, ResourceGroupId, ResourceOwnership, SwapchainImage,
+};
 use slotmap::Key;
 use std::{fmt, mem, mem::ManuallyDrop};
 use tracing::trace_span;
@@ -1014,11 +1021,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
 
         // Update last submitted pass SN
         self.context.last_sn = last_sn;
-        self.context
-            .device
-            .context_state
-            .is_building_frame
-            .set(false);
+        self.context.device.end_frame();
 
         submit_result
     }
@@ -1045,11 +1048,7 @@ impl Context {
         let frame_number = FrameNumber(self.submitted_frame_count + 1);
 
         // update the context state in the device
-        self.device.context_state.is_building_frame.set(true);
-        self.device
-            .context_state
-            .last_started_frame
-            .set(frame_number);
+        self.device.start_frame(frame_number);
 
         Frame {
             context: self,

@@ -2,7 +2,7 @@
 use crate::{
     ash::vk,
     context::{local_pass_index, Pass},
-    resource::{AccessTracker, Resource, ResourceAllocation, ResourceKind},
+    device::{AccessTracker, Resource, ResourceAllocation, ResourceKind},
     AllocationRequirements, Context, ResourceId, ResourceOwnership,
 };
 use fixedbitset::FixedBitSet;
