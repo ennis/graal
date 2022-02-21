@@ -1,7 +1,7 @@
 use crate::{
     context::{get_vk_sample_count, SemaphoreWait},
-    is_write_access, platform_impl, Context, FrameNumber, QueueSerialNumbers, SubmissionNumber,
-    VULKAN_ENTRY, VULKAN_INSTANCE,
+    is_write_access, platform_impl, Context, FrameNumber, QueueSerialNumbers, SubmissionNumber, VULKAN_ENTRY,
+    VULKAN_INSTANCE,
 };
 use ash::{vk, vk::Handle};
 use gpu_allocator::MemoryLocation;
@@ -22,15 +22,11 @@ use tracing::{trace, trace_span};
 pub(crate) const MAX_QUEUES: usize = 4;
 
 /// Chooses a swapchain surface format among a list of supported formats.
-fn get_preferred_swapchain_surface_format(
-    surface_formats: &[vk::SurfaceFormatKHR],
-) -> vk::SurfaceFormatKHR {
+fn get_preferred_swapchain_surface_format(surface_formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     surface_formats
         .iter()
         .find_map(|&fmt| {
-            if fmt.format == vk::Format::B8G8R8A8_SRGB
-                && fmt.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
-            {
+            if fmt.format == vk::Format::B8G8R8A8_SRGB && fmt.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR {
                 Some(fmt)
             } else {
                 None
@@ -40,9 +36,7 @@ fn get_preferred_swapchain_surface_format(
 }
 
 /// Chooses a present mode among a list of supported modes.
-fn get_preferred_present_mode(
-    available_present_modes: &[vk::PresentModeKHR],
-) -> vk::PresentModeKHR {
+fn get_preferred_present_mode(available_present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     if available_present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
         vk::PresentModeKHR::MAILBOX
     } else {
@@ -51,18 +45,14 @@ fn get_preferred_present_mode(
 }
 
 /// Computes the preferred swap extent.
-fn get_preferred_swap_extent(
-    framebuffer_size: (u32, u32),
-    capabilities: &vk::SurfaceCapabilitiesKHR,
-) -> vk::Extent2D {
+fn get_preferred_swap_extent(framebuffer_size: (u32, u32), capabilities: &vk::SurfaceCapabilitiesKHR) -> vk::Extent2D {
     if capabilities.current_extent.width != u32::MAX {
         capabilities.current_extent
     } else {
         vk::Extent2D {
-            width: framebuffer_size.0.clamp(
-                capabilities.min_image_extent.width,
-                capabilities.max_image_extent.width,
-            ),
+            width: framebuffer_size
+                .0
+                .clamp(capabilities.min_image_extent.width, capabilities.max_image_extent.width),
             height: framebuffer_size.1.clamp(
                 capabilities.min_image_extent.height,
                 capabilities.max_image_extent.height,
@@ -125,10 +115,7 @@ pub(crate) struct ContextState {
 
 impl ContextState {
     pub(crate) fn last_started_frame(&self) -> FrameNumber {
-        FrameNumber(
-            self.last_started_frame
-                .load(std::sync::atomic::Ordering::Relaxed),
-        )
+        FrameNumber(self.last_started_frame.load(std::sync::atomic::Ordering::Relaxed))
     }
 }
 
@@ -244,9 +231,7 @@ unsafe extern "system" fn debug_utils_message_callback(
     p_callback_data: *const vk::DebugUtilsMessengerCallbackDataEXT,
     _p_user_data: *mut c_void,
 ) -> vk::Bool32 {
-    let message = CStr::from_ptr((*p_callback_data).p_message)
-        .to_str()
-        .unwrap();
+    let message = CStr::from_ptr((*p_callback_data).p_message).to_str().unwrap();
 
     /*let message_id_name = CStr::from_ptr((*p_callback_data).p_message_id_name)
         .to_str()
@@ -335,9 +320,7 @@ impl Device {
             memory_type_bits,
             required_memory_properties | preferred_memory_properties,
         )
-        .or_else(|| {
-            self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties)
-        })
+        .or_else(|| self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties))
     }
 
     /// Returns whether this device is compatible for presentation on the specified surface.
@@ -345,11 +328,7 @@ impl Device {
     /// More precisely, it checks that the graphics queue created for this device can present to the given surface.
     pub unsafe fn is_compatible_for_presentation(&self, surface: vk::SurfaceKHR) -> bool {
         self.vk_khr_surface
-            .get_physical_device_surface_support(
-                self.physical_device,
-                self.graphics_queue().1,
-                surface,
-            )
+            .get_physical_device_surface_support(self.physical_device, self.graphics_queue().1, surface)
             .unwrap()
     }
 
@@ -390,30 +369,21 @@ impl Device {
 
         eprintln!(
             "Graphics queue family: {} ({:?})",
-            graphics_queue_family,
-            queue_family_properties[graphics_queue_family as usize].queue_flags
+            graphics_queue_family, queue_family_properties[graphics_queue_family as usize].queue_flags
         );
         eprintln!(
             "Compute queue family: {} ({:?})",
-            compute_queue_family,
-            queue_family_properties[compute_queue_family as usize].queue_flags
+            compute_queue_family, queue_family_properties[compute_queue_family as usize].queue_flags
         );
         eprintln!(
             "Transfer queue family: {} ({:?})",
-            transfer_queue_family,
-            queue_family_properties[transfer_queue_family as usize].queue_flags
+            transfer_queue_family, queue_family_properties[transfer_queue_family as usize].queue_flags
         );
 
         let mut device_queue_create_infos = Vec::<vk::DeviceQueueCreateInfo>::new();
         let queue_priorities = [1.0f32];
-        for &f in &[
-            graphics_queue_family,
-            compute_queue_family,
-            transfer_queue_family,
-        ] {
-            let already_created = device_queue_create_infos
-                .iter()
-                .any(|ci| ci.queue_family_index == f);
+        for &f in &[graphics_queue_family, compute_queue_family, transfer_queue_family] {
+            let already_created = device_queue_create_infos.iter().any(|ci| ci.queue_family_index == f);
             if already_created {
                 continue;
             }
@@ -481,11 +451,7 @@ impl Device {
         // Some of those indices may be equal. E.g. the graphics and compute queues might be the
         // same, and graphics == compute.
         let graphics_queue_index: u8 = 0u8;
-        let compute_queue_index: u8 = if compute_queue == graphics_queue {
-            0
-        } else {
-            1
-        };
+        let compute_queue_index: u8 = if compute_queue == graphics_queue { 0 } else { 1 };
         let transfer_queue_index: u8 = if transfer_queue == graphics_queue {
             0
         } else if transfer_queue == compute_queue {
@@ -511,14 +477,10 @@ impl Device {
             transfer: transfer_queue_index,
         };
 
-        queues_info.queue_count = *[
-            graphics_queue_index,
-            compute_queue_index,
-            transfer_queue_index,
-        ]
-        .iter()
-        .max()
-        .unwrap() as usize
+        queues_info.queue_count = *[graphics_queue_index, compute_queue_index, transfer_queue_index]
+            .iter()
+            .max()
+            .unwrap() as usize
             + 1;
 
         let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
@@ -532,14 +494,13 @@ impl Device {
                                         heap_size_limits: None,*/
         };
 
-        let allocator = gpu_allocator::vulkan::Allocator::new(&allocator_create_desc)
-            .expect("failed to create GPU allocator");
+        let allocator =
+            gpu_allocator::vulkan::Allocator::new(&allocator_create_desc).expect("failed to create GPU allocator");
 
         let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(&*VULKAN_INSTANCE, &device);
 
         // FIXME this should be created after the instance.
-        let vk_ext_debug_utils =
-            ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
+        let vk_ext_debug_utils = ash::extensions::ext::DebugUtils::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
 
         let debug_utils_messenger_create_info = vk::DebugUtilsMessengerCreateInfoEXT {
             flags: vk::DebugUtilsMessengerCreateFlagsEXT::empty(),
@@ -559,11 +520,9 @@ impl Device {
             .create_debug_utils_messenger(&debug_utils_messenger_create_info, None)
             .unwrap();
 
-        let physical_device_memory_properties =
-            VULKAN_INSTANCE.get_physical_device_memory_properties(phy.phy);
+        let physical_device_memory_properties = VULKAN_INSTANCE.get_physical_device_memory_properties(phy.phy);
 
-        let platform_extensions =
-            platform_impl::PlatformExtensions::load(&*VULKAN_ENTRY, &*VULKAN_INSTANCE, &device);
+        let platform_extensions = platform_impl::PlatformExtensions::load(&*VULKAN_ENTRY, &*VULKAN_INSTANCE, &device);
 
         Device {
             device,
@@ -632,13 +591,12 @@ impl Device {
         let image_format = get_preferred_swapchain_surface_format(&formats);
         let present_mode = get_preferred_present_mode(&present_modes);
         let image_extent = get_preferred_swap_extent(size, &capabilities);
-        let image_count = if capabilities.max_image_count > 0
-            && capabilities.min_image_count + 1 > capabilities.max_image_count
-        {
-            capabilities.max_image_count
-        } else {
-            capabilities.min_image_count + 1
-        };
+        let image_count =
+            if capabilities.max_image_count > 0 && capabilities.min_image_count + 1 > capabilities.max_image_count {
+                capabilities.max_image_count
+            } else {
+                capabilities.min_image_count + 1
+            };
 
         let create_info = vk::SwapchainCreateInfoKHR {
             flags: Default::default(),
@@ -666,15 +624,11 @@ impl Device {
             .expect("failed to create swapchain");
         if swapchain.handle != vk::SwapchainKHR::null() {
             // FIXME what if the images are in use?
-            self.vk_khr_swapchain
-                .destroy_swapchain(swapchain.handle, None);
+            self.vk_khr_swapchain.destroy_swapchain(swapchain.handle, None);
         }
 
         swapchain.handle = new_handle;
-        swapchain.images = self
-            .vk_khr_swapchain
-            .get_swapchain_images(swapchain.handle)
-            .unwrap();
+        swapchain.images = self.vk_khr_swapchain.get_swapchain_images(swapchain.handle).unwrap();
         swapchain.format = image_format.format;
     }
 
@@ -682,9 +636,7 @@ impl Device {
         use std::sync::atomic::Ordering::Relaxed;
         let prev = self.context_state.is_building_frame.swap(true, Relaxed);
         assert!(!prev);
-        self.context_state
-            .last_started_frame
-            .store(frame_number.0, Relaxed);
+        self.context_state.last_started_frame.store(frame_number.0, Relaxed);
     }
 
     pub(crate) fn end_frame(&self) {
@@ -699,9 +651,7 @@ impl Device {
     }
 }
 
-pub unsafe fn create_device_and_context(
-    present_surface: Option<vk::SurfaceKHR>,
-) -> (Arc<Device>, Context) {
+pub unsafe fn create_device_and_context(present_surface: Option<vk::SurfaceKHR>) -> (Arc<Device>, Context) {
     let device = Device::new(present_surface);
     let context = Context::with_device(device);
     (context.device().clone(), context)
@@ -735,10 +685,7 @@ impl AllocationRequirements {
     ///
     /// Adjustment succeeds when the memory location and memory type bits are the same between the two requirements.
     /// In this case, size and alignment are set to the biggest of the two.
-    pub(crate) fn adjusted_requirements(
-        &self,
-        other: &AllocationRequirements,
-    ) -> Option<AllocationRequirements> {
+    pub(crate) fn adjusted_requirements(&self, other: &AllocationRequirements) -> Option<AllocationRequirements> {
         if self.location != other.location {
             return None;
         }
@@ -979,9 +926,7 @@ impl Resource {
     pub(crate) fn set_allocation(&mut self, alloc: ResourceAllocation) {
         // set the allocation type on the resource object
         match self.ownership {
-            ResourceOwnership::OwnedResource {
-                ref mut allocation, ..
-            } => {
+            ResourceOwnership::OwnedResource { ref mut allocation, .. } => {
                 assert!(allocation.is_none());
                 *allocation = Some(alloc)
             }
@@ -997,21 +942,15 @@ pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
 unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     // deallocate its memory, if it was allocated for this object exclusively
     match resource.ownership {
-        ResourceOwnership::OwnedResource {
-            ref mut allocation, ..
-        } => {
+        ResourceOwnership::OwnedResource { ref mut allocation, .. } => {
             // destroy the object, if we're responsible for it (we're not responsible of destroying
             // swapchain images, for example, since they are destroyed with the swapchain).
             match &mut resource.kind {
                 ResourceKind::Buffer(buf) => {
-                    device
-                        .device
-                        .destroy_buffer(mem::take(&mut buf.handle), None);
+                    device.device.destroy_buffer(mem::take(&mut buf.handle), None);
                 }
                 ResourceKind::Image(img) => {
-                    device
-                        .device
-                        .destroy_image(mem::take(&mut img.handle), None);
+                    device.device.destroy_image(mem::take(&mut img.handle), None);
                 }
             }
 
@@ -1170,6 +1109,7 @@ impl<T> Default for ZombieList<T> {
     }
 }
 
+/*
 /// Vulkan object tracker.
 struct ObjectTracker<Id: slotmap::Key, Obj> {
     objects: SlotMap<Id, Tracked<Obj>>,
@@ -1224,7 +1164,7 @@ impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
             }
         }
     }
-}
+}*/
 
 /// Tracked device objects.
 ///
@@ -1284,9 +1224,7 @@ pub struct DescriptorSetAllocator {
 }
 
 impl DescriptorSetAllocator {
-    pub fn new(
-        descriptor_set_layout_bindings: &[vk::DescriptorSetLayoutBinding],
-    ) -> DescriptorSetAllocator {
+    pub fn new(descriptor_set_layout_bindings: &[vk::DescriptorSetLayoutBinding]) -> DescriptorSetAllocator {
         let mut pool_sizes: [vk::DescriptorPoolSize; 16] = Default::default();
         // count the number of each type of descriptor
         let mut sampler_desc_count = 0;
@@ -1305,25 +1243,17 @@ impl DescriptorSetAllocator {
         for b in descriptor_set_layout_bindings.iter() {
             match b.descriptor_type {
                 vk::DescriptorType::SAMPLER => sampler_desc_count += 1,
-                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => {
-                    combined_image_sampler_desc_count += 1
-                }
+                vk::DescriptorType::COMBINED_IMAGE_SAMPLER => combined_image_sampler_desc_count += 1,
                 vk::DescriptorType::SAMPLED_IMAGE => sampled_image_desc_count += 1,
                 vk::DescriptorType::STORAGE_IMAGE => storage_image_desc_count += 1,
                 vk::DescriptorType::UNIFORM_TEXEL_BUFFER => uniform_texel_buffer_desc_count += 1,
                 vk::DescriptorType::STORAGE_TEXEL_BUFFER => storage_texel_buffer_desc_count += 1,
                 vk::DescriptorType::UNIFORM_BUFFER => uniform_buffer_desc_count += 1,
                 vk::DescriptorType::STORAGE_BUFFER => storage_buffer_desc_count += 1,
-                vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => {
-                    uniform_buffer_dynamic_desc_count += 1
-                }
-                vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => {
-                    storage_buffer_dynamic_desc_count += 1
-                }
+                vk::DescriptorType::UNIFORM_BUFFER_DYNAMIC => uniform_buffer_dynamic_desc_count += 1,
+                vk::DescriptorType::STORAGE_BUFFER_DYNAMIC => storage_buffer_dynamic_desc_count += 1,
                 vk::DescriptorType::INPUT_ATTACHMENT => input_attachment_desc_count += 1,
-                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => {
-                    acceleration_structure_desc_count += 1
-                }
+                vk::DescriptorType::ACCELERATION_STRUCTURE_KHR => acceleration_structure_desc_count += 1,
                 _ => {}
             }
         }
@@ -1331,8 +1261,7 @@ impl DescriptorSetAllocator {
         let mut pool_size_count = 0;
         if sampler_desc_count != 0 {
             pool_sizes[pool_size_count].ty = vk::DescriptorType::SAMPLER;
-            pool_sizes[pool_size_count].descriptor_count =
-                sampler_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_sizes[pool_size_count].descriptor_count = sampler_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
             pool_size_count += 1;
         }
         if combined_image_sampler_desc_count != 0 {
@@ -1343,14 +1272,12 @@ impl DescriptorSetAllocator {
         }
         if sampled_image_desc_count != 0 {
             pool_sizes[pool_size_count].ty = vk::DescriptorType::SAMPLED_IMAGE;
-            pool_sizes[pool_size_count].descriptor_count =
-                sampled_image_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_sizes[pool_size_count].descriptor_count = sampled_image_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
             pool_size_count += 1;
         }
         if storage_image_desc_count != 0 {
             pool_sizes[pool_size_count].ty = vk::DescriptorType::STORAGE_IMAGE;
-            pool_sizes[pool_size_count].descriptor_count =
-                storage_image_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_sizes[pool_size_count].descriptor_count = storage_image_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
             pool_size_count += 1;
         }
         if uniform_texel_buffer_desc_count != 0 {
@@ -1367,14 +1294,12 @@ impl DescriptorSetAllocator {
         }
         if uniform_buffer_desc_count != 0 {
             pool_sizes[pool_size_count].ty = vk::DescriptorType::UNIFORM_BUFFER;
-            pool_sizes[pool_size_count].descriptor_count =
-                uniform_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_sizes[pool_size_count].descriptor_count = uniform_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
             pool_size_count += 1;
         }
         if storage_buffer_desc_count != 0 {
             pool_sizes[pool_size_count].ty = vk::DescriptorType::STORAGE_BUFFER;
-            pool_sizes[pool_size_count].descriptor_count =
-                storage_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_sizes[pool_size_count].descriptor_count = storage_buffer_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
             pool_size_count += 1;
         }
         if uniform_buffer_dynamic_desc_count != 0 {
@@ -1391,8 +1316,7 @@ impl DescriptorSetAllocator {
         }
         if input_attachment_desc_count != 0 {
             pool_sizes[pool_size_count].ty = vk::DescriptorType::INPUT_ATTACHMENT;
-            pool_sizes[pool_size_count].descriptor_count =
-                input_attachment_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
+            pool_sizes[pool_size_count].descriptor_count = input_attachment_desc_count * DESCRIPTOR_POOL_PER_TYPE_COUNT;
             pool_size_count += 1;
         }
         if acceleration_structure_desc_count != 0 {
@@ -1470,9 +1394,7 @@ impl DeviceObjects {
                 || r.tracking.readers > completed_serials
                 || match r.tracking.writer {
                     None => false,
-                    Some(AccessTracker::Device(writer)) => {
-                        writer.serial() > completed_serials.serial(writer.queue())
-                    }
+                    Some(AccessTracker::Device(writer)) => writer.serial() > completed_serials.serial(writer.queue()),
                     Some(AccessTracker::Host) => {
                         // nothing to wait for
                         false
@@ -1492,24 +1414,18 @@ impl DeviceObjects {
         let descriptor_allocators = &mut self.descriptor_allocators;
         self.discarded_descriptor_sets
             .cleanup(completed_frame, |(layout, set)| {
-                descriptor_allocators
-                    .get_mut(layout)
-                    .unwrap()
-                    .free
-                    .push(set)
+                descriptor_allocators.get_mut(layout).unwrap().free.push(set)
             });
-        self.discarded_samplers
-            .cleanup(completed_frame, |sampler| unsafe {
-                device.device.destroy_sampler(sampler, None);
-            });
+        self.discarded_samplers.cleanup(completed_frame, |sampler| unsafe {
+            device.device.destroy_sampler(sampler, None);
+        });
         self.discarded_pipeline_layouts
             .cleanup(completed_frame, |pipeline_layout| unsafe {
                 device.device.destroy_pipeline_layout(pipeline_layout, None);
             });
-        self.discarded_pipelines
-            .cleanup(completed_frame, |pipeline| unsafe {
-                device.device.destroy_pipeline(pipeline, None);
-            });
+        self.discarded_pipelines.cleanup(completed_frame, |pipeline| unsafe {
+            device.device.destroy_pipeline(pipeline, None);
+        });
     }
 
     /// Finds the ID of the resource that corresponds to the specified image handle.
@@ -1553,21 +1469,13 @@ impl DeviceObjects {
 
 impl Device {
     /// TODO docs
-    pub(crate) unsafe fn cleanup_resources(
-        &self,
-        completed_serials: QueueSerialNumbers,
-        completed_frame: FrameNumber,
-    ) {
+    pub(crate) unsafe fn cleanup_resources(&self, completed_serials: QueueSerialNumbers, completed_frame: FrameNumber) {
         let mut objects = self.objects.lock().expect("failed to lock resources");
         objects.cleanup_resources(&self, completed_serials, completed_frame)
     }
 
     /// Common helper function to register a buffer or image resource.
-    unsafe fn register_resource(
-        &self,
-        info: ResourceRegistrationInfo,
-        kind: ResourceKind,
-    ) -> ResourceId {
+    unsafe fn register_resource(&self, info: ResourceRegistrationInfo, kind: ResourceKind) -> ResourceId {
         let mut objects = self.objects.lock().expect("failed to lock resources");
         objects.register_resource(&self, info, kind)
     }
@@ -1576,9 +1484,7 @@ impl Device {
     pub unsafe fn register_buffer_resource(&self, info: BufferRegistrationInfo) -> BufferId {
         let id = self.register_resource(
             info.resource,
-            ResourceKind::Buffer(BufferResource {
-                handle: info.handle,
-            }),
+            ResourceKind::Buffer(BufferResource { handle: info.handle }),
         );
         BufferId(id)
     }
@@ -1614,10 +1520,7 @@ impl Device {
     }
 
     /// Creates a descriptor set layout object.
-    pub fn create_descriptor_set_layout(
-        &self,
-        bindings: &[vk::DescriptorSetLayoutBinding],
-    ) -> DescriptorSetLayoutInfo {
+    pub fn create_descriptor_set_layout(&self, bindings: &[vk::DescriptorSetLayoutBinding]) -> DescriptorSetLayoutInfo {
         // --- create layout ---
         let descriptor_set_layout_create_info = vk::DescriptorSetLayoutCreateInfo {
             binding_count: bindings.len() as u32,
@@ -1668,10 +1571,7 @@ impl Device {
     }
 
     /// Creates a pipeline layout object.
-    pub fn create_pipeline_layout(
-        &self,
-        create_info: &vk::PipelineLayoutCreateInfo,
-    ) -> vk::PipelineLayout {
+    pub fn create_pipeline_layout(&self, create_info: &vk::PipelineLayoutCreateInfo) -> vk::PipelineLayout {
         unsafe {
             self.device
                 .create_pipeline_layout(create_info, None)
@@ -1722,8 +1622,7 @@ impl Device {
                     p_set_layouts: &layout_handle,
                     ..Default::default()
                 };
-                self.device
-                    .allocate_descriptor_sets(&descriptor_set_allocate_info)
+                self.device.allocate_descriptor_sets(&descriptor_set_allocate_info)
             };
 
             match result {
@@ -1744,11 +1643,7 @@ impl Device {
     }
 
     /// Schedules the deletion of a descriptor set.
-    pub unsafe fn destroy_descriptor_set(
-        &self,
-        layout: DescriptorSetLayoutId,
-        ds: vk::DescriptorSet,
-    ) {
+    pub unsafe fn destroy_descriptor_set(&self, layout: DescriptorSetLayoutId, ds: vk::DescriptorSet) {
         let mut objects = self.objects.lock().unwrap();
         // Since we don't track the uses of descriptor sets in individual frame, the best thing we
         // can do here is assume that it was used in the last frame. So schedule deletion for the
@@ -1891,10 +1786,7 @@ impl Device {
     /// Returns information about the current state of a frozen buffer resource.
     pub fn get_buffer_state(&self, buffer_id: BufferId) -> Option<BufferResourceState> {
         let objects = self.objects.lock().expect("failed to lock resources");
-        let buffer = objects
-            .resources
-            .get(buffer_id.0)
-            .expect("invalid resource");
+        let buffer = objects.resources.get(buffer_id.0).expect("invalid resource");
         if let Some(group_id) = buffer.group {
             Some(BufferResourceState { group_id })
         } else {
@@ -2119,11 +2011,7 @@ impl Device {
             })
         };
 
-        BufferInfo {
-            id,
-            handle,
-            mapped_ptr,
-        }
+        BufferInfo { id, handle, mapped_ptr }
     }
 
     /// Returns the handle of the corresponding image resource.
