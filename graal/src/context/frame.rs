@@ -2,9 +2,8 @@
 use crate::{
     context::{
         is_write_access, local_pass_index, BufferId, Frame, FrameInner, GpuFuture, ImageId, Pass,
-        PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails,
-        ResourceId, ResourceKind, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
-        SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
+        PassEvaluationCallback, RecordingContext, ResourceAccess, ResourceAccessDetails, ResourceId, ResourceKind,
+        SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait, SemaphoreWaitKind, SyncDebugInfo, TemporarySet,
     },
     device::{AccessTracker, BufferResource, ImageResource, ResourceAllocation},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
@@ -187,8 +186,7 @@ fn add_memory_dependency<'a, UserContext>(
                     old_layout,
                     new_layout,
                 }) => {
-                    let mb = barrier_pass
-                        .get_or_create_image_memory_barrier(resource.handle, resource.format);
+                    let mb = barrier_pass.get_or_create_image_memory_barrier(resource.handle, resource.format);
                     mb.src_access_mask |= src_access_mask;
                     mb.dst_access_mask |= dst_access_mask;
                     // Also specify the layout transition here.
@@ -241,15 +239,10 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
     }
 
     /// Adds a semaphore signal operation: when finished, the pass will signal the specified semaphore.
-    pub fn add_external_semaphore_signal(
-        &mut self,
-        semaphore: vk::Semaphore,
-        signal_kind: SemaphoreSignalKind,
-    ) {
-        self.pass.external_semaphore_signals.push(SemaphoreSignal {
-            semaphore,
-            signal_kind,
-        })
+    pub fn add_external_semaphore_signal(&mut self, semaphore: vk::Semaphore, signal_kind: SemaphoreSignalKind) {
+        self.pass
+            .external_semaphore_signals
+            .push(SemaphoreSignal { semaphore, signal_kind })
     }
 
     /// Registers an image access made by this pass.
@@ -320,7 +313,10 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
 
         assert!(!resource.discarded, "referenced a discarded resource");
         // we can't synchronize on a resource that belongs to a group: we synchronize on the group instead
-        assert!(resource.group.is_none(), "cannot synchronize on a resource belonging to a group; synchronize on the group instead");
+        assert!(
+            resource.group.is_none(),
+            "cannot synchronize on a resource belonging to a group; synchronize on the group instead"
+        );
 
         //------------------------
         // handle the special case of upload buffers: when the last access is a write in the host domain,
@@ -390,14 +386,8 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
                 // the visibility mask is only valid if this access and the last write is in the same queue
                 // for cross-queue accesses, we never skip
                 writer.queue() == dst_pass.snn.queue()
-                    && (resource
-                        .tracking
-                        .visibility_mask
-                        .contains(access.access_mask)
-                        || resource
-                            .tracking
-                            .visibility_mask
-                            .contains(vk::AccessFlags::MEMORY_READ))
+                    && (resource.tracking.visibility_mask.contains(access.access_mask)
+                        || resource.tracking.visibility_mask.contains(vk::AccessFlags::MEMORY_READ))
             }
         };
 
@@ -426,9 +416,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
                         // no sources
                         QueueSerialNumbers::default()
                     }
-                    Some(AccessTracker::Device(writer)) => {
-                        QueueSerialNumbers::from_submission_number(writer)
-                    }
+                    Some(AccessTracker::Device(writer)) => QueueSerialNumbers::from_submission_number(writer),
                     Some(AccessTracker::Host) => {
                         // Shouldn't happen: WAW or RAW with the write being host access.
                         // FIXME: actually, it's possible when a host-mapped image, with linear storage
@@ -543,10 +531,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
             .resource_groups
             .get_mut(group_id)
             .expect("invalid or expired resource group");
-        let mut resource = objects
-            .resources
-            .get_mut(resource_id)
-            .expect("invalid resource");
+        let mut resource = objects.resources.get_mut(resource_id).expect("invalid resource");
         assert!(resource.group.is_none());
 
         // set group
@@ -580,9 +565,7 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
         self.add_resource_to_group(buffer_id.0, group_id)
     }
 
-    /// Registers an access to a resource group
-    // FIXME: don't specify access and dst stage: those should be set in the group; avoid putting
-    // more than one execution and visibility barrier
+    /// Registers an access to a resource group.
     pub fn reference_group(&mut self, id: ResourceGroupId) {
         let objects = self.frame.context.device.objects.lock().unwrap();
 
@@ -677,10 +660,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     }
 
     /// Starts a graphics pass.
-    pub fn start_graphics_pass<'frame>(
-        &'frame mut self,
-        name: &str,
-    ) -> PassBuilder<'frame, 'a, UserContext> {
+    pub fn start_graphics_pass<'frame>(&'frame mut self, name: &str) -> PassBuilder<'frame, 'a, UserContext> {
         self.start_pass(name, PassType::Graphics, false)
     }
 
@@ -854,8 +834,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                     }));
                 }
 
-                let xq_sync_json: Vec<_> =
-                    sync_debug_info.xq_sync_table.iter().map(|v| v.0).collect();
+                let xq_sync_json: Vec<_> = sync_debug_info.xq_sync_table.iter().map(|v| v.0).collect();
 
                 pass_json.as_object_mut().unwrap().insert(
                     "syncDebugInfo".to_string(),
@@ -933,10 +912,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                 } else {
                     print!("(unknown resource)");
                 }
-                println!(
-                    " access_mask:{:?}->{:?}",
-                    bmb.src_access_mask, bmb.dst_access_mask
-                );
+                println!(" access_mask:{:?}->{:?}", bmb.src_access_mask, bmb.dst_access_mask);
             }
 
             //println!("    output stage: {:?}", p.output_stage_mask);
@@ -985,10 +961,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
                             device_memory.as_raw()
                         );
                     }
-                    Some(ResourceAllocation::Transient {
-                        device_memory,
-                        offset,
-                    }) => {
+                    Some(ResourceAllocation::Transient { device_memory, offset }) => {
                         println!(
                             "    allocation: transient, device memory {:016x}@{:016x}",
                             device_memory.as_raw(),
@@ -1033,10 +1006,7 @@ impl Context {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn start_frame<'a, UserContext>(
-        &'a mut self,
-        create_info: FrameCreateInfo,
-    ) -> Frame<'a, UserContext> {
+    pub fn start_frame<'a, UserContext>(&'a mut self, create_info: FrameCreateInfo) -> Frame<'a, UserContext> {
         let base_sn = self.last_sn;
         let wait_init = create_info.happens_after.serials;
 
