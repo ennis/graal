@@ -1013,7 +1013,7 @@ impl Context {
         // Full CPU-side frame processing
         let span = trace_span!("frame", base_sn).entered();
         // DAG build only
-        let build_span = trace_span!("DAG build").entered();
+        let build_span = trace_span!("dag_build").entered();
 
         let frame_number = FrameNumber(self.submitted_frame_count + 1);
 
