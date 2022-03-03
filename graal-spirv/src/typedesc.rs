@@ -156,7 +156,6 @@ impl<'a> Default for StructType<'a> {
 /// TypeDescs are slightly different from Formats:
 /// the latter describes the precise bit layout, packing, numeric format, and interpretation
 /// of individual data elements, while the former describes unpacked data as seen inside shaders.
-// TODO move all types related to type descriptions into a separate module
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
 pub enum TypeDesc<'a> {
     /// Primitive type.
