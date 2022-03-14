@@ -2,8 +2,8 @@
 use crate::{
     context::{
         frame::{FrameSubmitResult, PresentOperationResult},
-        FrameInFlight, FrameInner, PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind,
-        SemaphoreWait, SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
+        FrameInFlight, FrameInner, PassEvaluationCallback, SemaphoreSignal, SemaphoreSignalKind, SemaphoreWait,
+        SemaphoreWaitKind, SEMAPHORE_WAIT_TIMEOUT_NS,
     },
     serial::{QueueSerialNumbers, SubmissionNumber},
     vk, Context, GpuFuture, MAX_QUEUES,
@@ -71,7 +71,7 @@ struct CommandBatch {
     wait_serials: QueueSerialNumbers,
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
     signal_snn: SubmissionNumber,
-    external_semaphore_waits: Vec<SemaphoreWait>, // TODO arrayvec
+    external_semaphore_waits: Vec<SemaphoreWait>,     // TODO arrayvec
     external_semaphore_signals: Vec<SemaphoreSignal>, // TODO arrayvec
     command_buffers: Vec<vk::CommandBuffer>,
 }
@@ -93,9 +93,7 @@ impl CommandBatch {
     /// Even if there are no command buffers, a batch may still submitted if the batch defines
     /// a wait and a signal operation, as a way of sequencing a timeline semaphore wait and a binary semaphore signal, for instance.
     fn is_empty(&self) -> bool {
-        self.command_buffers.is_empty()
-            && !self.signal_snn.is_valid()
-            && self.external_semaphore_signals.is_empty()
+        self.command_buffers.is_empty() && !self.signal_snn.is_valid() && self.external_semaphore_signals.is_empty()
     }
 
     fn reset(&mut self) {
@@ -133,12 +131,7 @@ impl Context {
         }
     }
 
-    fn submit_command_batch(
-        &mut self,
-        q: usize,
-        batch: &CommandBatch,
-        used_semaphores: &mut Vec<vk::Semaphore>,
-    ) {
+    fn submit_command_batch(&mut self, q: usize, batch: &CommandBatch, used_semaphores: &mut Vec<vk::Semaphore>) {
         if batch.is_empty() {
             return;
         }
@@ -300,8 +293,7 @@ impl Context {
             // queue index
             let q = p.snn.queue();
 
-            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials
-            {
+            let wait_serials = if first_pass_of_queue[q] && frame.wait_init > self.completed_serials {
                 p.wait_serials.join(frame.wait_init)
             } else {
                 p.wait_serials
@@ -311,8 +303,7 @@ impl Context {
 
             // we need to wait if we have a binary semaphore, or if it's the first pass in this queue
             // and the user specified an initial wait before starting the frame.
-            let needs_semaphore_wait =
-                wait_serials > self.completed_serials || !p.external_semaphore_waits.is_empty();
+            let needs_semaphore_wait = wait_serials > self.completed_serials || !p.external_semaphore_waits.is_empty();
 
             if needs_semaphore_wait {
                 // the pass needs a semaphore wait, so it needs a separate batch
@@ -335,21 +326,16 @@ impl Context {
             }
 
             // ensure that a command pool has been allocated for the queue
-            let command_pool: &mut CommandAllocator = cmd_pools[q as usize]
-                .get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
+            let command_pool: &mut CommandAllocator =
+                cmd_pools[q as usize].get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
             // append to the last command buffer of the batch, otherwise create another one
 
             if batch.command_buffers.is_empty() {
                 let cb = command_pool.allocate_command_buffer(&self.device.device);
-                let begin_info = vk::CommandBufferBeginInfo {
-                    ..Default::default()
-                };
+                let begin_info = vk::CommandBufferBeginInfo { ..Default::default() };
                 unsafe {
                     // TODO safety
-                    self.device
-                        .device
-                        .begin_command_buffer(cb, &begin_info)
-                        .unwrap();
+                    self.device.device.begin_command_buffer(cb, &begin_info).unwrap();
                 }
                 batch.command_buffers.push(cb);
             };
@@ -423,10 +409,7 @@ impl Context {
                     let mut cctx = RecordingContext { context: self };
                     submit_fn(&mut cctx, user_context, queue);
                 }
-                Some(PassEvaluationCallback::Present {
-                    swapchain,
-                    image_index,
-                }) => {
+                Some(PassEvaluationCallback::Present { swapchain, image_index }) => {
                     // present operation:
                     // modify the current batch to signal a binary semaphore and close it
                     let render_finished_semaphore = self.create_semaphore();
@@ -456,12 +439,8 @@ impl Context {
                     };
                     unsafe {
                         // TODO safety
-                        // TODO handle ERROR_OUT_OF_DATE_KHR
                         let queue = self.device.queues_info.queues[q as usize];
-                        let result = self
-                            .device
-                            .vk_khr_swapchain
-                            .queue_present(queue, &present_info);
+                        let result = self.device.vk_khr_swapchain.queue_present(queue, &present_info);
 
                         match result {
                             Ok(suboptimal) => {
@@ -482,11 +461,7 @@ impl Context {
                                 //
                                 // So we can just report the error and continue since the semaphores
                                 // will be left in a consistent state.
-
-                                present_results.push(PresentOperationResult {
-                                    swapchain,
-                                    result: err,
-                                });
+                                present_results.push(PresentOperationResult { swapchain, result: err });
                             }
                             Err(err) => {
                                 // TODO handle more complicated errors
@@ -518,10 +493,7 @@ impl Context {
             self.submit_command_batch(batch.signal_snn.queue(), batch, &mut used_semaphores)
         }
 
-        let command_pools = cmd_pools
-            .iter_mut()
-            .filter_map(|cmd_pool| cmd_pool.take())
-            .collect();
+        let command_pools = cmd_pools.iter_mut().filter_map(|cmd_pool| cmd_pool.take()).collect();
 
         // Add this frame to the list of "frames in flight": frames that might be executing on the device.
         // When this frame is completed, all resources of the frame will be automatically recycled.

@@ -5,9 +5,9 @@ authors = ["Alexandre Bléron <alex.bleron@gmail.com>"]
 edition = "2018"
 
 [dependencies]
-ash = "0.33.3"
+ash = "0.36"
 bitflags = "1.2.1"
-gpu-allocator = "0.10.0"
+gpu-allocator = "0.17"
 lazy_static = "1.4.0"
 raw-window-handle = "0.4"
 slotmap = "1.0.2"

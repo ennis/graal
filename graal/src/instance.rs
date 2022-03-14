@@ -15,7 +15,7 @@ lazy_static! {
 }
 
 fn initialize_vulkan_entry() -> ash::Entry {
-    unsafe { ash::Entry::new().expect("failed to initialize vulkan entry points") }
+    unsafe { ash::Entry::load().expect("failed to initialize vulkan entry points") }
 }
 
 /// Checks if all validation layers are supported
@@ -49,19 +49,12 @@ fn create_vulkan_instance() -> ash::Instance {
         }
 
         // Convert instance extension strings into C-strings
-        let c_instance_extensions: Vec<_> = INSTANCE_EXTENSIONS
-            .iter()
-            .map(|&s| CString::new(s).unwrap())
-            .collect();
+        let c_instance_extensions: Vec<_> = INSTANCE_EXTENSIONS.iter().map(|&s| CString::new(s).unwrap()).collect();
 
-        let instance_extensions: Vec<_> =
-            c_instance_extensions.iter().map(|s| s.as_ptr()).collect();
+        let instance_extensions: Vec<_> = c_instance_extensions.iter().map(|s| s.as_ptr()).collect();
 
         // Convert validation layer names into C-strings
-        let c_validation_layers: Vec<_> = VALIDATION_LAYERS
-            .iter()
-            .map(|&s| CString::new(s).unwrap())
-            .collect();
+        let c_validation_layers: Vec<_> = VALIDATION_LAYERS.iter().map(|&s| CString::new(s).unwrap()).collect();
 
         let validation_layers: Vec<_> = c_validation_layers.iter().map(|s| s.as_ptr()).collect();
 

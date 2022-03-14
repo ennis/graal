@@ -842,7 +842,7 @@ impl Default for ResourceTrackingInfo {
 }
 
 /// Describes how a resource got its memory.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ResourceAllocation {
     /// a block of memory exclusively for this resource.
     Default {
@@ -861,7 +861,7 @@ pub enum ResourceAllocation {
 }
 
 /// Specifies the kind of ownership held on a resource.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum ResourceOwnership {
     /// We own the resource and are responsible for its deletion.
     OwnedResource {
@@ -991,21 +991,21 @@ pub struct ImageInfo {
     pub handle: vk::Image,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ResourceRegistrationInfo<'a> {
     pub name: &'a str,
     pub ownership: ResourceOwnership,
     pub initial_wait: Option<SemaphoreWait>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct ImageRegistrationInfo<'a> {
     pub resource: ResourceRegistrationInfo<'a>,
     pub handle: vk::Image,
     pub format: vk::Format,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BufferRegistrationInfo<'a> {
     pub resource: ResourceRegistrationInfo<'a>,
     pub handle: vk::Buffer,
@@ -1662,6 +1662,7 @@ impl Device {
         allocator.free.push(ds);
     }
 
+    /// Schedules the destruction of an image view used in the current frame or the previous ones.
     pub unsafe fn destroy_image_view(&self, image_view: vk::ImageView) {
         let mut objects = self.objects.lock().unwrap();
         objects

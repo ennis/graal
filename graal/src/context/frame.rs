@@ -222,6 +222,11 @@ fn add_memory_dependency<'a, UserContext>(
 }
 
 impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
+    /// Returns the device associated to this pass.
+    pub fn device(&self) -> &Device {
+        &self.frame.context.device
+    }
+
     /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
     /// before starting.
     pub fn add_external_semaphore_wait(
