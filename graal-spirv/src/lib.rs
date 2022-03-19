@@ -6,18 +6,18 @@ pub mod typedesc;
 use std::{error, fmt};
 
 use crate::inst::{
-    decode_raw_instruction, DecodedInstruction, IDecorate, IMemberDecorate, ITypeArray, ITypeBool,
-    ITypeFloat, ITypeImage, ITypeInt, ITypeMatrix, ITypeOpaque, ITypePointer, ITypeRuntimeArray,
-    ITypeSampledImage, ITypeSampler, ITypeStruct, ITypeVector, ITypeVoid, IVariable, Instruction,
-    RawInstruction,
+    decode_raw_instruction, DecodedInstruction, IDecorate, IMemberDecorate, ITypeArray, ITypeBool, ITypeFloat,
+    ITypeImage, ITypeInt, ITypeMatrix, ITypeOpaque, ITypePointer, ITypeRuntimeArray, ITypeSampledImage, ITypeSampler,
+    ITypeStruct, ITypeVector, ITypeVoid, IVariable, Instruction, RawInstruction,
 };
 
 use crate::typedesc::{
-    ImageType, MatrixLayout, ObjectOrMemberInfo, PrimitiveType, StructField, StructType, TypeDesc,
-    Variable,
+    ImageType, MatrixLayout, ObjectOrMemberInfo, PrimitiveType, StructField, StructType, TypeDesc, Variable,
 };
-pub use spirv_headers as spv;
 use std::collections::HashMap;
+
+pub use pointer_value_pair::Cow;
+pub use spirv_headers as spv;
 
 /// An arena allocator used to store parsed SPIR-V structures.
 #[derive(Debug)]
@@ -77,9 +77,7 @@ fn raw_inst_iter<'a>(module: &'a [u32]) -> impl Iterator<Item = (usize, RawInstr
 }
 
 /// Returns an iterator of all instructions of type `T` in the given SPIR-V stream.
-fn inst_by_type_iter<'a, T: DecodedInstruction<'a>>(
-    module: &'a [u32],
-) -> impl Iterator<Item = (usize, T)> + 'a {
+fn inst_by_type_iter<'a, T: DecodedInstruction<'a>>(module: &'a [u32]) -> impl Iterator<Item = (usize, T)> + 'a {
     raw_inst_iter(module).filter_map(|(iptr, inst)| {
         if inst.opcode == T::OPCODE as u16 {
             Some((iptr, T::decode(inst.operands).into()))
@@ -103,10 +101,7 @@ fn next_inst<'a>(module: &'a [u32], ptr: usize) -> Result<usize, ParseError> {
 }*/
 
 /// Returns an iterator of all decorations on id.
-fn decorations_iter<'a>(
-    module: &'a [u32],
-    id: u32,
-) -> impl Iterator<Item = (usize, IDecorate)> + 'a {
+fn decorations_iter<'a>(module: &'a [u32], id: u32) -> impl Iterator<Item = (usize, IDecorate)> + 'a {
     inst_by_type_iter::<IDecorate>(module).filter(move |(_, d)| d.target_id == id)
 }
 
@@ -132,10 +127,7 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 tymap.insert(result_id, arena.0.alloc(TypeDesc::Void));
             }
             Instruction::TypeBool(ITypeBool { result_id }) => {
-                tymap.insert(
-                    result_id,
-                    arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Bool)),
-                );
+                tymap.insert(result_id, arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Bool)));
             }
             Instruction::TypeSampler(ITypeSampler { result_id }) => {
                 tymap.insert(result_id, arena.0.alloc(TypeDesc::Sampler));
@@ -147,24 +139,16 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
             }) => {
                 assert_eq!(width, 32, "unsupported bit width");
                 match signedness {
-                    true => tymap.insert(
-                        result_id,
-                        arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Int)),
-                    ),
+                    true => tymap.insert(result_id, arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Int))),
                     false => tymap.insert(
                         result_id,
-                        arena
-                            .0
-                            .alloc(TypeDesc::Primitive(PrimitiveType::UnsignedInt)),
+                        arena.0.alloc(TypeDesc::Primitive(PrimitiveType::UnsignedInt)),
                     ),
                 };
             }
             Instruction::TypeFloat(ITypeFloat { result_id, width }) => {
                 assert_eq!(width, 32, "unsupported bit width");
-                tymap.insert(
-                    result_id,
-                    arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Float)),
-                );
+                tymap.insert(result_id, arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Float)));
             }
             Instruction::TypeVector(ITypeVector {
                 result_id,
@@ -245,36 +229,22 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 length_id: _,
             }) => {
                 let elem_ty = tymap[&type_id];
-                tymap.insert(
-                    result_id,
-                    arena.0.alloc(TypeDesc::Array { elem_ty, len: 0 }),
-                );
+                tymap.insert(result_id, arena.0.alloc(TypeDesc::Array { elem_ty, len: 0 }));
             }
             Instruction::TypeRuntimeArray(ITypeRuntimeArray { result_id, type_id }) => {
                 let elem_ty = tymap[&type_id];
-                tymap.insert(
-                    result_id,
-                    arena.0.alloc(TypeDesc::Array { elem_ty, len: 0 }),
-                );
+                tymap.insert(result_id, arena.0.alloc(TypeDesc::Array { elem_ty, len: 0 }));
             }
             Instruction::TypeStruct(ITypeStruct {
                 result_id,
                 member_types,
             }) => {
-                let fields = arena
-                    .0
-                    .alloc_slice_fill_iter(member_types.iter().enumerate().map(
-                        |(member, &tyid)| {
-                            parse_struct_member(
-                                arena,
-                                module,
-                                &tymap,
-                                result_id,
-                                member as u32,
-                                tyid,
-                            )
-                        },
-                    ));
+                let fields =
+                    arena
+                        .0
+                        .alloc_slice_fill_iter(member_types.iter().enumerate().map(|(member, &tyid)| {
+                            parse_struct_member(arena, module, &tymap, result_id, member as u32, tyid)
+                        }));
 
                 let mut struct_type = StructType {
                     fields,
@@ -300,10 +270,7 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
 
                 tymap.insert(result_id, arena.0.alloc(TypeDesc::Struct(struct_type)));
             }
-            Instruction::TypeOpaque(ITypeOpaque {
-                result_id: _,
-                name: _,
-            }) => unimplemented!(),
+            Instruction::TypeOpaque(ITypeOpaque { result_id: _, name: _ }) => unimplemented!(),
             Instruction::TypePointer(ITypePointer {
                 result_id,
                 storage_class: _,
@@ -319,11 +286,7 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
     tymap
 }
 
-fn parse_object_or_member_decoration(
-    decoration: spv::Decoration,
-    _params: &[u32],
-    out_info: &mut ObjectOrMemberInfo,
-) {
+fn parse_object_or_member_decoration(decoration: spv::Decoration, _params: &[u32], out_info: &mut ObjectOrMemberInfo) {
     match decoration {
         spv::Decoration::NoPerspective => out_info.no_perspective = true,
         spv::Decoration::BuiltIn => out_info.builtin = true,
@@ -427,14 +390,16 @@ impl<'a> Module<'a> {
         // on the magic number at the start of the file
         let data = if data[0] == 0x07 && data[1] == 0x23 && data[2] == 0x02 && data[3] == 0x03 {
             // big endian
-            arena.0.alloc_slice_fill_iter(data.chunks(4).map(|c| {
-                ((c[0] as u32) << 24) | ((c[1] as u32) << 16) | ((c[2] as u32) << 8) | c[3] as u32
-            }))
+            arena.0.alloc_slice_fill_iter(
+                data.chunks(4)
+                    .map(|c| ((c[0] as u32) << 24) | ((c[1] as u32) << 16) | ((c[2] as u32) << 8) | c[3] as u32),
+            )
         } else if data[3] == 0x07 && data[2] == 0x23 && data[1] == 0x02 && data[0] == 0x03 {
             // little endian
-            arena.0.alloc_slice_fill_iter(data.chunks(4).map(|c| {
-                ((c[3] as u32) << 24) | ((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32
-            }))
+            arena.0.alloc_slice_fill_iter(
+                data.chunks(4)
+                    .map(|c| ((c[3] as u32) << 24) | ((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32),
+            )
         } else {
             return Err(ParseError::MissingHeader);
         };
