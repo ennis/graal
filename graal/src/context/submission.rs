@@ -340,7 +340,7 @@ impl Context {
                 batch.command_buffers.push(cb);
             };
 
-            let cb = batch.command_buffers.last().unwrap().clone();
+            let cb = *batch.command_buffers.last().unwrap();
 
             // cb is a command buffer in the recording state
             let marker_name = CString::new(p.name.as_str()).unwrap();

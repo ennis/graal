@@ -2,8 +2,8 @@ use crate::{
     context::submission::CommandAllocator,
     device::{Device, ResourceKind, ResourceTrackingInfo},
     serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
-    BufferId, ImageId, ImageInfo, ImageRegistrationInfo, ResourceId, ResourceOwnership,
-    ResourceRegistrationInfo, Swapchain, SwapchainImage, MAX_QUEUES,
+    BufferId, ImageId, ImageInfo, ImageRegistrationInfo, ResourceId, ResourceOwnership, ResourceRegistrationInfo,
+    Swapchain, SwapchainImage, MAX_QUEUES,
 };
 use ash::vk;
 use std::{
@@ -162,28 +162,21 @@ pub fn is_write_access(mask: vk::AccessFlags) -> bool {
 }
 
 pub fn is_depth_and_stencil_format(fmt: vk::Format) -> bool {
-    match fmt {
-        vk::Format::D16_UNORM_S8_UINT => true,
-        vk::Format::D24_UNORM_S8_UINT => true,
-        vk::Format::D32_SFLOAT_S8_UINT => true,
-        _ => false,
-    }
+    matches!(
+        fmt,
+        vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+    )
 }
 
 pub fn is_depth_only_format(fmt: vk::Format) -> bool {
-    match fmt {
-        vk::Format::D16_UNORM => true,
-        vk::Format::X8_D24_UNORM_PACK32 => true,
-        vk::Format::D32_SFLOAT => true,
-        _ => false,
-    }
+    matches!(
+        fmt,
+        vk::Format::D16_UNORM | vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT
+    )
 }
 
 pub fn is_stencil_only_format(fmt: vk::Format) -> bool {
-    match fmt {
-        vk::Format::S8_UINT => true,
-        _ => false,
-    }
+    matches!(fmt, vk::Format::S8_UINT)
 }
 
 pub fn format_aspect_mask(fmt: vk::Format) -> vk::ImageAspectFlags {
@@ -463,11 +456,7 @@ impl<'a, UserContext> Pass<'a, UserContext> {
         handle: vk::Image,
         format: vk::Format,
     ) -> &mut vk::ImageMemoryBarrier {
-        if let Some(b) = self
-            .image_memory_barriers
-            .iter_mut()
-            .position(|b| b.image == handle)
-        {
+        if let Some(b) = self.image_memory_barriers.iter_mut().position(|b| b.image == handle) {
             &mut self.image_memory_barriers[b]
         } else {
             let subresource_range = vk::ImageSubresourceRange {
@@ -492,15 +481,8 @@ impl<'a, UserContext> Pass<'a, UserContext> {
         }
     }
 
-    pub(crate) fn get_or_create_buffer_memory_barrier(
-        &mut self,
-        handle: vk::Buffer,
-    ) -> &mut vk::BufferMemoryBarrier {
-        if let Some(b) = self
-            .buffer_memory_barriers
-            .iter_mut()
-            .position(|b| b.buffer == handle)
-        {
+    pub(crate) fn get_or_create_buffer_memory_barrier(&mut self, handle: vk::Buffer) -> &mut vk::BufferMemoryBarrier {
+        if let Some(b) = self.buffer_memory_barriers.iter_mut().position(|b| b.buffer == handle) {
             &mut self.buffer_memory_barriers[b]
         } else {
             self.buffer_memory_barriers.push(vk::BufferMemoryBarrier {
@@ -518,15 +500,10 @@ impl<'a, UserContext> Pass<'a, UserContext> {
     }
 
     pub(crate) fn get_or_create_global_memory_barrier(&mut self) -> &mut vk::MemoryBarrier {
-        self.global_memory_barrier
-            .get_or_insert_with(Default::default)
+        self.global_memory_barrier.get_or_insert_with(Default::default)
     }
 
-    pub(crate) fn new(
-        name: &str,
-        frame_index: usize,
-        snn: SubmissionNumber,
-    ) -> Pass<'a, UserContext> {
+    pub(crate) fn new(name: &str, frame_index: usize, snn: SubmissionNumber) -> Pass<'a, UserContext> {
         Pass {
             name: name.to_string(),
             snn,
@@ -743,13 +720,8 @@ impl Context {
         }
 
         unsafe {
-            let create_info = vk::SemaphoreCreateInfo {
-                ..Default::default()
-            };
-            self.device
-                .device
-                .create_semaphore(&create_info, None)
-                .unwrap()
+            let create_info = vk::SemaphoreCreateInfo { ..Default::default() };
+            self.device.device.create_semaphore(&create_info, None).unwrap()
         }
     }
 
@@ -760,10 +732,7 @@ impl Context {
     }
 
     /// Acquires the next image in the swapchain.
-    pub unsafe fn acquire_next_image(
-        &mut self,
-        swapchain: &Swapchain,
-    ) -> Result<SwapchainImage, vk::Result> {
+    pub unsafe fn acquire_next_image(&mut self, swapchain: &Swapchain) -> Result<SwapchainImage, vk::Result> {
         let image_available = self.create_semaphore();
         let (image_index, _suboptimal) = match self.device.vk_khr_swapchain.acquire_next_image(
             swapchain.handle,
@@ -847,10 +816,8 @@ impl Context {
         // given the new completed serials, free resources that have expired
         unsafe {
             // SAFETY: we just waited for the passes to finish
-            self.device.cleanup_resources(
-                self.completed_serials,
-                FrameNumber(self.completed_frame_count),
-            )
+            self.device
+                .cleanup_resources(self.completed_serials, FrameNumber(self.completed_frame_count))
         }
     }
 

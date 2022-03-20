@@ -596,19 +596,10 @@ impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
     }
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct FrameCreateInfo {
     pub happens_after: GpuFuture,
     pub collect_debug_info: bool,
-}
-
-impl Default for FrameCreateInfo {
-    fn default() -> Self {
-        FrameCreateInfo {
-            happens_after: Default::default(),
-            collect_debug_info: false,
-        }
-    }
 }
 
 /// Determines on which queue a pass will be scheduled.
@@ -1011,7 +1002,7 @@ impl Context {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
-    pub fn start_frame<'a, UserContext>(&'a mut self, create_info: FrameCreateInfo) -> Frame<'a, UserContext> {
+    pub fn start_frame<UserContext>(&mut self, create_info: FrameCreateInfo) -> Frame<UserContext> {
         let base_sn = self.last_sn;
         let wait_init = create_info.happens_after.serials;
 

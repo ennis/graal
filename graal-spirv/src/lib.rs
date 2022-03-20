@@ -29,6 +29,12 @@ impl Arena {
     }
 }
 
+impl Default for Arena {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Errors that can occur during parsing of SPIR-V modules.
 #[derive(Debug, Clone)]
 pub enum ParseError {
@@ -57,7 +63,7 @@ fn raw_inst_iter<'a>(module: &'a [u32]) -> impl Iterator<Item = (usize, RawInstr
         type Item = (usize, RawInstruction<'m>);
 
         fn next(&mut self) -> Option<(usize, RawInstruction<'m>)> {
-            if self.i.len() >= 1 {
+            if !self.i.is_empty() {
                 let (inst, rest) = decode_raw_instruction(self.i).unwrap();
                 let ptr = self.ptr;
                 self.i = rest;
@@ -80,7 +86,7 @@ fn raw_inst_iter<'a>(module: &'a [u32]) -> impl Iterator<Item = (usize, RawInstr
 fn inst_by_type_iter<'a, T: DecodedInstruction<'a>>(module: &'a [u32]) -> impl Iterator<Item = (usize, T)> + 'a {
     raw_inst_iter(module).filter_map(|(iptr, inst)| {
         if inst.opcode == T::OPCODE as u16 {
-            Some((iptr, T::decode(inst.operands).into()))
+            Some((iptr, T::decode(inst.operands)))
         } else {
             None
         }

@@ -297,17 +297,13 @@ impl<'m> DecodedInstruction<'m> for ICapability {
 impl<'m> DecodedInstruction<'m> for ITypeVoid {
     const OPCODE: Op = Op::TypeVoid;
     fn decode<'a: 'm>(operands: &'a [u32]) -> Self {
-        ITypeVoid {
-            result_id: operands[0],
-        }
+        ITypeVoid { result_id: operands[0] }
     }
 }
 impl<'m> DecodedInstruction<'m> for ITypeBool {
     const OPCODE: Op = Op::TypeBool;
     fn decode<'a: 'm>(operands: &'a [u32]) -> Self {
-        ITypeBool {
-            result_id: operands[0],
-        }
+        ITypeBool { result_id: operands[0] }
     }
 }
 impl<'m> DecodedInstruction<'m> for ITypeInt {
@@ -382,9 +378,7 @@ impl<'m> DecodedInstruction<'m> for ITypeImage {
 impl<'m> DecodedInstruction<'m> for ITypeSampler {
     const OPCODE: Op = Op::TypeSampler;
     fn decode<'a: 'm>(operands: &'a [u32]) -> Self {
-        ITypeSampler {
-            result_id: operands[0],
-        }
+        ITypeSampler { result_id: operands[0] }
     }
 }
 impl<'m> DecodedInstruction<'m> for ITypeSampledImage {
@@ -461,7 +455,7 @@ impl<'m> DecodedInstruction<'m> for IVariable {
             result_type_id: operands[0],
             result_id: operands[1],
             storage_class: try_parse_constant::<StorageClass>(operands[2]).unwrap(),
-            initializer: operands.get(3).map(|&v| v),
+            initializer: operands.get(3).copied(),
         }
     }
 }
@@ -489,17 +483,13 @@ impl<'m> DecodedInstruction<'m> for IMemberDecorate<'m> {
 impl<'m> DecodedInstruction<'m> for ILabel {
     const OPCODE: Op = Op::Label;
     fn decode<'a: 'm>(operands: &'a [u32]) -> Self {
-        ILabel {
-            result_id: operands[0],
-        }
+        ILabel { result_id: operands[0] }
     }
 }
 impl<'m> DecodedInstruction<'m> for IBranch {
     const OPCODE: Op = Op::Branch;
     fn decode<'a: 'm>(operands: &'a [u32]) -> Self {
-        IBranch {
-            result_id: operands[0],
-        }
+        IBranch { result_id: operands[0] }
     }
 }
 /*impl DecodedInstruction for IKill {
@@ -522,7 +512,7 @@ impl<'m> RawInstruction<'m> {
 }
 
 pub(crate) fn decode_raw_instruction(i: &[u32]) -> Result<(RawInstruction, &[u32]), ParseError> {
-    assert!(i.len() >= 1);
+    assert!(!i.is_empty());
     let word_count = (i[0] >> 16) as usize;
     assert!(word_count >= 1);
     let opcode = (i[0] & 0xffff) as u16;

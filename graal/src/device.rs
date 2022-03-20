@@ -155,7 +155,7 @@ unsafe fn select_physical_device(instance: &ash::Instance) -> PhysicalDeviceAndP
     let physical_devices = instance
         .enumerate_physical_devices()
         .expect("failed to enumerate physical devices");
-    if physical_devices.len() == 0 {
+    if physical_devices.is_empty() {
         panic!("no device with vulkan support");
     }
 
@@ -296,13 +296,12 @@ impl Device {
         memory_properties: vk::MemoryPropertyFlags,
     ) -> Option<u32> {
         for i in 0..self.physical_device_memory_properties.memory_type_count {
-            if memory_type_bits & (1 << i) != 0 {
-                if self.physical_device_memory_properties.memory_types[i as usize]
+            if memory_type_bits & (1 << i) != 0
+                && self.physical_device_memory_properties.memory_types[i as usize]
                     .property_flags
                     .contains(memory_properties)
-                {
-                    return Some(i);
-                }
+            {
+                return Some(i);
             }
         }
         None
@@ -941,32 +940,22 @@ pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
 /// exclusively.
 unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
     // deallocate its memory, if it was allocated for this object exclusively
-    match resource.ownership {
-        ResourceOwnership::OwnedResource { ref mut allocation, .. } => {
-            // destroy the object, if we're responsible for it (we're not responsible of destroying
-            // swapchain images, for example, since they are destroyed with the swapchain).
-            match &mut resource.kind {
-                ResourceKind::Buffer(buf) => {
-                    device.device.destroy_buffer(mem::take(&mut buf.handle), None);
-                }
-                ResourceKind::Image(img) => {
-                    device.device.destroy_image(mem::take(&mut img.handle), None);
-                }
+    if let ResourceOwnership::OwnedResource { ref mut allocation, .. } = resource.ownership {
+        // destroy the object, if we're responsible for it (we're not responsible of destroying
+        // swapchain images, for example, since they are destroyed with the swapchain).
+        match &mut resource.kind {
+            ResourceKind::Buffer(buf) => {
+                device.device.destroy_buffer(mem::take(&mut buf.handle), None);
             }
-
-            // free the memory associated to the object
-            match allocation.take() {
-                Some(ResourceAllocation::Default { allocation }) => {
-                    device.allocator.lock().unwrap().free(allocation).unwrap()
-                }
-                _ => {
-                    // External: the memory is freed elsewhere (?)
-                    // Transient: the memory is freed when waiting for a frame to finish
-                    // No allocation: nothing to deallocate
-                }
+            ResourceKind::Image(img) => {
+                device.device.destroy_image(mem::take(&mut img.handle), None);
             }
         }
-        _ => {}
+
+        // free the memory associated to the object
+        if let Some(ResourceAllocation::Default { allocation }) = allocation.take() {
+            device.allocator.lock().unwrap().free(allocation).unwrap()
+        }
     }
 }
 
@@ -1403,10 +1392,8 @@ impl DeviceObjects {
 
             if !keep {
                 trace!(?id, name = r.name.as_str(), tracking=?r.tracking, "destroy_resource");
-                unsafe {
-                    // Safety: we know that all serials <= `self.completed_serials` have finished
-                    destroy_resource(device, r);
-                }
+                // Safety: we know that all serials <= `self.completed_serials` have finished
+                destroy_resource(device, r);
             }
             keep
         });
@@ -1416,14 +1403,14 @@ impl DeviceObjects {
             .cleanup(completed_frame, |(layout, set)| {
                 descriptor_allocators.get_mut(layout).unwrap().free.push(set)
             });
-        self.discarded_samplers.cleanup(completed_frame, |sampler| unsafe {
+        self.discarded_samplers.cleanup(completed_frame, |sampler| {
             device.device.destroy_sampler(sampler, None);
         });
         self.discarded_pipeline_layouts
-            .cleanup(completed_frame, |pipeline_layout| unsafe {
+            .cleanup(completed_frame, |pipeline_layout| {
                 device.device.destroy_pipeline_layout(pipeline_layout, None);
             });
-        self.discarded_pipelines.cleanup(completed_frame, |pipeline| unsafe {
+        self.discarded_pipelines.cleanup(completed_frame, |pipeline| {
             device.device.destroy_pipeline(pipeline, None);
         });
     }
@@ -1444,7 +1431,7 @@ impl DeviceObjects {
                 }
                 _ => None,
             })
-            .unwrap_or(ResourceId::null())
+            .unwrap_or_else(ResourceId::null)
     }
 
     /// Finds the ID of the resource that corresponds to the specified buffer handle.
@@ -1463,7 +1450,7 @@ impl DeviceObjects {
                 }
                 _ => None,
             })
-            .unwrap_or(ResourceId::null())
+            .unwrap_or_else(ResourceId::null)
     }
 }
 
@@ -1471,13 +1458,13 @@ impl Device {
     /// TODO docs
     pub(crate) unsafe fn cleanup_resources(&self, completed_serials: QueueSerialNumbers, completed_frame: FrameNumber) {
         let mut objects = self.objects.lock().expect("failed to lock resources");
-        objects.cleanup_resources(&self, completed_serials, completed_frame)
+        objects.cleanup_resources(self, completed_serials, completed_frame)
     }
 
     /// Common helper function to register a buffer or image resource.
     unsafe fn register_resource(&self, info: ResourceRegistrationInfo, kind: ResourceKind) -> ResourceId {
         let mut objects = self.objects.lock().expect("failed to lock resources");
-        objects.register_resource(&self, info, kind)
+        objects.register_resource(self, info, kind)
     }
 
     /// Registers an existing buffer resource in the context.
@@ -1774,25 +1761,17 @@ impl Device {
     pub fn get_image_state(&self, image_id: ImageId) -> Option<ImageResourceState> {
         let objects = self.objects.lock().expect("failed to lock resources");
         let image = objects.resources.get(image_id.0).expect("invalid resource");
-        if let Some(group_id) = image.group {
-            Some(ImageResourceState {
-                group_id,
-                layout: image.tracking.layout,
-            })
-        } else {
-            None
-        }
+        image.group.map(|group_id| ImageResourceState {
+            group_id,
+            layout: image.tracking.layout,
+        })
     }
 
     /// Returns information about the current state of a frozen buffer resource.
     pub fn get_buffer_state(&self, buffer_id: BufferId) -> Option<BufferResourceState> {
         let objects = self.objects.lock().expect("failed to lock resources");
         let buffer = objects.resources.get(buffer_id.0).expect("invalid resource");
-        if let Some(group_id) = buffer.group {
-            Some(BufferResourceState { group_id })
-        } else {
-            None
-        }
+        buffer.group.map(|group_id| BufferResourceState { group_id })
     }
 
     /// Creates a new image resource.
