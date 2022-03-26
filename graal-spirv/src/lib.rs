@@ -10,13 +10,11 @@ use crate::inst::{
     ITypeImage, ITypeInt, ITypeMatrix, ITypeOpaque, ITypePointer, ITypeRuntimeArray, ITypeSampledImage, ITypeSampler,
     ITypeStruct, ITypeVector, ITypeVoid, IVariable, Instruction, RawInstruction,
 };
-
 use crate::typedesc::{
     ImageType, MatrixLayout, ObjectOrMemberInfo, PrimitiveType, StructField, StructType, TypeDesc, Variable,
 };
 use std::collections::HashMap;
 
-pub use pointer_value_pair::Cow;
 pub use spirv_headers as spv;
 
 /// An arena allocator used to store parsed SPIR-V structures.

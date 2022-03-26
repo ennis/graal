@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "graal",                 # graphics resource abstraction layer
+    "graal-bench",           # graphics resource abstraction layer - testbench
+    "graal-spirv",           # graphics resource abstraction layer - SPIRV reflection utilities
+]
+
+[profile.release]
+debug = true
