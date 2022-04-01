@@ -149,7 +149,12 @@ impl DeviceExtWindows for Device {
         win32_handle: HANDLE,
         win32_handle_name: Option<&str>,
     ) -> ImageInfo {
+        let external_memory_image_create_info = vk::ExternalMemoryImageCreateInfo {
+            handle_types: win32_handle_type,
+            ..Default::default()
+        };
         let create_info = vk::ImageCreateInfo {
+            p_next: &external_memory_image_create_info as *const _ as *const c_void,
             image_type: image_info.image_type,
             format: image_info.format,
             extent: image_info.extent,
@@ -177,6 +182,7 @@ impl DeviceExtWindows for Device {
             win32_handle,
             win32_handle_name,
         );
+        self.device.bind_image_memory(handle, device_memory, 0).unwrap();
         let image_registration_info = ImageRegistrationInfo {
             resource: ResourceRegistrationInfo {
                 name,
