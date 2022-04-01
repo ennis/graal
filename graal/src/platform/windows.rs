@@ -1,13 +1,9 @@
 use crate::{
-    context::{get_vk_sample_count},
-    vk,
-    Context, Device, ImageInfo, ImageResourceCreateInfo, ResourceMemoryInfo,
+    context::get_vk_sample_count, device::ResourceAllocation, vk, AllocationRequirements, Device, ImageInfo,
+    ImageRegistrationInfo, ImageResourceCreateInfo, ResourceOwnership, ResourceRegistrationInfo,
 };
-use ash::{
-    prelude::VkResult,
-    version::DeviceV1_0,
-    vk::{HANDLE, SECURITY_ATTRIBUTES},
-};
+use ash::vk::{HANDLE, SECURITY_ATTRIBUTES};
+use gpu_allocator::MemoryLocation;
 use std::{
     ffi::{c_void, OsStr},
     ptr,
@@ -63,25 +59,17 @@ pub(crate) unsafe fn import_external_memory(
     handle_name: Option<&str>,
 ) -> vk::DeviceMemory {
     let vk_device = &device.device;
-
     let mut win32_handle_properties = vk::MemoryWin32HandlePropertiesKHR::default();
 
-    VkResult::from(
-        device
-            .platform_extensions
-            .khr_external_memory_win32
-            .get_memory_win32_handle_properties_khr(
-                vk_device.handle(),
-                handle_type,
-                handle,
-                &mut win32_handle_properties,
-            ),
-    )
-    .unwrap();
+    device
+        .platform_extensions
+        .khr_external_memory_win32
+        .get_memory_win32_handle_properties_khr(vk_device.handle(), handle_type, handle, &mut win32_handle_properties)
+        .result()
+        .expect("vkGetMemoryWin32HandlePropertiesKHR failed");
 
     // find a memory type that both matches the resource requirement and the external handle requirements for importing
-    let memory_type_bits =
-        memory_requirements.memory_type_bits & win32_handle_properties.memory_type_bits;
+    let memory_type_bits = memory_requirements.memory_type_bits & win32_handle_properties.memory_type_bits;
     let memory_type_index = device
         .find_compatible_memory_type(memory_type_bits, required_flags, preferred_flags)
         .expect("could not find a compatible memory type for importing external memory");
@@ -103,28 +91,27 @@ pub(crate) unsafe fn import_external_memory(
         ..Default::default()
     };
 
-    let device_memory = vk_device
-        .allocate_memory(&memory_allocate_info, None)
-        .unwrap();
+    let device_memory = vk_device.allocate_memory(&memory_allocate_info, None).unwrap();
 
     device_memory
 }
 
-pub trait ContextExtWindows {
+pub trait DeviceExtWindows {
     unsafe fn create_imported_image_win32(
-        &mut self,
+        &self,
         name: &str,
-        memory_info: &ResourceMemoryInfo,
         image_info: &ImageResourceCreateInfo,
+        required_memory_flags: vk::MemoryPropertyFlags,
+        preferred_memory_flags: vk::MemoryPropertyFlags,
         handle_type: vk::ExternalMemoryHandleTypeFlags,
         handle: HANDLE,
         handle_name: Option<&str>,
     ) -> ImageInfo;
 
     unsafe fn create_exported_image_win32(
-        &mut self,
+        &self,
         name: &str,
-        memory_info: &ResourceMemoryInfo,
+        memory_location: MemoryLocation,
         image_info: &ImageResourceCreateInfo,
         handle_type: vk::ExternalMemoryHandleTypeFlags,
         security_attributes: *const SECURITY_ATTRIBUTES,
@@ -135,7 +122,7 @@ pub trait ContextExtWindows {
     /// Creates a semaphore and exports it to a Windows handle of the specified type.
     /// The returned semaphore should be deleted with `vkDestroySemaphore`.
     unsafe fn create_exported_semaphore_win32(
-        &mut self,
+        &self,
         handle_type: vk::ExternalSemaphoreHandleTypeFlags,
         security_attributes: *const SECURITY_ATTRIBUTES,
         access_flags: u32,
@@ -143,7 +130,7 @@ pub trait ContextExtWindows {
     ) -> (vk::Semaphore, HANDLE);
 
     unsafe fn create_imported_semaphore_win32(
-        &mut self,
+        &self,
         import_flags: vk::SemaphoreImportFlags,
         handle_type: vk::ExternalSemaphoreHandleTypeFlags,
         handle: HANDLE,
@@ -151,17 +138,17 @@ pub trait ContextExtWindows {
     ) -> vk::Semaphore;
 }
 
-impl ContextExtWindows for Context {
+impl DeviceExtWindows for Device {
     unsafe fn create_imported_image_win32(
-        &mut self,
+        &self,
         name: &str,
-        memory_info: &ResourceMemoryInfo,
         image_info: &ImageResourceCreateInfo,
+        required_memory_flags: vk::MemoryPropertyFlags,
+        preferred_memory_flags: vk::MemoryPropertyFlags,
         win32_handle_type: vk::ExternalMemoryHandleTypeFlags,
         win32_handle: HANDLE,
         win32_handle_name: Option<&str>,
     ) -> ImageInfo {
-        let vk_device = self.vulkan_device();
         let create_info = vk::ImageCreateInfo {
             image_type: image_info.image_type,
             format: image_info.format,
@@ -172,41 +159,54 @@ impl ContextExtWindows for Context {
             tiling: image_info.tiling,
             usage: image_info.usage,
             sharing_mode: vk::SharingMode::CONCURRENT,
-            queue_family_index_count: self.device.queues_info.queue_count as u32,
-            p_queue_family_indices: self.device.queues_info.families.as_ptr(),
+            queue_family_index_count: self.queues_info.queue_count as u32,
+            p_queue_family_indices: self.queues_info.families.as_ptr(),
             ..Default::default()
         };
-        let handle =
-            vk_device
-                .create_image(&create_info, None)
-                .expect("failed to create image");
-        let mem_req = vk_device.get_image_memory_requirements(handle);
+        let handle = self
+            .device
+            .create_image(&create_info, None)
+            .expect("failed to create image");
+        let mem_req = self.device.get_image_memory_requirements(handle);
         let device_memory = import_external_memory(
-            &self.device,
+            self,
             &mem_req,
-            memory_info.required_flags,
-            memory_info.preferred_flags,
+            required_memory_flags,
+            preferred_memory_flags,
             win32_handle_type,
             win32_handle,
             win32_handle_name,
         );
-        let memory = ResourceMemory::External { device_memory };
-        let id = self.register_image_resource(name, handle, image_info.format, memory, false);
+        let image_registration_info = ImageRegistrationInfo {
+            resource: ResourceRegistrationInfo {
+                name,
+                ownership: ResourceOwnership::OwnedResource {
+                    requirements: AllocationRequirements {
+                        mem_req,
+                        location: MemoryLocation::Unknown,
+                    },
+                    allocation: Some(ResourceAllocation::External { device_memory }),
+                },
+                initial_wait: None,
+            },
+            handle,
+            format: Default::default(),
+        };
+        let id = self.register_image_resource(image_registration_info);
 
         ImageInfo { id, handle }
     }
 
     unsafe fn create_exported_image_win32(
-        &mut self,
+        &self,
         name: &str,
-        memory_info: &ResourceMemoryInfo,
+        memory_location: MemoryLocation,
         image_info: &ImageResourceCreateInfo,
         handle_type: vk::ExternalMemoryHandleTypeFlags,
         security_attributes: *const SECURITY_ATTRIBUTES,
         access_flags: u32,
         handle_name: Option<&str>,
     ) -> (ImageInfo, HANDLE) {
-        let vk_device = self.vulkan_device();
         let external_memory_image_create_info = vk::ExternalMemoryImageCreateInfo {
             handle_types: handle_type,
             ..Default::default()
@@ -222,24 +222,43 @@ impl ContextExtWindows for Context {
             tiling: image_info.tiling,
             usage: image_info.usage,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
-            queue_family_index_count: self.device.queues_info.queue_count as u32,
-            p_queue_family_indices: self.device.queues_info.families.as_ptr(),
+            queue_family_index_count: self.queues_info.queue_count as u32,
+            p_queue_family_indices: self.queues_info.families.as_ptr(),
             ..Default::default()
         };
-        let handle =
-            vk_device
-                .create_image(&create_info, None)
-                .expect("failed to create image");
-        let mem_req = vk_device.get_image_memory_requirements(handle);
+        let handle = self
+            .device
+            .create_image(&create_info, None)
+            .expect("failed to create image");
+        let mem_req = self.device.get_image_memory_requirements(handle);
 
         let (_, handle_name_wstr) = handle_name_to_wstr(handle_name);
 
+        let (required_memory_properties, preferred_memory_properties) = match memory_location {
+            MemoryLocation::Unknown => Default::default(),
+            MemoryLocation::GpuOnly => (
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            ),
+            MemoryLocation::CpuToGpu => (
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+                    | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ),
+            MemoryLocation::GpuToCpu => (
+                vk::MemoryPropertyFlags::HOST_VISIBLE
+                    | vk::MemoryPropertyFlags::HOST_COHERENT
+                    | vk::MemoryPropertyFlags::HOST_CACHED,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            ),
+        };
+
         let memory_type_index = self
-            .device
             .find_compatible_memory_type(
                 mem_req.memory_type_bits,
-                memory_info.required_flags,
-                memory_info.preferred_flags,
+                required_memory_properties,
+                preferred_memory_properties,
             )
             .expect("could not find a compatible memory type for exporting memory");
 
@@ -261,7 +280,8 @@ impl ContextExtWindows for Context {
             ..Default::default()
         };
 
-        let device_memory = vk_device
+        let device_memory = self
+            .device
             .allocate_memory(&memory_allocate_info, None)
             .expect("failed to allocate exported memory");
 
@@ -274,31 +294,35 @@ impl ContextExtWindows for Context {
 
         let mut win32_handle = ptr::null_mut();
 
-        VkResult::from(
-            self.device
-                .platform_extensions
-                .khr_external_memory_win32
-                .get_memory_win32_handle_khr(
-                    vk_device.handle(),
-                    &get_win32_handle_info,
-                    &mut win32_handle,
-                ),
-        )
-        .unwrap();
+        self.platform_extensions
+            .khr_external_memory_win32
+            .get_memory_win32_handle_khr(self.device.handle(), &get_win32_handle_info, &mut win32_handle)
+            .result()
+            .expect("vkGetMemoryWin32HandleKHR failed");
 
         // bind memory
-        self.device
-            .device
-            .bind_image_memory(handle, device_memory, 0)
-            .unwrap();
+        self.device.bind_image_memory(handle, device_memory, 0).unwrap();
 
-        let id = self.register_image_resource(
-            name,
+        // register the image
+        // FIXME better API for registering imported resources
+        let image_registration_info = ImageRegistrationInfo {
+            resource: ResourceRegistrationInfo {
+                name,
+                // we are responsible for the deletion of the resource
+                ownership: ResourceOwnership::OwnedResource {
+                    requirements: AllocationRequirements {
+                        mem_req,
+                        location: MemoryLocation::Unknown,
+                    },
+                    // we provide our own device memory block
+                    allocation: Some(ResourceAllocation::External { device_memory }),
+                },
+                initial_wait: None,
+            },
             handle,
-            image_info.format,
-            ResourceMemory::External { device_memory },
-            false,
-        );
+            format: image_info.format,
+        };
+        let id = self.register_image_resource(image_registration_info);
 
         let image_info = ImageInfo { id, handle };
 
@@ -306,13 +330,12 @@ impl ContextExtWindows for Context {
     }
 
     unsafe fn create_exported_semaphore_win32(
-        &mut self,
+        &self,
         handle_type: vk::ExternalSemaphoreHandleTypeFlags,
         security_attributes: *const SECURITY_ATTRIBUTES,
         access_flags: u32,
         handle_name: Option<&str>,
     ) -> (vk::Semaphore, HANDLE) {
-        let vk_device = self.vulkan_device();
         let (_, handle_name_wstr) = handle_name_to_wstr(handle_name);
 
         let export_semaphore_win32_handle_info = vk::ExportSemaphoreWin32HandleInfoKHR {
@@ -331,9 +354,7 @@ impl ContextExtWindows for Context {
             ..Default::default()
         };
 
-        let semaphore = vk_device
-            .create_semaphore(&semaphore_create_info, None)
-            .unwrap();
+        let semaphore = self.device.create_semaphore(&semaphore_create_info, None).unwrap();
 
         let mut handle = ptr::null_mut();
         let get_win32_handle_info = vk::SemaphoreGetWin32HandleInfoKHR {
@@ -341,29 +362,23 @@ impl ContextExtWindows for Context {
             handle_type,
             ..Default::default()
         };
-        VkResult::from(
-            self.device
-                .platform_extensions
-                .khr_external_semaphore_win32
-                .get_semaphore_win32_handle_khr(
-                    vk_device.handle(),
-                    &get_win32_handle_info,
-                    &mut handle,
-                ),
-        )
-        .unwrap();
+
+        self.platform_extensions
+            .khr_external_semaphore_win32
+            .get_semaphore_win32_handle_khr(self.device.handle(), &get_win32_handle_info, &mut handle)
+            .result()
+            .expect("vkGetSemaphoreWin32HandleKHR failed");
 
         (semaphore, handle)
     }
 
     unsafe fn create_imported_semaphore_win32(
-        &mut self,
+        &self,
         import_flags: vk::SemaphoreImportFlags,
         handle_type: vk::ExternalSemaphoreHandleTypeFlags,
         handle: HANDLE,
         handle_name: Option<&str>,
     ) -> vk::Semaphore {
-        let vk_device = self.vulkan_device();
         let (_, handle_name_wstr) = handle_name_to_wstr(handle_name);
 
         // create the semaphore
@@ -387,9 +402,7 @@ impl ContextExtWindows for Context {
             ..Default::default()
         };
 
-        let semaphore = vk_device
-            .create_semaphore(&semaphore_create_info, None)
-            .unwrap();
+        let semaphore = self.device.create_semaphore(&semaphore_create_info, None).unwrap();
 
         let import_semaphore_win32_handle_info = vk::ImportSemaphoreWin32HandleInfoKHR {
             semaphore,
@@ -400,16 +413,12 @@ impl ContextExtWindows for Context {
             ..Default::default()
         };
 
-        VkResult::from(
-            self.device
-                .platform_extensions
-                .khr_external_semaphore_win32
-                .import_semaphore_win32_handle_khr(
-                    vk_device.handle(),
-                    &import_semaphore_win32_handle_info,
-                ),
-        )
-        .unwrap();
+        self.platform_extensions
+            .khr_external_semaphore_win32
+            .import_semaphore_win32_handle_khr(self.device.handle(), &import_semaphore_win32_handle_info)
+            .result()
+            .expect("vkImportSemaphoreWin32HandleKHR failed");
+
         semaphore
     }
 }
