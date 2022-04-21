@@ -20,7 +20,7 @@ pub(crate) mod submission;
 pub(crate) mod transient;
 
 /// Maximum time to wait for batches to finish in `SubmissionState::wait`.
-pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 1_000_000_000;
+pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// TODO document
 fn local_pass_index(serial: u64, frame_base_serial: u64) -> usize {

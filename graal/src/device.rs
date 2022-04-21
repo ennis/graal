@@ -953,8 +953,12 @@ unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
         }
 
         // free the memory associated to the object
-        if let Some(ResourceAllocation::Default { allocation }) = allocation.take() {
-            device.allocator.lock().unwrap().free(allocation).unwrap()
+        match allocation.take() {
+            Some(ResourceAllocation::Default { allocation }) => {
+                device.allocator.lock().unwrap().free(allocation).unwrap()
+            }
+            Some(ResourceAllocation::External { device_memory }) => device.device.free_memory(device_memory, None),
+            _ => {}
         }
     }
 }

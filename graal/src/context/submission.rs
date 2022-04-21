@@ -395,19 +395,22 @@ impl Context {
                     // perform a command-buffer level operation
                     let mut cctx = RecordingContext { context: self };
                     record_fn(&mut cctx, user_context, cb);
-
                     // update signalled serial for the batch (pass serials are guaranteed to be increasing)
+                    //eprintln!("PassEvaluationCallback::CommandBuffer, signal_snn={:?}", p.snn);
                     batch.signal_snn = p.snn;
                 }
                 Some(PassEvaluationCallback::Queue(submit_fn)) => {
                     // perform a queue-level operation:
                     // this terminates the current batch
+                    // FIXME: this always submits empty command buffers
                     self.submit_command_batch(q, batch, &mut used_semaphores);
                     batch.reset();
                     // call the handler
                     let queue = self.device.queues_info.queues[q as usize];
                     let mut cctx = RecordingContext { context: self };
                     submit_fn(&mut cctx, user_context, queue);
+                    //eprintln!("PassEvaluationCallback::Queue, signal_snn={:?}", p.snn);
+                    batch.signal_snn = p.snn;
                 }
                 Some(PassEvaluationCallback::Present { swapchain, image_index }) => {
                     // present operation:
@@ -483,6 +486,10 @@ impl Context {
             // the pass needs a semaphore signal: this terminates the batch on the queue
             // FIXME what does this do if the pass is a queue-level operation?
             if p.signal_queue_timelines || !p.external_semaphore_signals.is_empty() {
+                /*eprintln!(
+                    "submit_command_batch (queue = {}, reason: signal_queue_timelines={})",
+                    q, p.signal_queue_timelines
+                );*/
                 self.submit_command_batch(q, batch, &mut used_semaphores);
                 batch.reset();
             }
@@ -490,6 +497,7 @@ impl Context {
 
         // close unfinished batches
         for batch in cmd_batches.iter() {
+            //eprintln!("submit_command_batch (finishing)");
             self.submit_command_batch(batch.signal_snn.queue(), batch, &mut used_semaphores)
         }
 
