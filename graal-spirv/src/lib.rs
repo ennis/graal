@@ -5,33 +5,20 @@ pub mod typedesc;
 
 use std::{error, fmt};
 
-use crate::inst::{
-    decode_raw_instruction, DecodedInstruction, IDecorate, IMemberDecorate, ITypeArray, ITypeBool, ITypeFloat,
-    ITypeImage, ITypeInt, ITypeMatrix, ITypeOpaque, ITypePointer, ITypeRuntimeArray, ITypeSampledImage, ITypeSampler,
-    ITypeStruct, ITypeVector, ITypeVoid, IVariable, Instruction, RawInstruction,
+use crate::{
+    inst::{
+        decode_raw_instruction, DecodedInstruction, IDecorate, IMemberDecorate, ITypeArray, ITypeBool, ITypeFloat,
+        ITypeImage, ITypeInt, ITypeMatrix, ITypeOpaque, ITypePointer, ITypeRuntimeArray, ITypeSampledImage,
+        ITypeSampler, ITypeStruct, ITypeVector, ITypeVoid, IVariable, Instruction, RawInstruction,
+    },
+    typedesc::{
+        ImageType, MatrixLayout, ObjectOrMemberInfo, PrimitiveType, StructField, StructType, TypeDesc, Variable,
+    },
 };
-use crate::typedesc::{
-    ImageType, MatrixLayout, ObjectOrMemberInfo, PrimitiveType, StructField, StructType, TypeDesc, Variable,
-};
-use std::collections::HashMap;
+use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
+use std::{collections::HashMap, io::Cursor, sync::Arc};
 
 pub use spirv_headers as spv;
-
-/// An arena allocator used to store parsed SPIR-V structures.
-#[derive(Debug)]
-pub struct Arena(bumpalo::Bump);
-
-impl Arena {
-    pub fn new() -> Arena {
-        Arena(bumpalo::Bump::new())
-    }
-}
-
-impl Default for Arena {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// Errors that can occur during parsing of SPIR-V modules.
 #[derive(Debug, Clone)]
@@ -119,22 +106,22 @@ fn member_decorations_iter<'a>(
         .filter(move |(_, d)| d.target_id == struct_type_id && d.member == member)
 }
 
-fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a TypeDesc<'a>> {
+fn parse_types(module: &[u32]) -> HashMap<u32, TypeDesc> {
     // build a map from id to type
-    let mut tymap = HashMap::<u32, &'a TypeDesc<'a>>::new();
+    let mut tymap = HashMap::<u32, TypeDesc>::new();
 
     // can process types in order, since the spec specifies that:
     // "Types are built bottom up: A parameterizing operand in a type must be defined before being used."
     inst_iter(module).for_each(|(_, inst)| {
         match inst {
             Instruction::TypeVoid(ITypeVoid { result_id }) => {
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Void));
+                tymap.insert(result_id, TypeDesc::Void);
             }
             Instruction::TypeBool(ITypeBool { result_id }) => {
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Bool)));
+                tymap.insert(result_id, TypeDesc::Primitive(PrimitiveType::Bool));
             }
             Instruction::TypeSampler(ITypeSampler { result_id }) => {
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Sampler));
+                tymap.insert(result_id, TypeDesc::Sampler);
             }
             Instruction::TypeInt(ITypeInt {
                 result_id,
@@ -143,30 +130,27 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
             }) => {
                 assert_eq!(width, 32, "unsupported bit width");
                 match signedness {
-                    true => tymap.insert(result_id, arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Int))),
-                    false => tymap.insert(
-                        result_id,
-                        arena.0.alloc(TypeDesc::Primitive(PrimitiveType::UnsignedInt)),
-                    ),
+                    true => tymap.insert(result_id, TypeDesc::Primitive(PrimitiveType::Int)),
+                    false => tymap.insert(result_id, TypeDesc::Primitive(PrimitiveType::UnsignedInt)),
                 };
             }
             Instruction::TypeFloat(ITypeFloat { result_id, width }) => {
                 assert_eq!(width, 32, "unsupported bit width");
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Primitive(PrimitiveType::Float)));
+                tymap.insert(result_id, TypeDesc::Primitive(PrimitiveType::Float));
             }
             Instruction::TypeVector(ITypeVector {
                 result_id,
                 component_id,
                 count,
             }) => {
-                let elem_ty = tymap[&component_id];
-                if let &TypeDesc::Primitive(elem_ty) = &*elem_ty {
+                let elem_ty = &tymap[&component_id];
+                if let TypeDesc::Primitive(elem_ty) = elem_ty {
                     tymap.insert(
                         result_id,
-                        arena.0.alloc(TypeDesc::Vector {
-                            elem_ty,
+                        TypeDesc::Vector {
+                            elem_ty: *elem_ty,
                             len: count as u8,
-                        }),
+                        },
                     );
                 } else {
                     panic!("expected primitive type");
@@ -177,15 +161,15 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 column_type_id,
                 column_count,
             }) => {
-                let colty = tymap[&column_type_id];
-                if let &TypeDesc::Vector { elem_ty, len } = colty {
+                let colty = &tymap[&column_type_id];
+                if let TypeDesc::Vector { elem_ty, len } = colty {
                     tymap.insert(
                         result_id,
-                        arena.0.alloc(TypeDesc::Matrix {
-                            elem_ty,
-                            rows: len,
+                        TypeDesc::Matrix {
+                            elem_ty: *elem_ty,
+                            rows: *len,
                             columns: column_count as u8,
-                        }),
+                        },
                     );
                 } else {
                     panic!("expected vector type");
@@ -202,10 +186,10 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 format,
                 access: _,
             }) => {
-                let sampled_ty = tymap[&sampled_type_id];
+                let sampled_ty = tymap[&sampled_type_id].clone();
                 tymap.insert(
                     result_id,
-                    arena.0.alloc(TypeDesc::Image(ImageType {
+                    TypeDesc::Image(Arc::new(ImageType {
                         sampled_ty,
                         format,
                         dim,
@@ -220,9 +204,9 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 result_id,
                 image_type_id,
             }) => {
-                let image_ty = tymap[&image_type_id];
-                if let &TypeDesc::Image(ref img_ty) = image_ty {
-                    tymap.insert(result_id, arena.0.alloc(TypeDesc::SampledImage(*img_ty)));
+                let image_ty = &tymap[&image_type_id];
+                if let TypeDesc::Image(img_ty) = image_ty {
+                    tymap.insert(result_id, TypeDesc::SampledImage(img_ty.clone()));
                 } else {
                     panic!("expected image type")
                 };
@@ -232,33 +216,31 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 type_id,
                 length_id: _,
             }) => {
-                let elem_ty = tymap[&type_id];
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Array { elem_ty, len: 0 }));
+                let elem_ty = Box::new(tymap[&type_id].clone());
+                tymap.insert(result_id, TypeDesc::Array { elem_ty, len: 0 });
             }
             Instruction::TypeRuntimeArray(ITypeRuntimeArray { result_id, type_id }) => {
-                let elem_ty = tymap[&type_id];
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Array { elem_ty, len: 0 }));
+                let elem_ty = Box::new(tymap[&type_id].clone());
+                tymap.insert(result_id, TypeDesc::Array { elem_ty, len: 0 });
             }
             Instruction::TypeStruct(ITypeStruct {
                 result_id,
                 member_types,
             }) => {
-                let fields =
-                    arena
-                        .0
-                        .alloc_slice_fill_iter(member_types.iter().enumerate().map(|(member, &tyid)| {
-                            parse_struct_member(arena, module, &tymap, result_id, member as u32, tyid)
-                        }));
+                let fields = member_types
+                    .iter()
+                    .enumerate()
+                    .map(|(member, &tyid)| parse_struct_member(module, &tymap, result_id, member as u32, tyid))
+                    .collect();
 
                 let mut struct_type = StructType {
                     fields,
-                    decorations: &[],
+                    decorations: vec![],
                     block: false,
                     buffer_block: false,
                     struct_layout: None,
                 };
 
-                let mut decorations = Vec::new();
                 for (_, d) in decorations_iter(module, result_id) {
                     match d.decoration {
                         spv::Decoration::Block => struct_type.block = true,
@@ -267,12 +249,10 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                             // TODO
                         }
                     }
-                    decorations.push((d.decoration, d.params));
+                    struct_type.decorations.push((d.decoration, d.params.to_vec()));
                 }
 
-                struct_type.decorations = arena.0.alloc_slice_fill_iter(decorations);
-
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Struct(struct_type)));
+                tymap.insert(result_id, TypeDesc::Struct(Arc::new(struct_type)));
             }
             Instruction::TypeOpaque(ITypeOpaque { result_id: _, name: _ }) => unimplemented!(),
             Instruction::TypePointer(ITypePointer {
@@ -280,8 +260,8 @@ fn parse_types<'a>(arena: &'a Arena, module: &'a [u32]) -> HashMap<u32, &'a Type
                 storage_class: _,
                 type_id,
             }) => {
-                let ty = tymap[&type_id];
-                tymap.insert(result_id, arena.0.alloc(TypeDesc::Pointer(ty)));
+                let ty = tymap[&type_id].clone();
+                tymap.insert(result_id, TypeDesc::Pointer(Box::new(ty)));
             }
             _ => {}
         };
@@ -298,17 +278,16 @@ fn parse_object_or_member_decoration(decoration: spv::Decoration, _params: &[u32
     }
 }
 
-fn parse_struct_member<'a>(
-    arena: &'a Arena,
-    module: &'a [u32],
-    tymap: &HashMap<u32, &'a TypeDesc<'a>>,
+fn parse_struct_member(
+    module: &[u32],
+    tymap: &HashMap<u32, TypeDesc>,
     struct_type_id: u32,
     member: u32,
     member_type_id: u32,
-) -> StructField<'a> {
+) -> StructField {
     let mut field = StructField {
-        ty: tymap[&member_type_id],
-        decorations: &[],
+        ty: tymap[&member_type_id].clone(),
+        decorations: vec![],
         matrix_layout: None,
         matrix_stride: None,
         offset: None,
@@ -319,8 +298,6 @@ fn parse_struct_member<'a>(
         },
     };
 
-    let mut decorations = Vec::new();
-
     for (_, d) in member_decorations_iter(module, struct_type_id, member) {
         match d.decoration {
             spv::Decoration::MatrixStride => field.matrix_stride = Some(d.params[0]),
@@ -329,24 +306,19 @@ fn parse_struct_member<'a>(
             spv::Decoration::Offset => field.offset = Some(d.params[0]),
             other => parse_object_or_member_decoration(other, d.params, &mut field.member_info),
         }
-        decorations.push((d.decoration, d.params));
+        field.decorations.push((d.decoration, d.params.to_vec()));
     }
 
-    field.decorations = arena.0.alloc_slice_fill_iter(decorations);
     field
 }
 
-fn parse_variables<'a>(
-    arena: &'a Arena,
-    module: &'a [u32],
-    tymap: &HashMap<u32, &'a TypeDesc<'a>>,
-) -> &'a [Variable<'a>] {
+fn parse_variables(module: &[u32], tymap: &HashMap<u32, TypeDesc>) -> Vec<Variable> {
     let vars: Vec<_> = inst_by_type_iter::<IVariable>(module)
         .map(|(_iptr, v)| {
             let mut variable = Variable {
                 id: v.result_id,
-                ty: tymap[&v.result_type_id],
-                decorations: &[],
+                ty: tymap[&v.result_type_id].clone(),
+                decorations: vec![],
                 storage_class: v.storage_class,
                 descriptor_set: None,
                 binding: None,
@@ -354,7 +326,6 @@ fn parse_variables<'a>(
                 info: Default::default(),
             };
 
-            let mut decorations = Vec::new();
             for (_, d) in decorations_iter(module, v.result_id) {
                 match d.decoration {
                     spv::Decoration::DescriptorSet => variable.descriptor_set = Some(d.params[0]),
@@ -362,57 +333,52 @@ fn parse_variables<'a>(
                     spv::Decoration::Location => variable.location = Some(d.params[0]),
                     other => parse_object_or_member_decoration(other, d.params, &mut variable.info),
                 }
-                decorations.push((d.decoration, d.params));
+                variable.decorations.push((d.decoration, d.params.to_vec()));
             }
-            variable.decorations = arena.0.alloc_slice_fill_iter(decorations);
             variable
         })
         .collect();
 
-    arena.0.alloc_slice_fill_iter(vars)
+    vars
 }
 
 /// A SPIR-V module.
 #[derive(Debug, Clone)]
-pub struct Module<'a> {
-    arena: &'a Arena,
-    pub data: &'a [u32],
-    _tymap: HashMap<u32, &'a TypeDesc<'a>>,
-    pub variables: &'a [Variable<'a>],
+pub struct Module {
+    //pub data: &'a [u32],
+    _tymap: HashMap<u32, TypeDesc>,
+    pub variables: Vec<Variable>,
     pub version: (u8, u8),
     pub bound: u32,
 }
 
-impl<'a> Module<'a> {
+impl Module {
     /// Parses a SPIR-V module from a slice of bytes, possibly converting it to the native byte order if necessary.
-    pub fn from_bytes(arena: &'a Arena, data: &[u8]) -> Result<Module<'a>, ParseError> {
+    pub fn from_bytes(data: &[u8]) -> Result<Module, ParseError> {
         if data.len() < 20 {
             return Err(ParseError::MissingHeader);
         }
 
+        let mut words = vec![];
+        words.reserve_exact(data.len() / 4);
+
+        let mut reader = Cursor::new(data);
+
         // we need to determine whether we are in big endian order or little endian order depending
         // on the magic number at the start of the file
-        let data = if data[0] == 0x07 && data[1] == 0x23 && data[2] == 0x02 && data[3] == 0x03 {
-            // big endian
-            arena.0.alloc_slice_fill_iter(
-                data.chunks(4)
-                    .map(|c| ((c[0] as u32) << 24) | ((c[1] as u32) << 16) | ((c[2] as u32) << 8) | c[3] as u32),
-            )
+        if data[0] == 0x07 && data[1] == 0x23 && data[2] == 0x02 && data[3] == 0x03 {
+            reader.read_u32_into::<BigEndian>(&mut words).unwrap();
         } else if data[3] == 0x07 && data[2] == 0x23 && data[1] == 0x02 && data[0] == 0x03 {
-            // little endian
-            arena.0.alloc_slice_fill_iter(
-                data.chunks(4)
-                    .map(|c| ((c[3] as u32) << 24) | ((c[2] as u32) << 16) | ((c[1] as u32) << 8) | c[0] as u32),
-            )
+            reader.read_u32_into::<LittleEndian>(&mut words).unwrap();
         } else {
             return Err(ParseError::MissingHeader);
         };
 
-        Self::from_words(arena, data)
+        Self::from_words(&words)
     }
 
     /// Parses a SPIR-V module from machine words.
-    pub fn from_words(arena: &'a Arena, module: &'a [u32]) -> Result<Module<'a>, ParseError> {
+    pub fn from_words(module: &[u32]) -> Result<Module, ParseError> {
         if module.len() < 5 {
             return Err(ParseError::MissingHeader);
         }
@@ -426,12 +392,11 @@ impl<'a> Module<'a> {
             ((module[1] & 0x0000ff00) >> 8) as u8,
         );
 
-        let tymap = parse_types(arena, module);
-        let variables = parse_variables(arena, module, &tymap);
+        let tymap = parse_types(module);
+        let variables = parse_variables(module, &tymap);
 
         Ok(Module {
-            arena,
-            data: module,
+            //data: module,
             _tymap: tymap,
             variables,
             version,

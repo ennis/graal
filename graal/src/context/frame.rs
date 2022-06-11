@@ -975,6 +975,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     /// Finishes building the frame and submits all the passes to the command queues.
     pub fn finish(self, user_context: &mut UserContext) -> FrameSubmitResult {
         //assert!(self.device.context_state.is_building_frame, "not building a frame");
+        self.build_span.exit();
 
         //self.dump(None);
         //self.print_frame_info(&frame.passes, &frame.temporaries);
@@ -1007,9 +1008,9 @@ impl Context {
         let wait_init = create_info.happens_after.serials;
 
         // Full CPU-side frame processing
-        let span = trace_span!("frame", base_sn).entered();
+        let span = trace_span!("Frame", base_sn).entered();
         // DAG build only
-        let build_span = trace_span!("dag_build").entered();
+        let build_span = trace_span!("Building DAG").entered();
 
         let frame_number = FrameNumber(self.submitted_frame_count + 1);
 
@@ -1018,6 +1019,7 @@ impl Context {
 
         Frame {
             context: self,
+            build_span,
             inner: FrameInner {
                 base_sn,
                 current_sn: base_sn,
@@ -1030,7 +1032,6 @@ impl Context {
                 collect_sync_debug_info: create_info.collect_debug_info,
                 sync_debug_info: Vec::new(),
                 span,
-                build_span,
             },
         }
     }

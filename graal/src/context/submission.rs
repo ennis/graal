@@ -115,7 +115,7 @@ impl Default for CommandBatch {
 
 impl Context {
     pub(crate) fn wait(&self, serials: &QueueSerialNumbers) {
-        let _span = trace_span!("wait", ?serials);
+        let _span = trace_span!("Waiting for serials", ?serials);
 
         let wait_info = vk::SemaphoreWaitInfo {
             semaphore_count: self.timelines.len() as u32,
@@ -268,9 +268,7 @@ impl Context {
         mut frame: FrameInner<UserContext>,
         user_context: &mut UserContext,
     ) -> FrameSubmitResult {
-        frame.build_span.exit();
-
-        let _ = trace_span!("submit_frame").entered();
+        let _span = trace_span!("Submit frame").entered();
 
         let mut present_results = vec![];
 

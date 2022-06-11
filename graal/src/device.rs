@@ -1378,7 +1378,7 @@ impl DeviceObjects {
         completed_serials: QueueSerialNumbers,
         completed_frame: FrameNumber,
     ) {
-        let _ = trace_span!("cleanup_resources");
+        let _ = trace_span!("Resource cleanup");
         // we retain only resources that have a non-zero user refcount (the user is still holding a reference to the resource),
         // and resources that have reader or writer passes that have not yet completed
         self.resources.retain(|id, r| {

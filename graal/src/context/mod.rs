@@ -546,7 +546,6 @@ impl SyncDebugInfo {
 pub(crate) struct FrameInner<'a, UserContext> {
     frame_number: FrameNumber,
     span: tracing::span::EnteredSpan,
-    build_span: tracing::span::EnteredSpan,
     base_sn: u64,
     current_sn: u64,
     /// Map temporary index -> resource
@@ -630,6 +629,7 @@ pub(crate) struct FrameInner<'a, UserContext> {
 ///
 pub struct Frame<'a, UserContext> {
     context: &'a mut Context,
+    build_span: tracing::span::EnteredSpan,
     inner: FrameInner<'a, UserContext>,
     //current_pass: Option<Pass<'a, UserContext>>,
 }
@@ -731,8 +731,8 @@ impl Context {
         self.semaphore_pool.append(&mut semaphores)
     }
 
-    /// Acquires the next image in the swapchain.
-    pub unsafe fn acquire_next_image(&mut self, swapchain: &Swapchain) -> Result<SwapchainImage, vk::Result> {
+    /// Acquires the next image in a swapchain.
+    pub unsafe fn acquire_next_swapchain_image(&mut self, swapchain: &Swapchain) -> Result<SwapchainImage, vk::Result> {
         let image_available = self.create_semaphore();
         let (image_index, _suboptimal) = match self.device.vk_khr_swapchain.acquire_next_image(
             swapchain.handle,
@@ -780,14 +780,16 @@ impl Context {
     /// Waits for all but the last submitted frame to finish and then recycles their resources.
     /// Calls `cleanup_resources` internally.
     fn wait_for_frames_in_flight(&mut self) {
-        let _span = trace_span!("wait_for_frames_in_flight").entered();
+        let _span = trace_span!("Frame pacing").entered();
 
         // pacing
-        while self.in_flight.len() >= 2 {
+        // FIXME instead of always waiting for the 2 previous frames, introduce "frame groups" (to bikeshed)
+        // that define the granularity of the pacing. (i.e. wait for whole frame groups instead of individual frames)
+        // This is because in some workloads we submit a lot of small frames that target different surfaces (e.g. for compositing layers in kyute).
+        while self.in_flight.len() >= 50 {
             // two frames in flight already, must wait for the oldest one
             let f = self.in_flight.pop_front().unwrap();
 
-            let _span = trace_span!("waiting for frame", serials = ?f.signalled_serials, frames_in_flight = self.in_flight.len()).entered();
             self.wait(&f.signalled_serials);
 
             // update completed serials

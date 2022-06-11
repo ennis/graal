@@ -1,3 +1,4 @@
+use std::sync::Arc;
 //--------------------------------------------------------------------------------------------------
 use crate::spv;
 
@@ -20,9 +21,9 @@ pub enum PrimitiveType {
 }
 
 /// SPIR-V image type
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ImageType<'a> {
-    pub sampled_ty: &'a TypeDesc<'a>,
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ImageType {
+    pub sampled_ty: TypeDesc,
     pub format: spv::ImageFormat,
     pub dim: spv::Dim,
     pub arrayed: bool,
@@ -60,12 +61,12 @@ impl Default for ObjectOrMemberInfo {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct StructField<'a> {
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct StructField {
     /// The type of the field
-    pub ty: &'a TypeDesc<'a>,
+    pub ty: TypeDesc,
     /// Decorations attached to this field.
-    pub decorations: &'a [(spv::Decoration, &'a [u32])],
+    pub decorations: Vec<(spv::Decoration, Vec<u32>)>,
     /// Matrix layout (RowMajor or ColMajor decorations).
     pub matrix_layout: Option<MatrixLayout>,
     pub matrix_stride: Option<u32>,
@@ -74,11 +75,11 @@ pub struct StructField<'a> {
     pub member_info: ObjectOrMemberInfo,
 }
 
-impl<'a> StructField<'a> {
+impl StructField {
     pub const fn new() -> Self {
         StructField {
-            ty: &TypeDesc::Void,
-            decorations: &[],
+            ty: TypeDesc::Void,
+            decorations: vec![],
             matrix_layout: None,
             matrix_stride: None,
             offset: None,
@@ -87,20 +88,20 @@ impl<'a> StructField<'a> {
     }
 }
 
-impl<'a> Default for StructField<'a> {
+impl Default for StructField {
     fn default() -> Self {
         Self::new()
     }
 }
 
 /// SPIR-V variable information.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct Variable<'a> {
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Variable {
     pub id: u32,
     /// Type of the variable
-    pub ty: &'a TypeDesc<'a>,
+    pub ty: TypeDesc,
     /// Decorations attached to the variable
-    pub decorations: &'a [(spv::Decoration, &'a [u32])],
+    pub decorations: Vec<(spv::Decoration, Vec<u32>)>,
     /// Storage class
     pub storage_class: spv::StorageClass,
     pub descriptor_set: Option<u32>,
@@ -118,12 +119,12 @@ pub enum StructLayout {
 }
 
 /// Declaration of a SPIR-V structure type.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct StructType<'a> {
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct StructType {
     /// Fields.
-    pub fields: &'a [StructField<'a>],
+    pub fields: Vec<StructField>,
     /// Decorations attached to the type
-    pub decorations: &'a [(spv::Decoration, &'a [u32])],
+    pub decorations: Vec<(spv::Decoration, Vec<u32>)>,
     /// Whether the struct has a `Block` decoration
     pub block: bool,
     /// Whether the struct has a `BufferBlock` decoration
@@ -132,11 +133,11 @@ pub struct StructType<'a> {
     pub struct_layout: Option<StructLayout>,
 }
 
-impl<'a> StructType<'a> {
+impl StructType {
     pub const fn new() -> Self {
         StructType {
-            fields: &[],
-            decorations: &[],
+            fields: vec![],
+            decorations: vec![],
             block: false,
             buffer_block: false,
             struct_layout: None,
@@ -144,7 +145,7 @@ impl<'a> StructType<'a> {
     }
 }
 
-impl<'a> Default for StructType<'a> {
+impl Default for StructType {
     fn default() -> Self {
         Self::new()
     }
@@ -156,13 +157,13 @@ impl<'a> Default for StructType<'a> {
 /// TypeDescs are slightly different from Formats:
 /// the latter describes the precise bit layout, packing, numeric format, and interpretation
 /// of individual data elements, while the former describes unpacked data as seen inside shaders.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub enum TypeDesc<'a> {
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub enum TypeDesc {
     /// Primitive type.
     Primitive(PrimitiveType),
     /// Array type. (typedesc + length + stride)
     Array {
-        elem_ty: &'a TypeDesc<'a>,
+        elem_ty: Box<TypeDesc>,
         len: usize,
     },
     /// Vector type (ty,size).
@@ -177,33 +178,33 @@ pub enum TypeDesc<'a> {
         columns: u8,
     },
     /// Structure type (array of (offset, type) tuples).
-    Struct(StructType<'a>),
+    Struct(Arc<StructType>),
     /// Image type.
-    Image(ImageType<'a>),
+    Image(Arc<ImageType>),
     /// Combination of an image and sampling information.
-    SampledImage(ImageType<'a>),
+    SampledImage(Arc<ImageType>),
     Void,
     /// Pointer to data.
-    Pointer(&'a TypeDesc<'a>),
+    Pointer(Box<TypeDesc>),
     /// Sampler
     Sampler,
     Unknown,
 }
 
-impl<'a> TypeDesc<'a> {
+impl TypeDesc {
     /// The array element type, if this TypeDesc describes an array type.
-    pub fn element_type(&self) -> Option<&'a TypeDesc<'a>> {
+    pub fn element_type(&self) -> Option<&TypeDesc> {
         match self {
-            TypeDesc::Array { elem_ty, .. } => Some(*elem_ty),
-            TypeDesc::Pointer(elem_ty) => Some(*elem_ty),
+            TypeDesc::Array { elem_ty, .. } => Some(elem_ty),
+            TypeDesc::Pointer(elem_ty) => Some(elem_ty),
             _ => None,
         }
     }
 
     /// The type of the pointed-to element, if this TypeDesc describes a pointer.
-    pub fn pointee_type(&self) -> Option<&'a TypeDesc<'a>> {
+    pub fn pointee_type(&self) -> Option<&TypeDesc> {
         match self {
-            TypeDesc::Pointer(elem_ty) => Some(*elem_ty),
+            TypeDesc::Pointer(elem_ty) => Some(elem_ty),
             _ => None,
         }
     }
