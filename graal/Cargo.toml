@@ -9,9 +9,8 @@ ash = "0.36"
 bitflags = "1.2.1"
 gpu-allocator = "0.17"
 lazy_static = "1.4.0"
-raw-window-handle = "0.4"
+raw-window-handle = "0.5.0"
 slotmap = "1.0.2"
-fixedbitset = "0.3.2"
 graal-spirv = { path = "../graal-spirv" }
 #graal-macros = { path = "macros" }
 once_cell = "1.7.2"
@@ -33,12 +32,12 @@ features = [
     "wtypesbase" ]
 
 [dev-dependencies]
-winit = "0.24.0"
+winit = "0.27.2"
 obj = "0.10.2"
 inline-spirv = "0.1.4"
 openimageio = { path = "../../openimageio-rs" }
 tracing-subscriber = { version = "0.2.17", features = ["fmt"] }
-windows = { version = "0.34.0", features = ["Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security"] }
+windows = { version = "0.39.0", features = ["Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security"] }
 
 [build-dependencies]
 shaderc = "0.7.4"

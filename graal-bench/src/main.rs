@@ -9,7 +9,7 @@ use winit::{
     window::WindowBuilder,
 };
 
-use graal::{swapchain::Swapchain, vk};
+use graal::{vk, Swapchain};
 
 use crate::{
     background::BackgroundPass,
@@ -45,7 +45,7 @@ fn main() {
     let event_loop = EventLoop::new();
     let window = WindowBuilder::new().build(&event_loop).unwrap();
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
-    let mut context = graal::Context::with_surface(surface);
+    let (mut context, mut device) = graal::Context::with_surface(surface);
     let mut swapchain = unsafe { Swapchain::new(&context, surface, window.inner_size().into()) };
 
     // Create a scene that will hold our objects and buffers.
@@ -61,25 +61,22 @@ fn main() {
     let bkg_pass = BackgroundPass::new(&mut context);
     let geom_pass = GeometryPass::new(&mut context);
     let mut swapchain_size: (u32, u32) = window.inner_size().into();
-    let mut camera_control = CameraControl::new(glam::dvec2(
-        swapchain_size.0 as f64,
-        swapchain_size.1 as f64,
-    ));
+    let mut camera_control = CameraControl::new(glam::dvec2(swapchain_size.0 as f64, swapchain_size.1 as f64));
 
     let mut egui_ctx = egui::CtxRef::default();
     let mut egui_renderer = egui_renderer::EguiRenderer::new(&mut context, swapchain.format);
-    let mut winit_input_state = WinitInputState::from_pixels_per_point(1.0);
+    //let mut winit_input_state = WinitInputState::from_pixels_per_point(1.0);
 
     camera_control.center_on_bounds(&scene.bounds(), std::f64::consts::FRAC_PI_2);
     let mut dump_next_frame = false;
 
     event_loop.run(move |event, _, control_flow| {
         *control_flow = ControlFlow::Poll;
-        let mut egui_input_state = egui::RawInput::default();
+        //let mut egui_input_state = egui::RawInput::default();
 
         match event {
             Event::WindowEvent { window_id, event } => {
-                input_to_egui(1.0, &event, &mut winit_input_state, control_flow);
+                //input_to_egui(1.0, &event, &mut winit_input_state, control_flow);
 
                 match event {
                     WindowEvent::CloseRequested => {
@@ -97,8 +94,7 @@ fn main() {
                             winit::event::ElementState::Pressed => true,
                             winit::event::ElementState::Released => false,
                         };
-                        camera_control
-                            .handle_input(&CameraControlInput::MouseInput { button, pressed });
+                        camera_control.handle_input(&CameraControlInput::MouseInput { button, pressed });
                     }
                     WindowEvent::KeyboardInput { input, .. } => {
                         if let Some(winit::event::VirtualKeyCode::F11) = input.virtual_keycode {
@@ -114,10 +110,7 @@ fn main() {
                         swapchain_size = size.into();
                         eprintln!("window resized: {},{}", swapchain_size.0, swapchain_size.1);
                         swapchain.resize(&context, swapchain_size);
-                        camera_control.set_screen_size(glam::dvec2(
-                            swapchain_size.0 as f64,
-                            swapchain_size.1 as f64,
-                        ));
+                        camera_control.set_screen_size(glam::dvec2(swapchain_size.0 as f64, swapchain_size.1 as f64));
                     },
                     _ => {}
                 }
@@ -169,11 +162,9 @@ fn main() {
                         .width(150.0)
                         .selected_text("foo")
                         .show_ui(ui, |ui| {
-                            egui::CollapsingHeader::new("Dev")
-                                .default_open(true)
-                                .show(ui, |ui| {
-                                    ui.label("contents");
-                                });
+                            egui::CollapsingHeader::new("Dev").default_open(true).show(ui, |ui| {
+                                ui.label("contents");
+                            });
                         });
                 });
 

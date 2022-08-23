@@ -1,6 +1,5 @@
 //! Generic geometry (G-buffer) generation pass
 use crate::{camera::Camera, mesh::Vertex3D, scene::Scene, shader::create_shader_module};
-use egui::CursorIcon::Default;
 use glam::{Mat4, Vec4};
 use graal::{ash::version::DeviceV1_0, vk, FragmentOutputInterface, VertexInputInterfaceExt};
 use inline_spirv::include_spirv;
@@ -413,10 +412,7 @@ impl GeometryPass {
                         &g.depth,
                         AttachmentLoadOp::Clear {
                             value: vk::ClearValue {
-                                depth_stencil: vk::ClearDepthStencilValue {
-                                    depth: 1.0,
-                                    stencil: 0,
-                                },
+                                depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
                             },
                         },
                     )

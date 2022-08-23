@@ -163,9 +163,11 @@ pub enum TypeDesc {
     Primitive(PrimitiveType),
     /// Array type. (typedesc + length + stride)
     Array {
-        elem_ty: Box<TypeDesc>,
+        elem_ty: Arc<TypeDesc>,
         len: usize,
     },
+    /// Runtime array type. Array without a known length.
+    RuntimeArray(Arc<TypeDesc>),
     /// Vector type (ty,size).
     Vector {
         elem_ty: PrimitiveType,

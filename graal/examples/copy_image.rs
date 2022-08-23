@@ -1,7 +1,7 @@
 use ash::vk::{BufferUsageFlags, Rect2D, SampleCountFlags};
 use graal::{
-    swapchain::Swapchain, vk, BufferResourceCreateInfo, Frame, FrameCreateInfo, ImageId, ImageInfo,
-    ImageResourceCreateInfo, MemoryLocation, ResourceId,
+    vk, BufferResourceCreateInfo, Frame, ImageId, ImageInfo, ImageResourceCreateInfo, MemoryLocation, ResourceId,
+    SubmitInfo, Swapchain,
 };
 use raw_window_handle::HasRawWindowHandle;
 use std::{mem, path::Path, ptr};
@@ -124,7 +124,7 @@ fn load_image(
         vk::AccessFlags::TRANSFER_READ,
         vk::PipelineStageFlags::TRANSFER,
     );
-    pass.set_record_callback(move |context, _, command_buffer| unsafe {
+    pass.set_record_callback(Box::new(move |context, _, command_buffer| unsafe {
         let device = context.vulkan_device();
         let regions = &[vk::BufferImageCopy {
             buffer_offset: 0,
@@ -151,9 +151,10 @@ fn load_image(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             regions,
         );
-    });
+    }));
     pass.finish();
-    device.destroy_buffer(staging_buffer.id);
+
+    frame.destroy_buffer(staging_buffer.id);
     (image_id, width, height)
 }
 
@@ -170,7 +171,7 @@ fn main() {
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
 
     let (device, mut context) = unsafe { graal::create_device_and_context(Some(surface)) };
-    let mut swapchain = unsafe { Swapchain::new(&device, surface, window.inner_size().into()) };
+    let mut swapchain = unsafe { device.create_swapchain(surface, window.inner_size().into()) };
     let mut swapchain_size = window.inner_size().into();
 
     event_loop.run(move |event, _, control_flow| {
@@ -183,7 +184,7 @@ fn main() {
                 }
                 WindowEvent::Resized(size) => unsafe {
                     swapchain_size = size.into();
-                    swapchain.resize(&device, swapchain_size);
+                    device.resize_swapchain(&mut swapchain, swapchain_size);
                 },
                 _ => {}
             },
@@ -191,8 +192,7 @@ fn main() {
                 window.request_redraw();
             }
             Event::RedrawRequested(_) => {
-                let swapchain_image =
-                    unsafe { swapchain.acquire_next_image(&device, context.create_semaphore()) };
+                let swapchain_image = unsafe { context.acquire_next_swapchain_image(&swapchain) };
 
                 let swapchain_image = match swapchain_image {
                     Ok(image) => image,
@@ -202,10 +202,7 @@ fn main() {
                     }
                 };
 
-                let mut frame = context.start_frame(FrameCreateInfo {
-                    collect_debug_info: true,
-                    happens_after: Default::default(),
-                });
+                let mut frame = Frame::new();
 
                 let (file_image_id, file_image_width, file_image_height) = load_image(
                     &device,
@@ -235,9 +232,8 @@ fn main() {
                 let blit_w = file_image_width.min(swapchain_size.0);
                 let blit_h = file_image_height.min(swapchain_size.1);
 
-                pass.set_record_callback(move |context, _, command_buffer| {
-                    let dst_image_handle =
-                        context.device().image_handle(swapchain_image.image_info.id);
+                pass.set_record_callback(Box::new(move |context, _, command_buffer| {
+                    let dst_image_handle = context.device().image_handle(swapchain_image.image_info.id);
                     let src_image_handle = context.device().image_handle(file_image_id);
 
                     let regions = &[vk::ImageBlit {
@@ -282,10 +278,11 @@ fn main() {
                             vk::Filter::NEAREST,
                         );
                     }
-                });
+                }));
                 pass.finish();
                 frame.present("P12", &swapchain_image);
-                frame.finish(&mut ());
+                context.submit_frame(&mut (), frame, &SubmitInfo::default());
+
                 device.destroy_image(file_image_id);
                 device.destroy_image(swapchain_image.image_info.id);
             }

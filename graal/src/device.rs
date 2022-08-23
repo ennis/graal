@@ -896,12 +896,12 @@ impl Resource {
         }
     }
 
-    pub(crate) fn image_mut(&mut self) -> &mut ImageResource {
+    /*pub(crate) fn image_mut(&mut self) -> &mut ImageResource {
         match &mut self.kind {
             ResourceKind::Image(r) => r,
             _ => panic!("expected an image resource"),
         }
-    }
+    }*/
 
     pub(crate) fn buffer(&self) -> &BufferResource {
         match &self.kind {
@@ -910,16 +910,16 @@ impl Resource {
         }
     }
 
-    pub(crate) fn buffer_mut(&mut self) -> &mut BufferResource {
+    /*pub(crate) fn buffer_mut(&mut self) -> &mut BufferResource {
         match &mut self.kind {
             ResourceKind::Buffer(r) => r,
             _ => panic!("expected a buffer resource"),
         }
-    }
+    }*/
 
-    pub(crate) fn is_frozen(&self) -> bool {
+    /*pub(crate) fn is_frozen(&self) -> bool {
         self.group.is_some()
-    }
+    }*/
 
     /// Sets the resource allocation for resources with delayed allocations.
     pub(crate) fn set_allocation(&mut self, alloc: ResourceAllocation) {
@@ -935,6 +935,7 @@ impl Resource {
 }
 
 pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
+pub(crate) type ResourceGroupMap = SlotMap<ResourceGroupId, ResourceGroup>;
 
 /// Destroys a resource and frees its device memory if it was allocated for this resource
 /// exclusively.
@@ -1172,8 +1173,8 @@ impl<Id: slotmap::Key, Obj> ObjectTracker<Id, Obj> {
 ///     - pipeline layouts
 pub(crate) struct DeviceObjects {
     pub(crate) resources: ResourceMap,
-    pub(crate) resource_groups: slotmap::SlotMap<ResourceGroupId, ResourceGroup>,
-    descriptor_set_layouts: slotmap::SlotMap<DescriptorSetLayoutId, vk::DescriptorSetLayout>,
+    pub(crate) resource_groups: ResourceGroupMap,
+    descriptor_set_layouts: SlotMap<DescriptorSetLayoutId, vk::DescriptorSetLayout>,
     descriptor_allocators: slotmap::SecondaryMap<DescriptorSetLayoutId, DescriptorSetAllocator>,
 
     discarded_pipeline_layouts: ZombieList<vk::PipelineLayout>,
@@ -1738,6 +1739,10 @@ impl Device {
     }
 
     /// Creates a resource group.
+    ///
+    /// Resource group hold a set of static resources that can be synchronized with as a group.
+    /// This is useful for large sets of long-lived static resources, like texture maps,
+    /// where it would be impractical to synchronize on each of them individually.
     pub fn create_resource_group(
         &self,
         dst_stage_mask: vk::PipelineStageFlags,

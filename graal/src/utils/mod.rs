@@ -22,7 +22,7 @@ pub fn blit_images<UserContext>(
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     );
-    pass.set_record_callback(move |context, _, command_buffer| {
+    pass.set_record_callback(Box::new(move |context, _, command_buffer| {
         let regions = &[vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask,
@@ -65,6 +65,6 @@ pub fn blit_images<UserContext>(
                 vk::Filter::NEAREST,
             );
         }
-    });
+    }));
     pass.finish();
 }

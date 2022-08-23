@@ -144,11 +144,11 @@ fn parse_types(module: &[u32]) -> HashMap<u32, TypeDesc> {
                 count,
             }) => {
                 let elem_ty = &tymap[&component_id];
-                if let TypeDesc::Primitive(elem_ty) = elem_ty {
+                if let TypeDesc::Primitive(elem_ty) = *elem_ty {
                     tymap.insert(
                         result_id,
                         TypeDesc::Vector {
-                            elem_ty: *elem_ty,
+                            elem_ty,
                             len: count as u8,
                         },
                     );
@@ -162,12 +162,12 @@ fn parse_types(module: &[u32]) -> HashMap<u32, TypeDesc> {
                 column_count,
             }) => {
                 let colty = &tymap[&column_type_id];
-                if let TypeDesc::Vector { elem_ty, len } = colty {
+                if let TypeDesc::Vector { elem_ty, len } = *colty {
                     tymap.insert(
                         result_id,
                         TypeDesc::Matrix {
-                            elem_ty: *elem_ty,
-                            rows: *len,
+                            elem_ty,
+                            rows: len,
                             columns: column_count as u8,
                         },
                     );
@@ -206,7 +206,8 @@ fn parse_types(module: &[u32]) -> HashMap<u32, TypeDesc> {
             }) => {
                 let image_ty = &tymap[&image_type_id];
                 if let TypeDesc::Image(img_ty) = image_ty {
-                    tymap.insert(result_id, TypeDesc::SampledImage(img_ty.clone()));
+                    let img_ty = img_ty.clone();
+                    tymap.insert(result_id, TypeDesc::SampledImage(img_ty));
                 } else {
                     panic!("expected image type")
                 };
@@ -216,11 +217,11 @@ fn parse_types(module: &[u32]) -> HashMap<u32, TypeDesc> {
                 type_id,
                 length_id: _,
             }) => {
-                let elem_ty = Box::new(tymap[&type_id].clone());
+                let elem_ty = Arc::new(tymap[&type_id].clone());
                 tymap.insert(result_id, TypeDesc::Array { elem_ty, len: 0 });
             }
             Instruction::TypeRuntimeArray(ITypeRuntimeArray { result_id, type_id }) => {
-                let elem_ty = Box::new(tymap[&type_id].clone());
+                let elem_ty = Arc::new(tymap[&type_id].clone());
                 tymap.insert(result_id, TypeDesc::Array { elem_ty, len: 0 });
             }
             Instruction::TypeStruct(ITypeStruct {
