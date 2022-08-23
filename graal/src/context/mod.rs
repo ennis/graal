@@ -211,7 +211,7 @@ pub(crate) struct SemaphoreSignal {
 }
 
 /// A pass within a frame.
-pub(crate) struct Pass<'a, UserContext> {
+pub struct Pass<'a, UserContext> {
     /// Name of this pass, for debugging purposes.
     name: String,
 
@@ -339,107 +339,120 @@ impl<'a, UserContext> Pass<'a, UserContext> {
 // PassBuilder
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-pub struct PassBuilder<'a, 'b, UserContext> {
-    frame: &'a mut Frame<'b, UserContext>,
-    pass: ManuallyDrop<Pass<'b, UserContext>>,
+pub struct PassBuilder<'a, UserContext> {
+    /// Name of this pass, for debugging purposes.
+    name: String,
+
+    ty: PassType,
+    async_queue: bool,
+
+    /// Pass callback.
+    eval: Option<PassEvaluationCallback<'a, UserContext>>,
+
+    /// Resource dependencies.
+    accesses: Vec<ResourceAccess>,
+
+    /// Semaphores to wait on before starting the pass.
+    external_semaphore_waits: Vec<SemaphoreWait>,
+
+    /// Semaphores to signal after finishing the pass.
+    external_semaphore_signals: Vec<SemaphoreSignal>,
 }
 
-impl<'a, 'b, UserContext> Drop for PassBuilder<'a, 'b, UserContext> {
-    fn drop(&mut self) {
-        panic!("PassBuilder object dropped. Use `PassBuilder::finished` instead")
+impl<'a, UserContext> PassBuilder<'a, UserContext> {
+    /// Creates a new pass description.
+    pub fn new() -> PassBuilder<'a, UserContext> {
+        PassBuilder {
+            name: "".to_string(),
+            ty: PassType::Graphics,
+            async_queue: true,
+            eval: None,
+            accesses: vec![],
+            external_semaphore_waits: vec![],
+            external_semaphore_signals: vec![],
+        }
     }
-}
 
-impl<'a, 'b, UserContext> PassBuilder<'a, 'b, UserContext> {
+    pub fn name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    pub fn queue(mut self, ty: PassType) -> Self {
+        self.ty = ty;
+        self
+    }
+
     /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
     /// before starting.
-    pub fn add_external_semaphore_wait(
-        &mut self,
+    pub fn external_semaphore_wait(
+        mut self,
         semaphore: vk::Semaphore,
         dst_stage: vk::PipelineStageFlags,
         wait_kind: SemaphoreWaitKind,
-    ) {
-        self.pass.external_semaphore_waits.push(SemaphoreWait {
+    ) -> Self {
+        self.external_semaphore_waits.push(SemaphoreWait {
             semaphore,
             owned: false,
             dst_stage,
             wait_kind,
-        })
+        });
+        self
     }
 
     /// Adds a semaphore signal operation: when finished, the pass will signal the specified semaphore.
-    pub fn add_external_semaphore_signal(&mut self, semaphore: vk::Semaphore, signal_kind: SemaphoreSignalKind) {
-        self.pass
-            .external_semaphore_signals
-            .push(SemaphoreSignal { semaphore, signal_kind })
+    pub fn external_semaphore_signal(mut self, semaphore: vk::Semaphore, signal_kind: SemaphoreSignalKind) -> Self {
+        self.external_semaphore_signals
+            .push(SemaphoreSignal { semaphore, signal_kind });
+
+        self
     }
 
     /// Registers an image access made by this pass.
-    pub fn add_image_dependency(
-        &mut self,
+    pub fn image_dependency(
+        mut self,
         id: ImageId,
         access_mask: vk::AccessFlags,
         stage_mask: vk::PipelineStageFlags,
         initial_layout: vk::ImageLayout,
         final_layout: vk::ImageLayout,
-    ) {
-        self.pass.accesses.push(ResourceAccess {
+    ) -> Self {
+        self.accesses.push(ResourceAccess {
             id: id.resource_id(),
             access_mask,
             stage_mask,
             initial_layout,
             final_layout,
-        })
+        });
+        self
     }
 
-    pub fn add_buffer_dependency(
-        &mut self,
+    pub fn buffer_dependency(
+        mut self,
         id: BufferId,
         access_mask: vk::AccessFlags,
         stage_mask: vk::PipelineStageFlags,
-    ) {
-        self.pass.accesses.push(ResourceAccess {
+    ) -> Self {
+        self.accesses.push(ResourceAccess {
             id: id.resource_id(),
             access_mask,
             stage_mask,
             initial_layout: vk::ImageLayout::UNDEFINED,
             final_layout: vk::ImageLayout::UNDEFINED,
-        })
+        });
+        self
     }
 
     /// Sets the command buffer recording function for this pass.
     /// The handler will be called when building the command buffer, on batch submission.
-    pub fn set_record_callback(&mut self, record_cb: CommandCallback<'b, UserContext>) {
-        self.pass.eval = Some(PassEvaluationCallback::CommandBuffer(record_cb));
+    pub fn record_callback(mut self, record_cb: CommandCallback<'a, UserContext>) -> Self {
+        self.eval = Some(PassEvaluationCallback::CommandBuffer(record_cb));
+        self
     }
 
-    pub fn set_submit_callback(&mut self, submit_cb: QueueCallback<'b, UserContext>) {
-        self.pass.eval = Some(PassEvaluationCallback::Queue(submit_cb));
-    }
-
-    /// Ends the current pass.
-    pub fn finish(mut self) {
-        let pass = unsafe {
-            // SAFETY: self.pass not used afterwards, including Drop
-            ManuallyDrop::take(&mut self.pass)
-        };
-        self.frame.passes.push(pass);
-
-        /*if self.frame.inner.collect_sync_debug_info {
-            let mut info = SyncDebugInfo::new();
-
-            // current resource tracking info
-            let objects = self.frame.context.device.objects.lock().unwrap();
-            for (id, r) in objects.resources.iter() {
-                info.tracking.insert(id, r.tracking);
-            }
-            // current sync table
-            info.xq_sync_table = self.frame.inner.xq_sync_table;
-            self.frame.inner.sync_debug_info.push(info);
-        }*/
-
-        // skip running the panicking destructor
-        mem::forget(self)
+    pub fn submit_callback(mut self, submit_cb: QueueCallback<'a, UserContext>) -> Self {
+        self.eval = Some(PassEvaluationCallback::Queue(submit_cb));
+        self
     }
 }
 
@@ -467,12 +480,6 @@ enum FrameCommand {
     },
 }
 
-pub struct Frame<'a, UserContext> {
-    passes: Vec<Pass<'a, UserContext>>,
-    initial_wait: QueueSerialNumbers,
-    commands: Vec<(usize, FrameCommand)>,
-}
-
 #[derive(Clone, Debug)]
 pub struct PresentOperationResult {
     pub swapchain: vk::SwapchainKHR,
@@ -486,6 +493,18 @@ pub struct SubmitResult {
     pub future: GpuFuture,
     /// Results of present operations.
     pub present_results: Vec<PresentOperationResult>,
+}
+
+pub struct Frame<'a, UserContext> {
+    passes: Vec<Pass<'a, UserContext>>,
+    initial_wait: QueueSerialNumbers,
+    commands: Vec<(usize, FrameCommand)>,
+}
+
+impl<'a, UserContext> Default for Frame<'a, UserContext> {
+    fn default() -> Self {
+        Frame::new()
+    }
 }
 
 impl<'a, UserContext> fmt::Debug for Frame<'a, UserContext> {
@@ -504,6 +523,10 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             initial_wait: Default::default(),
             commands: vec![],
         }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.passes.is_empty() && self.commands.is_empty()
     }
 
     /// Adds a dependency on a GPU future object.
@@ -535,6 +558,30 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         ));
     }
 
+    pub fn add_pass(&mut self, pass: PassBuilder<'a, UserContext>) {
+        let pass_index = self.passes.len();
+        self.passes.push(Pass {
+            name: pass.name,
+            frame_index: pass_index,
+            ty: pass.ty,
+            async_queue: pass.async_queue,
+            eval: pass.eval,
+            accesses: pass.accesses,
+            external_semaphore_waits: pass.external_semaphore_waits,
+            external_semaphore_signals: pass.external_semaphore_signals,
+            snn: Default::default(),
+            preds: vec![],
+            signal_queue_timelines: false,
+            src_stage_mask: Default::default(),
+            dst_stage_mask: Default::default(),
+            image_memory_barriers: vec![],
+            buffer_memory_barriers: vec![],
+            global_memory_barrier: None,
+            wait_serials: Default::default(),
+            wait_dst_stages: Default::default(),
+        })
+    }
+
     pub fn destroy_image(&mut self, image_id: ImageId) {
         self.commands
             .push((self.passes.len(), FrameCommand::DestroyImage { image: image_id }));
@@ -545,59 +592,20 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             .push((self.passes.len(), FrameCommand::DestroyBuffer { buffer: buffer_id }));
     }
 
-    /// Starts a graphics pass.
-    pub fn start_graphics_pass<'frame>(&'frame mut self, name: &str) -> PassBuilder<'frame, 'a, UserContext> {
-        self.start_pass(name, PassType::Graphics, false)
-    }
-
-    /// Starts a compute pass
-    pub fn start_compute_pass<'frame>(
-        &'frame mut self,
-        name: &str,
-        async_compute: bool,
-    ) -> PassBuilder<'frame, 'a, UserContext> {
-        self.start_pass(name, PassType::Compute, async_compute)
-    }
-
-    /// Starts a transfer pass
-    pub fn start_transfer_pass<'frame>(
-        &'frame mut self,
-        name: &str,
-        async_transfer: bool,
-    ) -> PassBuilder<'frame, 'a, UserContext> {
-        self.start_pass(name, PassType::Transfer, async_transfer)
-    }
-
     /// Presents a swapchain image to the associated swapchain.
     pub fn present(&mut self, name: &str, image: &SwapchainImage) {
-        let mut pass = self.start_pass(name, PassType::Present, false);
-
-        pass.pass.eval = Some(PassEvaluationCallback::Present {
-            swapchain: image.swapchain_handle,
-            image_index: image.image_index,
-        });
-        pass.add_image_dependency(
+        let mut pass = PassBuilder::new().queue(PassType::Present).image_dependency(
             image.image_info.id,
             vk::AccessFlags::MEMORY_READ,
             vk::PipelineStageFlags::ALL_COMMANDS, // ?
             vk::ImageLayout::PRESENT_SRC_KHR,
             vk::ImageLayout::PRESENT_SRC_KHR,
         );
-        pass.finish();
-    }
-
-    /// Common code for `start_xxx_pass`
-    fn start_pass<'frame>(
-        &'frame mut self,
-        name: &str,
-        ty: PassType,
-        async_pass: bool,
-    ) -> PassBuilder<'frame, 'a, UserContext> {
-        let pass_index = self.passes.len();
-        PassBuilder {
-            frame: self,
-            pass: ManuallyDrop::new(Pass::new(name, pass_index, ty, async_pass)),
-        }
+        pass.eval = Some(PassEvaluationCallback::Present {
+            swapchain: image.swapchain_handle,
+            image_index: image.image_index,
+        });
+        self.add_pass(pass);
     }
 
     /*/// Dumps the frame to a JSON object.
@@ -1080,7 +1088,7 @@ impl Context {
         submit_info: &SubmitInfo,
     ) -> SubmitResult {
         let frame_number = FrameNumber(self.submitted_frame_count + 1);
-        self.device.start_frame(frame_number);
+        self.device.enter_frame(frame_number);
 
         //let base_sn = self.last_sn;
         //let wait_init = submit_info.happens_after.serials;
@@ -1112,7 +1120,7 @@ impl Context {
         self.submitted_frame_count += 1;
         self.last_sn = last_sn;
 
-        self.device.end_frame();
+        self.device.exit_frame();
         result
     }
 

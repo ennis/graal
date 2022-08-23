@@ -631,14 +631,14 @@ impl Device {
         swapchain.format = image_format.format;
     }
 
-    pub(crate) fn start_frame(&self, frame_number: FrameNumber) {
+    pub(crate) fn enter_frame(&self, frame_number: FrameNumber) {
         use std::sync::atomic::Ordering::Relaxed;
         let prev = self.context_state.is_building_frame.swap(true, Relaxed);
         assert!(!prev);
         self.context_state.last_started_frame.store(frame_number.0, Relaxed);
     }
 
-    pub(crate) fn end_frame(&self) {
+    pub(crate) fn exit_frame(&self) {
         use std::sync::atomic::Ordering::Relaxed;
         let prev = self.context_state.is_building_frame.swap(false, Relaxed);
         assert!(prev);
