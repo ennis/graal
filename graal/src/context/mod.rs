@@ -7,7 +7,7 @@ use crate::{
         AccessTracker, BufferResource, Device, ImageResource, Resource, ResourceAllocation, ResourceGroupMap,
         ResourceKind, ResourceMap, ResourceTrackingInfo,
     },
-    serial::{FrameNumber, QueueSerialNumbers, SubmissionNumber},
+    serial::{FrameNumber, QueueProgress, SubmissionNumber},
     BufferId, ImageId, ImageInfo, ImageRegistrationInfo, ResourceGroupId, ResourceId, ResourceOwnership,
     ResourceRegistrationInfo, Swapchain, SwapchainImage, MAX_QUEUES,
 };
@@ -25,9 +25,6 @@ use std::{
 use tracing::trace_span;
 
 pub use crate::context::submit::RecordingContext;
-
-/// Maximum time to wait for batches to finish in `SubmissionState::wait`.
-pub(crate) const SEMAPHORE_WAIT_TIMEOUT_NS: u64 = 5_000_000_000;
 
 pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     match count {
@@ -252,7 +249,7 @@ pub struct Pass<'a, UserContext> {
     buffer_memory_barriers: Vec<vk::BufferMemoryBarrier>,
     global_memory_barrier: Option<vk::MemoryBarrier>,
 
-    wait_serials: QueueSerialNumbers,
+    wait_serials: QueueProgress,
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
 }
 
@@ -486,18 +483,21 @@ pub struct PresentOperationResult {
     pub result: vk::Result,
 }
 
+/// The result of a frame submission.
 #[derive(Clone, Debug)]
-/// The result of a frame submission
 pub struct SubmitResult {
-    /// GPU future for the frame.
-    pub future: GpuFuture,
-    /// Results of present operations.
+    /// Progress values for each queue (reached serials) when the frame will have completed execution.
+    ///
+    /// To block until the frame is completed, use `Device::wait` with these progress values.
+    pub progress: QueueProgress,
+
+    /// Results of `vkQueuePresent` calls made during submission of the frame.
     pub present_results: Vec<PresentOperationResult>,
 }
 
 pub struct Frame<'a, UserContext> {
     passes: Vec<Pass<'a, UserContext>>,
-    initial_wait: QueueSerialNumbers,
+    initial_wait: QueueProgress,
     commands: Vec<(usize, FrameCommand)>,
 }
 
@@ -529,11 +529,11 @@ impl<'a, UserContext> Frame<'a, UserContext> {
         self.passes.is_empty() && self.commands.is_empty()
     }
 
-    /// Adds a dependency on a GPU future object.
+    /// Adds a dependency on the completion of previous queue operations.
     ///
     /// Execution of the *whole* frame will wait for the operation represented by the future to complete.
-    pub fn add_dependency(&mut self, future: GpuFuture) {
-        self.initial_wait = self.initial_wait.join(future.serials);
+    pub fn add_dependency(&mut self, progress: QueueProgress) {
+        self.initial_wait = self.initial_wait.join(progress);
     }
 
     /// Adds an image to a resource group.
@@ -884,7 +884,7 @@ fn local_pass_index(serial: u64, frame_base_serial: u64) -> usize {
 /// Stores the set of resources owned by a currently executing frame.
 #[derive(Debug)]
 struct FrameInFlight {
-    signalled_serials: QueueSerialNumbers,
+    signalled_serials: QueueProgress,
     //transient_allocations: Vec<gpu_allocator::vulkan::Allocation>,
     command_pools: Vec<submit::CommandAllocator>,
     semaphores: Vec<vk::Semaphore>,
@@ -892,40 +892,10 @@ struct FrameInFlight {
     //framebuffers: Vec<vk::Framebuffer>,
 }
 
-/// Represents a GPU operation that may have not finished yet.
-#[derive(Copy, Clone, Debug)]
-pub struct GpuFuture {
-    pub(crate) serials: QueueSerialNumbers,
-}
-
-impl Default for GpuFuture {
-    fn default() -> Self {
-        GpuFuture::new()
-    }
-}
-
-impl GpuFuture {
-    /// Returns an "empty" GPU future that represents an already completed operation.
-    /// Waiting on this future always returns immediately.
-    pub const fn new() -> GpuFuture {
-        GpuFuture {
-            serials: QueueSerialNumbers::new(),
-        }
-    }
-
-    /// Returns a future representing the moment when the operations represented
-    /// by both `self` and `other` have completed.
-    pub fn join(&self, other: GpuFuture) -> GpuFuture {
-        GpuFuture {
-            serials: self.serials.join(other.serials),
-        }
-    }
-}
-
 /// Collected debugging information about a frame.
 struct SyncDebugInfo {
     tracking: slotmap::SecondaryMap<ResourceId, ResourceTrackingInfo>,
-    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
+    xq_sync_table: [QueueProgress; MAX_QUEUES],
 }
 
 impl SyncDebugInfo {
@@ -939,7 +909,7 @@ impl SyncDebugInfo {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SubmitInfo {
-    pub happens_after: GpuFuture,
+    pub happens_after: QueueProgress,
     pub collect_debug_info: bool,
 }
 
@@ -951,8 +921,6 @@ pub struct Context {
     device: Arc<Device>,
     /// Free semaphores guaranteed to be in the unsignalled state.
     semaphore_pool: Vec<vk::Semaphore>,
-    /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
-    timelines: [vk::Semaphore; MAX_QUEUES],
     /// Command buffer submission state.
     submit_state: submit::SubmitState,
     /// The serial of the last submitted pass.
@@ -972,32 +940,9 @@ impl fmt::Debug for Context {
 
 impl Context {
     /// Creates a new context with the given device.
-    pub fn with_device(device: Device) -> Context {
-        let mut timelines: [vk::Semaphore; MAX_QUEUES] = Default::default();
-
-        let mut timeline_create_info = vk::SemaphoreTypeCreateInfo {
-            semaphore_type: vk::SemaphoreType::TIMELINE,
-            initial_value: 0,
-            ..Default::default()
-        };
-
-        let semaphore_create_info = vk::SemaphoreCreateInfo {
-            p_next: &mut timeline_create_info as *mut _ as *mut c_void,
-            ..Default::default()
-        };
-
-        for i in timelines.iter_mut() {
-            *i = unsafe {
-                device
-                    .device
-                    .create_semaphore(&semaphore_create_info, None)
-                    .expect("failed to create semaphore")
-            };
-        }
-
+    pub(crate) unsafe fn new(device: Device) -> Context {
         Context {
             device: Arc::new(device),
-            timelines,
             submit_state: submit::SubmitState::new(),
             semaphore_pool: vec![],
             last_sn: 0,
@@ -1104,7 +1049,7 @@ impl Context {
                 resource_groups,
                 &mut frame,
                 self.last_sn,
-                submit_info.happens_after.serials,
+                submit_info.happens_after,
             )
         };
 
@@ -1131,27 +1076,6 @@ impl Context {
     pub fn current_frame_number(&self) -> FrameNumber {
         //assert!(self.is_building_frame, "not building a frame");
         FrameNumber(self.submitted_frame_count + 1)
-    }
-
-    pub(crate) fn wait(&self, serials: &QueueSerialNumbers) {
-        let _span = trace_span!("Waiting for serials", ?serials);
-
-        let wait_info = vk::SemaphoreWaitInfo {
-            semaphore_count: self.timelines.len() as u32,
-            p_semaphores: self.timelines.as_ptr(),
-            p_values: serials.0.as_ptr(),
-            ..Default::default()
-        };
-        unsafe {
-            self.device
-                .device
-                .wait_semaphores(&wait_info, SEMAPHORE_WAIT_TIMEOUT_NS)
-                .expect("error waiting for batch");
-        }
-    }
-
-    pub fn wait_for(&mut self, future: GpuFuture) {
-        self.wait(&future.serials);
     }
 }
 

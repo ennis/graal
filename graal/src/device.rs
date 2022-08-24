@@ -1,6 +1,6 @@
 use crate::{
     context::{get_vk_sample_count, SemaphoreWait},
-    is_write_access, platform_impl, Context, FrameNumber, QueueSerialNumbers, SubmissionNumber, VULKAN_ENTRY,
+    is_write_access, platform_impl, Context, FrameNumber, QueueProgress, SubmissionNumber, VULKAN_ENTRY,
     VULKAN_INSTANCE,
 };
 use ash::{vk, vk::Handle};
@@ -16,6 +16,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64},
         Arc, Mutex,
     },
+    time::Duration,
 };
 use tracing::{trace, trace_span};
 
@@ -97,13 +98,15 @@ pub(crate) struct QueueIndices {
 #[derive(Copy, Clone, Default)]
 pub(crate) struct QueuesInfo {
     /// Number of created queues.
-    pub queue_count: usize,
+    pub(crate) queue_count: usize,
     /// Queue indices by usage.
-    pub indices: QueueIndices,
+    pub(crate) indices: QueueIndices,
     /// The queue family index of each queue. The first `queue_count` entries are valid, the rest is unspecified.
-    pub families: [u32; MAX_QUEUES],
+    pub(crate) families: [u32; MAX_QUEUES],
     /// The queue handle of each queue. The first `queue_count` entries are valid, the rest is unspecified.
-    pub queues: [vk::Queue; MAX_QUEUES],
+    pub(crate) queues: [vk::Queue; MAX_QUEUES],
+    /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
+    pub(crate) timelines: [vk::Semaphore; MAX_QUEUES],
 }
 
 pub(crate) struct ContextState {
@@ -459,28 +462,45 @@ impl Device {
             2
         };
 
-        let mut queues_info = QueuesInfo::default();
+        //let mut queues_info = QueuesInfo::default();
+        let mut queues = [vk::Queue::null(); MAX_QUEUES];
+        let mut queue_families = [0u32; MAX_QUEUES];
 
-        queues_info.queues[graphics_queue_index as usize] = graphics_queue;
-        queues_info.queues[compute_queue_index as usize] = compute_queue;
-        queues_info.queues[transfer_queue_index as usize] = transfer_queue;
+        queues[graphics_queue_index as usize] = graphics_queue;
+        queues[compute_queue_index as usize] = compute_queue;
+        queues[transfer_queue_index as usize] = transfer_queue;
 
-        queues_info.families[graphics_queue_index as usize] = graphics_queue_family;
-        queues_info.families[compute_queue_index as usize] = compute_queue_family;
-        queues_info.families[transfer_queue_index as usize] = transfer_queue_family;
+        queue_families[graphics_queue_index as usize] = graphics_queue_family;
+        queue_families[compute_queue_index as usize] = compute_queue_family;
+        queue_families[transfer_queue_index as usize] = transfer_queue_family;
 
-        queues_info.indices = QueueIndices {
-            graphics: graphics_queue_index,
-            compute: compute_queue_index,
-            present: graphics_queue_index,
-            transfer: transfer_queue_index,
-        };
-
-        queues_info.queue_count = *[graphics_queue_index, compute_queue_index, transfer_queue_index]
+        let queue_count = *[graphics_queue_index, compute_queue_index, transfer_queue_index]
             .iter()
             .max()
             .unwrap() as usize
             + 1;
+
+        // create a timeline semaphore for each queue, for use by `Context`
+        let mut queue_timelines = [vk::Semaphore::null(); MAX_QUEUES];
+        {
+            let mut timeline_create_info = vk::SemaphoreTypeCreateInfo {
+                semaphore_type: vk::SemaphoreType::TIMELINE,
+                initial_value: 0,
+                ..Default::default()
+            };
+            let semaphore_create_info = vk::SemaphoreCreateInfo {
+                p_next: &mut timeline_create_info as *mut _ as *mut c_void,
+                ..Default::default()
+            };
+
+            for i in 0..queue_count {
+                queue_timelines[i] = unsafe {
+                    device
+                        .create_semaphore(&semaphore_create_info, None)
+                        .expect("failed to create semaphore")
+                };
+            }
+        }
 
         let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
             physical_device: phy.phy,
@@ -530,7 +550,18 @@ impl Device {
             physical_device_properties: phy.properties,
             //physical_device_features: phy.features,
             physical_device_memory_properties,
-            queues_info,
+            queues_info: QueuesInfo {
+                queue_count,
+                indices: QueueIndices {
+                    graphics: graphics_queue_index,
+                    compute: compute_queue_index,
+                    present: graphics_queue_index,
+                    transfer: transfer_queue_index,
+                },
+                families: queue_families,
+                queues,
+                timelines: queue_timelines,
+            },
             allocator: Mutex::new(allocator),
             vk_khr_swapchain,
             vk_khr_surface,
@@ -557,6 +588,12 @@ impl Device {
     pub fn graphics_queue(&self) -> (vk::Queue, u32) {
         let q = self.queues_info.indices.graphics as usize;
         (self.queues_info.queues[q], self.queues_info.families[q])
+    }
+
+    /// Returns the timeline semaphore for the specified queue.
+    pub fn queue_timeline(&self, queue_index: usize) -> vk::Semaphore {
+        assert!(queue_index < self.queues_info.queue_count);
+        self.queues_info.timelines[queue_index]
     }
 
     /// Creates a swapchain object.
@@ -652,7 +689,7 @@ impl Device {
 
 pub unsafe fn create_device_and_context(present_surface: Option<vk::SurfaceKHR>) -> (Arc<Device>, Context) {
     let device = Device::new(present_surface);
-    let context = Context::with_device(device);
+    let context = Context::new(device);
     (context.device().clone(), context)
 }
 
@@ -792,7 +829,7 @@ pub(crate) struct ResourceTrackingInfo {
     /// Unused?
     pub(crate) owner_queue_family: u32,
     /// Current readers of the resource.
-    pub(crate) readers: QueueSerialNumbers,
+    pub(crate) readers: QueueProgress,
     /// Current writer of the resource.
     pub(crate) writer: Option<AccessTracker>,
     /// Current image layout if the resource is an image. Ignored otherwise.
@@ -1008,7 +1045,7 @@ pub struct BufferRegistrationInfo<'a> {
 pub(crate) struct ResourceGroup {
     /// The serials that a pass needs to wait for to ensure an execution dependency between the pass
     /// and all writers of the resources in the group.
-    pub(crate) wait_serials: QueueSerialNumbers,
+    pub(crate) wait_serials: QueueProgress,
     // ignored if waiting on multiple queues
     pub(crate) src_stage_mask: vk::PipelineStageFlags,
     pub(crate) dst_stage_mask: vk::PipelineStageFlags,
@@ -1376,7 +1413,7 @@ impl DeviceObjects {
     pub(crate) unsafe fn cleanup_resources(
         &mut self,
         device: &Device,
-        completed_serials: QueueSerialNumbers,
+        completed_serials: QueueProgress,
         completed_frame: FrameNumber,
     ) {
         let _ = trace_span!("Resource cleanup");
@@ -1461,7 +1498,7 @@ impl DeviceObjects {
 
 impl Device {
     /// TODO docs
-    pub(crate) unsafe fn cleanup_resources(&self, completed_serials: QueueSerialNumbers, completed_frame: FrameNumber) {
+    pub(crate) unsafe fn cleanup_resources(&self, completed_serials: QueueProgress, completed_frame: FrameNumber) {
         let mut objects = self.objects.lock().expect("failed to lock resources");
         objects.cleanup_resources(self, completed_serials, completed_frame)
     }
@@ -2015,5 +2052,23 @@ impl Device {
     pub fn buffer_handle(&self, id: BufferId) -> vk::Buffer {
         let resources = self.objects.lock().expect("failed to lock resources");
         resources.resources.get(id.0).unwrap().buffer().handle
+    }
+
+    /// Waits for completion of queue commands.
+    pub fn wait(&self, progress: &QueueProgress, timeout: Duration) -> Result<(), vk::Result> {
+        let _span = trace_span!("Waiting for serials", ?progress);
+
+        let wait_info = vk::SemaphoreWaitInfo {
+            semaphore_count: self.queues_info.queue_count as u32,
+            p_semaphores: self.queues_info.timelines.as_ptr(),
+            p_values: progress.0.as_ptr(),
+            ..Default::default()
+        };
+
+        let timeout_ns = timeout.as_nanos();
+        assert!(timeout_ns < u64::MAX as u128, "timeout value too large");
+        let timeout_ns = timeout_ns as u64;
+
+        unsafe { self.device.wait_semaphores(&wait_info, timeout_ns) }
     }
 }

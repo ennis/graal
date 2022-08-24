@@ -4,7 +4,7 @@ extern crate test;
 use test::Bencher;
 
 use ash::vk;
-use graal::{ash::vk::PipelineStageFlags, QueueSerialNumbers, SubmissionNumber};
+use graal::{ash::vk::PipelineStageFlags, QueueProgress, SubmissionNumber};
 use std::{fmt, fmt::Formatter};
 
 const EMPTY: vk::PipelineStageFlags = vk::PipelineStageFlags::empty();
@@ -146,7 +146,7 @@ struct PerStageTrackingInfo {
     compute: u64,
     transfer: u64,
     /// Sync sources from other queues.
-    foreign: QueueSerialNumbers,
+    foreign: QueueProgress,
 }
 
 /// Execution dependency tracker.
@@ -170,14 +170,8 @@ impl DependencyTracker {
     }
 
     /// Creates a new dependency tracker from the last known state.
-    pub fn new(
-        last_known_state: &[DependencyTracker],
-        this_snn: SubmissionNumber,
-    ) -> DependencyTracker {
-        let mut tracker = last_known_state
-            .last()
-            .cloned()
-            .unwrap_or(DependencyTracker::empty());
+    pub fn new(last_known_state: &[DependencyTracker], this_snn: SubmissionNumber) -> DependencyTracker {
+        let mut tracker = last_known_state.last().cloned().unwrap_or(DependencyTracker::empty());
         tracker.snn = this_snn;
         tracker
     }
@@ -211,12 +205,7 @@ impl DependencyTracker {
 impl fmt::Debug for PerStageTrackingInfo {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if self.draw.0 != 0 {
-            write!(
-                f,
-                "{:>2}.{:<3}",
-                self.draw.0,
-                pipeline_stage_short_name(self.draw.1)
-            )?;
+            write!(f, "{:>2}.{:<3}", self.draw.0, pipeline_stage_short_name(self.draw.1))?;
         } else {
             write!(f, "      ")?;
         }
@@ -271,12 +260,8 @@ impl PipelineSyncState {
                             || is_logically_earlier(stage.draw.1, src_stage))
                     {
                         stage.draw = (src, src_stage);
-                        stage.compute = stage
-                            .compute
-                            .max(prev_tables[src as usize].table[i_src].compute);
-                        stage.transfer = stage
-                            .transfer
-                            .max(prev_tables[src as usize].table[i_src].transfer);
+                        stage.compute = stage.compute.max(prev_tables[src as usize].table[i_src].compute);
+                        stage.transfer = stage.transfer.max(prev_tables[src as usize].table[i_src].transfer);
                     }
                 }
                 CS => {
@@ -285,31 +270,21 @@ impl PipelineSyncState {
                         stage.compute = src;
                         if prev_tables[src as usize].table[i_src].draw.0 > stage.draw.0
                             && ((stage.draw.1 == vk::PipelineStageFlags::empty())
-                                || is_logically_earlier(
-                                    stage.draw.1,
-                                    prev_tables[src as usize].table[i_src].draw.1,
-                                ))
+                                || is_logically_earlier(stage.draw.1, prev_tables[src as usize].table[i_src].draw.1))
                         {
                             stage.draw = prev_tables[src as usize].table[i_src].draw;
                         }
-                        stage.transfer = stage
-                            .transfer
-                            .max(prev_tables[src as usize].table[i_src].transfer);
+                        stage.transfer = stage.transfer.max(prev_tables[src as usize].table[i_src].transfer);
                     }
                 }
                 TR => {
                     // transfer pipeline
                     if src > stage.transfer {
                         stage.transfer = src;
-                        stage.compute = stage
-                            .compute
-                            .max(prev_tables[src as usize].table[i_src].compute);
+                        stage.compute = stage.compute.max(prev_tables[src as usize].table[i_src].compute);
                         if prev_tables[src as usize].table[i_src].draw.0 > stage.draw.0
                             && ((stage.draw.1 == vk::PipelineStageFlags::empty())
-                                || is_logically_earlier(
-                                    stage.draw.1,
-                                    prev_tables[src as usize].table[i_src].draw.1,
-                                ))
+                                || is_logically_earlier(stage.draw.1, prev_tables[src as usize].table[i_src].draw.1))
                         {
                             stage.draw = prev_tables[src as usize].table[i_src].draw;
                         }
@@ -370,13 +345,7 @@ impl DepMatrix {
         }
     }
 
-    pub fn add(
-        &mut self,
-        from: usize,
-        src: vk::PipelineStageFlags,
-        to: usize,
-        dst: vk::PipelineStageFlags,
-    ) {
+    pub fn add(&mut self, from: usize, src: vk::PipelineStageFlags, to: usize, dst: vk::PipelineStageFlags) {
         self.matrix[from * self.num_passes + to] = Dep(src, dst);
     }
 
@@ -509,39 +478,19 @@ fn bench_exec_dependencies_propagation(b: &mut Bencher) {
     passes.push(Pass::new(vk::PipelineStageFlags::TRANSFER));
     passes.push(Pass::new(vk::PipelineStageFlags::TRANSFER));*/
 
-    passes[2]
-        .deps
-        .push((1, vk::PipelineStageFlags::VERTEX_SHADER));
-    passes[3]
-        .deps
-        .push((1, vk::PipelineStageFlags::FRAGMENT_SHADER));
-    passes[4]
-        .deps
-        .push((2, vk::PipelineStageFlags::COMPUTE_SHADER));
-    passes[5]
-        .deps
-        .push((3, vk::PipelineStageFlags::COMPUTE_SHADER));
-    passes[5]
-        .deps
-        .push((4, vk::PipelineStageFlags::COMPUTE_SHADER));
-    passes[6]
-        .deps
-        .push((4, vk::PipelineStageFlags::VERTEX_SHADER));
-    passes[6]
-        .deps
-        .push((5, vk::PipelineStageFlags::FRAGMENT_SHADER));
-    passes[7]
-        .deps
-        .push((4, vk::PipelineStageFlags::FRAGMENT_SHADER));
-    passes[7]
-        .deps
-        .push((6, vk::PipelineStageFlags::FRAGMENT_SHADER));
+    passes[2].deps.push((1, vk::PipelineStageFlags::VERTEX_SHADER));
+    passes[3].deps.push((1, vk::PipelineStageFlags::FRAGMENT_SHADER));
+    passes[4].deps.push((2, vk::PipelineStageFlags::COMPUTE_SHADER));
+    passes[5].deps.push((3, vk::PipelineStageFlags::COMPUTE_SHADER));
+    passes[5].deps.push((4, vk::PipelineStageFlags::COMPUTE_SHADER));
+    passes[6].deps.push((4, vk::PipelineStageFlags::VERTEX_SHADER));
+    passes[6].deps.push((5, vk::PipelineStageFlags::FRAGMENT_SHADER));
+    passes[7].deps.push((4, vk::PipelineStageFlags::FRAGMENT_SHADER));
+    passes[7].deps.push((6, vk::PipelineStageFlags::FRAGMENT_SHADER));
     passes[8].deps.push((7, vk::PipelineStageFlags::TRANSFER));
 
     for i in 8..passes.len() - 1 {
-        passes[i + 1]
-            .deps
-            .push((i, vk::PipelineStageFlags::TRANSFER));
+        passes[i + 1].deps.push((i, vk::PipelineStageFlags::TRANSFER));
     }
 
     let n = passes.len();
@@ -570,12 +519,7 @@ fn bench_exec_dependencies_propagation(b: &mut Bencher) {
     for (i, p) in passes.iter().enumerate() {
         let mut table = tables.last().cloned().unwrap_or(PipelineSyncState::new());
         for &(src, dst_stage) in p.deps.iter() {
-            table.add_execution_dependency(
-                &tables,
-                src as u64,
-                passes[src].output_stage,
-                dst_stage,
-            );
+            table.add_execution_dependency(&tables, src as u64, passes[src].output_stage, dst_stage);
         }
         if i == 0 {
             println!("{:3} {:#?}", i, table);

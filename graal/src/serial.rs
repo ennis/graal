@@ -76,12 +76,12 @@ impl fmt::Debug for SubmissionNumber {
 /// A set of serial numbers, one for each queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 #[repr(transparent)]
-pub struct QueueSerialNumbers(pub [u64; MAX_QUEUES]);
+pub struct QueueProgress(pub [u64; MAX_QUEUES]);
 
-impl QueueSerialNumbers {
+impl QueueProgress {
     //
-    pub const fn new() -> QueueSerialNumbers {
-        QueueSerialNumbers([0; MAX_QUEUES])
+    pub const fn new() -> QueueProgress {
+        QueueProgress([0; MAX_QUEUES])
     }
 
     // TODO better name?
@@ -96,11 +96,11 @@ impl QueueSerialNumbers {
         false
     }*/
 
-    pub fn from_submission_number(snn: SubmissionNumber) -> QueueSerialNumbers {
+    pub fn from_submission_number(snn: SubmissionNumber) -> QueueProgress {
         Self::from_queue_serial(snn.queue(), snn.serial())
     }
 
-    pub fn from_queue_serial(queue: usize, serial: u64) -> QueueSerialNumbers {
+    pub fn from_queue_serial(queue: usize, serial: u64) -> QueueProgress {
         let mut s = Self::new();
         s[queue] = serial;
         s
@@ -110,19 +110,19 @@ impl QueueSerialNumbers {
         self.0[queue]
     }
 
-    pub fn join(&self, other: QueueSerialNumbers) -> QueueSerialNumbers {
+    pub fn join(&self, other: QueueProgress) -> QueueProgress {
         let mut r = *self;
         r.join_assign(other);
         r
     }
 
-    pub fn join_assign(&mut self, other: QueueSerialNumbers) {
+    pub fn join_assign(&mut self, other: QueueProgress) {
         for i in 0..MAX_QUEUES {
             self[i] = self[i].max(other[i]);
         }
     }
 
-    pub fn join_serial(&self, snn: SubmissionNumber) -> QueueSerialNumbers {
+    pub fn join_serial(&self, snn: SubmissionNumber) -> QueueProgress {
         let mut r = *self;
         r[snn.queue()] = r[snn.queue()].max(snn.serial());
         r
@@ -132,14 +132,10 @@ impl QueueSerialNumbers {
         self.0.iter()
     }
 
-    pub(crate) fn is_single_source_same_queue_and_frame(
-        &self,
-        queue: usize,
-        frame_base_serial: u64,
-    ) -> bool {
-        self.iter().enumerate().all(|(i, &sn)| {
-            (i != queue && sn == 0) || (i == queue && (sn == 0 || sn > frame_base_serial))
-        })
+    pub(crate) fn is_single_source_same_queue_and_frame(&self, queue: usize, frame_base_serial: u64) -> bool {
+        self.iter()
+            .enumerate()
+            .all(|(i, &sn)| (i != queue && sn == 0) || (i == queue && (sn == 0 || sn > frame_base_serial)))
     }
 
     //pub fn iter_mut(&mut self) -> impl Iterator<Item = &'_ mut u64> {
@@ -147,7 +143,7 @@ impl QueueSerialNumbers {
     //}
 }
 
-impl Deref for QueueSerialNumbers {
+impl Deref for QueueProgress {
     type Target = [u64];
 
     fn deref(&self) -> &Self::Target {
@@ -155,13 +151,13 @@ impl Deref for QueueSerialNumbers {
     }
 }
 
-impl DerefMut for QueueSerialNumbers {
+impl DerefMut for QueueProgress {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl PartialOrd for QueueSerialNumbers {
+impl PartialOrd for QueueProgress {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         let before = self.0.iter().zip(other.0.iter()).all(|(&a, &b)| a <= b);
 

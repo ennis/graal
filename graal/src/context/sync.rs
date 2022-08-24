@@ -7,7 +7,7 @@ use crate::{
     device::{
         AccessTracker, BufferResource, DeviceObjects, ImageResource, ResourceGroupMap, ResourceKind, ResourceMap,
     },
-    is_write_access, BufferId, Context, Device, Frame, FrameNumber, QueueSerialNumbers, ResourceGroupId, ResourceId,
+    is_write_access, BufferId, Context, Device, Frame, FrameNumber, QueueProgress, ResourceGroupId, ResourceId,
     SubmissionNumber, MAX_QUEUES,
 };
 use ash::vk;
@@ -25,7 +25,7 @@ struct SyncState {
     /// Set of all resources referenced in the frame
     temporary_set: TemporarySet,
     /// Serials to wait for before executing the frame.
-    initial_wait: QueueSerialNumbers,
+    initial_wait: QueueProgress,
 
     /// Cross-queue synchronization table.
     ///
@@ -88,7 +88,7 @@ struct SyncState {
     /// - Q1 has waited for pass SN 1 on Q0
     /// - Q2 has also waited for pass SN 1 on Q0
     /// - Q3 hasn't synchronized with anything
-    xq_sync_table: [QueueSerialNumbers; MAX_QUEUES],
+    xq_sync_table: [QueueProgress; MAX_QUEUES],
 
     collect_sync_debug_info: bool,
     sync_debug_info: Vec<SyncDebugInfo>,
@@ -133,7 +133,7 @@ fn add_memory_dependency<'a, UserContext>(
     state: &mut SyncState,
     passes: &mut [Pass<'a, UserContext>],
     dst_pass: &mut Pass<'a, UserContext>,
-    sources: QueueSerialNumbers,
+    sources: QueueProgress,
     barrier: PipelineBarrierDesc,
 ) {
     let q = dst_pass.snn.queue();
@@ -395,9 +395,9 @@ fn add_resource_dependency<'a, UserContext>(
             match resource.tracking.writer {
                 None => {
                     // no sources
-                    QueueSerialNumbers::default()
+                    QueueProgress::default()
                 }
-                Some(AccessTracker::Device(writer)) => QueueSerialNumbers::from_submission_number(writer),
+                Some(AccessTracker::Device(writer)) => QueueProgress::from_submission_number(writer),
                 Some(AccessTracker::Host) => {
                     // Shouldn't happen: WAW or RAW with the write being host access.
                     // FIXME: actually, it's possible when a host-mapped image, with linear storage
@@ -491,7 +491,7 @@ fn add_resource_to_group(
     match resource.tracking.writer {
         Some(AccessTracker::Device(writer)) => group
             .wait_serials
-            .join_assign(QueueSerialNumbers::from_submission_number(writer)),
+            .join_assign(QueueProgress::from_submission_number(writer)),
         Some(AccessTracker::Host) => {
             // FIXME why? it would make sense to add all upload buffers in a frame to a single group
             panic!("host-accessible resources cannot be added to a group")
@@ -544,7 +544,7 @@ pub(super) fn synchronize_and_track_resources<'a, UserContext>(
     resource_groups: &mut ResourceGroupMap,
     frame: &mut Frame<'a, UserContext>,
     base_sn: u64,
-    initial_wait: QueueSerialNumbers,
+    initial_wait: QueueProgress,
 ) -> u64 {
     // Play back the recorded frame, updating the resource states as we go
     let mut sync_state = SyncState {

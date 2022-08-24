@@ -3,16 +3,17 @@
 use crate::{
     context::{
         FrameInFlight, PassEvaluationCallback, PresentOperationResult, SemaphoreSignal, SemaphoreSignalKind,
-        SemaphoreWait, SemaphoreWaitKind, SubmitResult, SEMAPHORE_WAIT_TIMEOUT_NS,
+        SemaphoreWait, SemaphoreWaitKind, SubmitResult,
     },
-    serial::{QueueSerialNumbers, SubmissionNumber},
-    vk, Context, Frame, FrameNumber, GpuFuture, MAX_QUEUES,
+    serial::{QueueProgress, SubmissionNumber},
+    vk, Context, Frame, FrameNumber, MAX_QUEUES,
 };
 use std::{
     collections::VecDeque,
     ffi::{c_void, CString},
     ops::Deref,
     ptr,
+    time::Duration,
 };
 use tracing::trace_span;
 
@@ -73,7 +74,7 @@ impl CommandAllocator {
 
 /// Represents a queue submission (a call to vkQueueSubmit or vkQueuePresent)
 struct CommandBatch {
-    wait_serials: QueueSerialNumbers,
+    wait_serials: QueueProgress,
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
     signal_snn: SubmissionNumber,
     external_semaphore_waits: Vec<SemaphoreWait>,     // TODO arrayvec
@@ -121,7 +122,7 @@ impl Default for CommandBatch {
 /// States related to queue operations and the tracking of frames in flight.
 pub(super) struct SubmitState {
     /// Array containing the last submitted pass serials for each queue
-    last_signalled_serials: QueueSerialNumbers,
+    last_signalled_serials: QueueProgress,
 
     /// Pool of recycled command pools.
     command_pools: Vec<CommandAllocator>,
@@ -130,7 +131,7 @@ pub(super) struct SubmitState {
     in_flight: VecDeque<FrameInFlight>,
 
     /// The last completed pass serials for each queue
-    completed_serials: QueueSerialNumbers,
+    completed_serials: QueueProgress,
 
     /// Number of completed frames
     completed_frame_count: u64,
@@ -171,7 +172,7 @@ impl Context {
 
         // setup queue timeline signals if necessary
         if batch.signal_snn.serial() > 0 {
-            signal_semaphores.push(self.timelines[queue as usize]);
+            signal_semaphores.push(self.device.queue_timeline(queue));
             signal_semaphore_values.push(batch.signal_snn.serial());
             self.submit_state.last_signalled_serials[queue] = batch.signal_snn.serial();
         }
@@ -189,10 +190,10 @@ impl Context {
             }
         }
 
-        // setup queue timeline waits
+        // setup queue timeline wait values & stage masks (see VkTimelineSemaphoreSubmitInfo below).
         for (i, &w) in batch.wait_serials.iter().enumerate() {
             if w != 0 {
-                wait_semaphores.push(self.timelines[i]);
+                wait_semaphores.push(self.device.queue_timeline(i));
                 wait_semaphore_values.push(w);
                 wait_semaphore_dst_stages.push(batch.wait_dst_stages[i]);
             }
@@ -533,9 +534,7 @@ impl Context {
         });
 
         SubmitResult {
-            future: GpuFuture {
-                serials: self.submit_state.last_signalled_serials,
-            },
+            progress: self.submit_state.last_signalled_serials,
             present_results,
         }
     }
@@ -558,6 +557,9 @@ impl Context {
     pub(super) fn wait_for_frames_in_flight(&mut self) {
         let _span = trace_span!("Frame pacing").entered();
 
+        // Maximum time to wait for batches to finish.
+        const FRAME_PACING_TIMEOUT: Duration = Duration::from_secs(5);
+
         // pacing
         // FIXME instead of always waiting for the 2 previous frames, introduce "frame groups" (to bikeshed)
         // that define the granularity of the pacing. (i.e. wait for whole frame groups instead of individual frames)
@@ -566,7 +568,9 @@ impl Context {
             // two frames in flight already, must wait for the oldest one
             let f = self.submit_state.in_flight.pop_front().unwrap();
 
-            self.wait(&f.signalled_serials);
+            self.device
+                .wait(&f.signalled_serials, FRAME_PACING_TIMEOUT)
+                .expect("wait for completion of previous frame failed");
 
             // update completed serials
             // we just waited on those serials, so we know they are completed
