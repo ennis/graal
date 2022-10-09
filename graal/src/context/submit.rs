@@ -5,7 +5,7 @@ use crate::{
         FrameInFlight, PassEvaluationCallback, PresentOperationResult, SemaphoreSignal, SemaphoreSignalKind,
         SemaphoreWait, SemaphoreWaitKind, SubmitResult,
     },
-    serial::{QueueProgress, SubmissionNumber},
+    serial::{DeviceProgress, SubmissionNumber},
     vk, Context, Frame, FrameNumber, MAX_QUEUES,
 };
 use std::{
@@ -74,7 +74,7 @@ impl CommandAllocator {
 
 /// Represents a queue submission (a call to vkQueueSubmit or vkQueuePresent)
 struct CommandBatch {
-    wait_serials: QueueProgress,
+    wait_serials: DeviceProgress,
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
     signal_snn: SubmissionNumber,
     external_semaphore_waits: Vec<SemaphoreWait>,     // TODO arrayvec
@@ -122,7 +122,7 @@ impl Default for CommandBatch {
 /// States related to queue operations and the tracking of frames in flight.
 pub(super) struct SubmitState {
     /// Array containing the last submitted pass serials for each queue
-    last_signalled_serials: QueueProgress,
+    last_signalled_serials: DeviceProgress,
 
     /// Pool of recycled command pools.
     command_pools: Vec<CommandAllocator>,
@@ -131,7 +131,7 @@ pub(super) struct SubmitState {
     in_flight: VecDeque<FrameInFlight>,
 
     /// The last completed pass serials for each queue
-    completed_serials: QueueProgress,
+    completed_serials: DeviceProgress,
 
     /// Number of completed frames
     completed_frame_count: u64,
@@ -552,38 +552,54 @@ impl Context {
         self.submit_state.completed_frame_count >= serial.0
     }
 
-    /// Waits for all but the last submitted frame to finish and then recycles their resources.
-    /// Calls `cleanup_resources` internally.
-    pub(super) fn wait_for_frames_in_flight(&mut self) {
+    /// Reclaims the resources of the frames that have finished, and optionally waits for the specified progress.
+    ///
+    /// # Arguments
+    /// * wait_target progress to wait for before reclaiming finished frames
+    /// * wait_target_timeout timeout for the wait, ignored if `wait_target` is `None`.
+    ///
+    pub(super) fn retire_completed_frames(
+        &mut self,
+        wait_target: Option<DeviceProgress>,
+        wait_target_timeout: Duration,
+    ) -> Result<(), vk::Result> {
         let _span = trace_span!("Frame pacing").entered();
 
-        // Maximum time to wait for batches to finish.
-        const FRAME_PACING_TIMEOUT: Duration = Duration::from_secs(5);
+        if let Some(ref wait_target) = wait_target {
+            self.device.wait(wait_target, wait_target_timeout)?;
+        }
 
-        // pacing
-        // FIXME instead of always waiting for the 2 previous frames, introduce "frame groups" (to bikeshed)
-        // that define the granularity of the pacing. (i.e. wait for whole frame groups instead of individual frames)
-        // This is because in some workloads we submit a lot of small frames that target different surfaces (e.g. for compositing layers in kyute).
-        while self.submit_state.in_flight.len() >= 50 {
-            // two frames in flight already, must wait for the oldest one
-            let f = self.submit_state.in_flight.pop_front().unwrap();
+        // retire all finished frames and reclaim their resources, starting from the oldest
+        let current_progress = self.device.current_progress()?;
+        let mut should_cleanup_resources = false;
+        loop {
+            if self.submit_state.in_flight.is_empty() {
+                break;
+            }
 
-            self.device
-                .wait(&f.signalled_serials, FRAME_PACING_TIMEOUT)
-                .expect("wait for completion of previous frame failed");
+            let oldest_frame = self.submit_state.in_flight.front().unwrap();
+
+            // break if the frame isn't finished yet (the device hasn't yet reached its progress value)
+            if oldest_frame.signalled_serials > current_progress {
+                break;
+            }
+
+            // the frame has finished, do cleanup
+            should_cleanup_resources = true;
+            let oldest_frame = self.submit_state.in_flight.pop_front().unwrap();
 
             // update completed serials
             // we just waited on those serials, so we know they are completed
-            self.submit_state.completed_serials = f.signalled_serials;
+            self.submit_state.completed_serials = oldest_frame.signalled_serials;
 
             // Recycle the command pools allocated for the frame. The allocated command buffers
             // can then be reused for future submissions.
-            self.recycle_command_pools(f.command_pools);
+            self.recycle_command_pools(oldest_frame.command_pools);
 
             // Recycle the semaphores. They are guaranteed to be unsignalled since the frame must have
             // waited on them.
             unsafe {
-                self.recycle_semaphores(f.semaphores);
+                self.recycle_semaphores(oldest_frame.semaphores);
             }
 
             // TODO delayed allocation/automatic aliasing is being phased out. Replace with explicitly aliased resources and stream-ordered allocators.
@@ -597,13 +613,17 @@ impl Context {
             self.submit_state.completed_frame_count += 1;
         }
 
-        // given the new completed serials, free resources that have expired
-        unsafe {
-            // SAFETY: we just waited for the passes to finish
-            self.device.cleanup_resources(
-                self.submit_state.completed_serials,
-                FrameNumber(self.submit_state.completed_frame_count),
-            )
+        // if at least one frame has been retired, reclaim/free the resources that may have expired as a result
+        if should_cleanup_resources {
+            unsafe {
+                // SAFETY: we just waited for the passes to finish
+                self.device.cleanup_resources(
+                    self.submit_state.completed_serials,
+                    FrameNumber(self.submit_state.completed_frame_count),
+                )
+            }
         }
+
+        Ok(())
     }
 }

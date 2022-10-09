@@ -76,12 +76,12 @@ impl fmt::Debug for SubmissionNumber {
 /// A set of serial numbers, one for each queue.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Default)]
 #[repr(transparent)]
-pub struct QueueProgress(pub [u64; MAX_QUEUES]);
+pub struct DeviceProgress(pub [u64; MAX_QUEUES]);
 
-impl QueueProgress {
+impl DeviceProgress {
     //
-    pub const fn new() -> QueueProgress {
-        QueueProgress([0; MAX_QUEUES])
+    pub const fn new() -> DeviceProgress {
+        DeviceProgress([0; MAX_QUEUES])
     }
 
     // TODO better name?
@@ -96,11 +96,11 @@ impl QueueProgress {
         false
     }*/
 
-    pub fn from_submission_number(snn: SubmissionNumber) -> QueueProgress {
+    pub fn from_submission_number(snn: SubmissionNumber) -> DeviceProgress {
         Self::from_queue_serial(snn.queue(), snn.serial())
     }
 
-    pub fn from_queue_serial(queue: usize, serial: u64) -> QueueProgress {
+    pub fn from_queue_serial(queue: usize, serial: u64) -> DeviceProgress {
         let mut s = Self::new();
         s[queue] = serial;
         s
@@ -110,19 +110,19 @@ impl QueueProgress {
         self.0[queue]
     }
 
-    pub fn join(&self, other: QueueProgress) -> QueueProgress {
+    pub fn join(&self, other: DeviceProgress) -> DeviceProgress {
         let mut r = *self;
         r.join_assign(other);
         r
     }
 
-    pub fn join_assign(&mut self, other: QueueProgress) {
+    pub fn join_assign(&mut self, other: DeviceProgress) {
         for i in 0..MAX_QUEUES {
             self[i] = self[i].max(other[i]);
         }
     }
 
-    pub fn join_serial(&self, snn: SubmissionNumber) -> QueueProgress {
+    pub fn join_serial(&self, snn: SubmissionNumber) -> DeviceProgress {
         let mut r = *self;
         r[snn.queue()] = r[snn.queue()].max(snn.serial());
         r
@@ -143,7 +143,7 @@ impl QueueProgress {
     //}
 }
 
-impl Deref for QueueProgress {
+impl Deref for DeviceProgress {
     type Target = [u64];
 
     fn deref(&self) -> &Self::Target {
@@ -151,13 +151,13 @@ impl Deref for QueueProgress {
     }
 }
 
-impl DerefMut for QueueProgress {
+impl DerefMut for DeviceProgress {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
     }
 }
 
-impl PartialOrd for QueueProgress {
+impl PartialOrd for DeviceProgress {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         let before = self.0.iter().zip(other.0.iter()).all(|(&a, &b)| a <= b);
 

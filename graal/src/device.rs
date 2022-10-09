@@ -1,6 +1,6 @@
 use crate::{
     context::{get_vk_sample_count, SemaphoreWait},
-    is_write_access, platform_impl, Context, FrameNumber, QueueProgress, SubmissionNumber, VULKAN_ENTRY,
+    is_write_access, platform_impl, Context, DeviceProgress, FrameNumber, SubmissionNumber, VULKAN_ENTRY,
     VULKAN_INSTANCE,
 };
 use ash::{vk, vk::Handle};
@@ -596,6 +596,15 @@ impl Device {
         self.queues_info.timelines[queue_index]
     }
 
+    /// Returns the current values of all queue timelines (i.e. the "progress" value on the device).
+    pub fn current_progress(&self) -> Result<DeviceProgress, vk::Result> {
+        let mut values = [0; MAX_QUEUES];
+        for i in 0..self.queues_info.queue_count {
+            values[i] = unsafe { self.device.get_semaphore_counter_value(self.queues_info.timelines[i])? };
+        }
+        Ok(DeviceProgress(values))
+    }
+
     /// Creates a swapchain object.
     pub unsafe fn create_swapchain(&self, surface: vk::SurfaceKHR, size: (u32, u32)) -> Swapchain {
         let mut swapchain = Swapchain {
@@ -829,7 +838,7 @@ pub(crate) struct ResourceTrackingInfo {
     /// Unused?
     pub(crate) owner_queue_family: u32,
     /// Current readers of the resource.
-    pub(crate) readers: QueueProgress,
+    pub(crate) readers: DeviceProgress,
     /// Current writer of the resource.
     pub(crate) writer: Option<AccessTracker>,
     /// Current image layout if the resource is an image. Ignored otherwise.
@@ -1045,7 +1054,7 @@ pub struct BufferRegistrationInfo<'a> {
 pub(crate) struct ResourceGroup {
     /// The serials that a pass needs to wait for to ensure an execution dependency between the pass
     /// and all writers of the resources in the group.
-    pub(crate) wait_serials: QueueProgress,
+    pub(crate) wait_serials: DeviceProgress,
     // ignored if waiting on multiple queues
     pub(crate) src_stage_mask: vk::PipelineStageFlags,
     pub(crate) dst_stage_mask: vk::PipelineStageFlags,
@@ -1413,7 +1422,7 @@ impl DeviceObjects {
     pub(crate) unsafe fn cleanup_resources(
         &mut self,
         device: &Device,
-        completed_serials: QueueProgress,
+        completed_serials: DeviceProgress,
         completed_frame: FrameNumber,
     ) {
         let _ = trace_span!("Resource cleanup");
@@ -1498,7 +1507,7 @@ impl DeviceObjects {
 
 impl Device {
     /// TODO docs
-    pub(crate) unsafe fn cleanup_resources(&self, completed_serials: QueueProgress, completed_frame: FrameNumber) {
+    pub(crate) unsafe fn cleanup_resources(&self, completed_serials: DeviceProgress, completed_frame: FrameNumber) {
         let mut objects = self.objects.lock().expect("failed to lock resources");
         objects.cleanup_resources(self, completed_serials, completed_frame)
     }
@@ -2055,7 +2064,7 @@ impl Device {
     }
 
     /// Waits for completion of queue commands.
-    pub fn wait(&self, progress: &QueueProgress, timeout: Duration) -> Result<(), vk::Result> {
+    pub fn wait(&self, progress: &DeviceProgress, timeout: Duration) -> Result<(), vk::Result> {
         let _span = trace_span!("Waiting for serials", ?progress);
 
         let wait_info = vk::SemaphoreWaitInfo {

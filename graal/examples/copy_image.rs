@@ -126,7 +126,7 @@ fn load_image(
             vk::AccessFlags::TRANSFER_READ,
             vk::PipelineStageFlags::TRANSFER,
         )
-        .record_callback(Box::new(move |context, _, command_buffer| unsafe {
+        .record_callback(move |context, _, command_buffer| unsafe {
             let device = context.vulkan_device();
             let regions = &[vk::BufferImageCopy {
                 buffer_offset: 0,
@@ -153,7 +153,7 @@ fn load_image(
                 vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                 regions,
             );
-        }));
+        });
     frame.add_pass(upload_pass);
     frame.destroy_buffer(staging_buffer.id);
     (image_id, width, height)
@@ -232,7 +232,7 @@ fn main() {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     )
-                    .record_callback(Box::new(move |context, _, command_buffer| {
+                    .record_callback(move |context, _, command_buffer| {
                         let dst_image_handle = context.device().image_handle(swapchain_image.image_info.id);
                         let src_image_handle = context.device().image_handle(file_image_id);
 
@@ -278,7 +278,7 @@ fn main() {
                                 vk::Filter::NEAREST,
                             );
                         }
-                    }));
+                    });
                 frame.add_pass(blit_pass);
                 frame.present("present", &swapchain_image);
                 context.submit_frame(&mut (), frame, &SubmitInfo::default());

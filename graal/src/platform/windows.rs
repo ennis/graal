@@ -49,6 +49,11 @@ fn handle_name_to_wstr(name: Option<&str>) -> (Vec<u16>, *const u16) {
     }
 }
 
+pub(crate) enum DedicatedAllocation {
+    Buffer(vk::Buffer),
+    Image(vk::Image),
+}
+
 pub(crate) unsafe fn import_external_memory(
     device: &Device,
     memory_requirements: &vk::MemoryRequirements,
@@ -57,6 +62,7 @@ pub(crate) unsafe fn import_external_memory(
     handle_type: vk::ExternalMemoryHandleTypeFlags,
     handle: HANDLE,
     handle_name: Option<&str>,
+    dedicated: Option<DedicatedAllocation>,
 ) -> vk::DeviceMemory {
     let vk_device = &device.device;
     let mut win32_handle_properties = vk::MemoryWin32HandlePropertiesKHR::default();
@@ -77,7 +83,29 @@ pub(crate) unsafe fn import_external_memory(
     // import memory
     let (_, handle_name_wstr) = handle_name_to_wstr(handle_name);
 
+    let mut dedicated_allocate_info: vk::MemoryDedicatedAllocateInfo;
+    let mut p_dedicated_allocate_info = ptr::null();
+
+    if let Some(dedicated) = dedicated {
+        dedicated_allocate_info = vk::MemoryDedicatedAllocateInfo {
+            image: Default::default(),
+            buffer: Default::default(),
+            ..Default::default()
+        };
+
+        match dedicated {
+            DedicatedAllocation::Buffer(buffer) => {
+                dedicated_allocate_info.buffer = buffer;
+            }
+            DedicatedAllocation::Image(image) => {
+                dedicated_allocate_info.image = image;
+            }
+        }
+        p_dedicated_allocate_info = &dedicated_allocate_info as *const _ as *const c_void;
+    }
+
     let import_memory_win32_handle_info = vk::ImportMemoryWin32HandleInfoKHR {
+        p_next: p_dedicated_allocate_info,
         handle_type,
         handle,
         name: handle_name_wstr,
@@ -181,6 +209,7 @@ impl DeviceExtWindows for Device {
             win32_handle_type,
             win32_handle,
             win32_handle_name,
+            Some(DedicatedAllocation::Image(handle)),
         );
         self.device.bind_image_memory(handle, device_memory, 0).unwrap();
         let image_registration_info = ImageRegistrationInfo {

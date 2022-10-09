@@ -7,7 +7,7 @@ use crate::{
         AccessTracker, BufferResource, Device, ImageResource, Resource, ResourceAllocation, ResourceGroupMap,
         ResourceKind, ResourceMap, ResourceTrackingInfo,
     },
-    serial::{FrameNumber, QueueProgress, SubmissionNumber},
+    serial::{DeviceProgress, FrameNumber, SubmissionNumber},
     BufferId, ImageId, ImageInfo, ImageRegistrationInfo, ResourceGroupId, ResourceId, ResourceOwnership,
     ResourceRegistrationInfo, Swapchain, SwapchainImage, MAX_QUEUES,
 };
@@ -21,6 +21,7 @@ use std::{
     os::raw::c_void,
     ptr,
     sync::Arc,
+    time::Duration,
 };
 use tracing::trace_span;
 
@@ -249,9 +250,12 @@ pub struct Pass<'a, UserContext> {
     buffer_memory_barriers: Vec<vk::BufferMemoryBarrier>,
     global_memory_barrier: Option<vk::MemoryBarrier>,
 
-    wait_serials: QueueProgress,
+    wait_serials: DeviceProgress,
     wait_dst_stages: [vk::PipelineStageFlags; MAX_QUEUES],
 }
+
+// TODO: verify this. The only thing that's not sync are the `*const pNext` fields in `vk::ImageMemoryBarrier`, and those are always set to null anyway.
+unsafe impl<'a, UserContext> Send for Pass<'a, UserContext> {}
 
 impl<'a, UserContext> Pass<'a, UserContext> {
     /// Helper function to setup an image memory barrier entry.
@@ -442,13 +446,19 @@ impl<'a, UserContext> PassBuilder<'a, UserContext> {
 
     /// Sets the command buffer recording function for this pass.
     /// The handler will be called when building the command buffer, on batch submission.
-    pub fn record_callback(mut self, record_cb: CommandCallback<'a, UserContext>) -> Self {
-        self.eval = Some(PassEvaluationCallback::CommandBuffer(record_cb));
+    pub fn record_callback(
+        mut self,
+        record_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::CommandBuffer) + 'a,
+    ) -> Self {
+        self.eval = Some(PassEvaluationCallback::CommandBuffer(Box::new(record_cb)));
         self
     }
 
-    pub fn submit_callback(mut self, submit_cb: QueueCallback<'a, UserContext>) -> Self {
-        self.eval = Some(PassEvaluationCallback::Queue(submit_cb));
+    pub fn submit_callback(
+        mut self,
+        submit_cb: impl FnOnce(&mut RecordingContext, &mut UserContext, vk::Queue) + 'a,
+    ) -> Self {
+        self.eval = Some(PassEvaluationCallback::Queue(Box::new(submit_cb)));
         self
     }
 }
@@ -489,7 +499,7 @@ pub struct SubmitResult {
     /// Progress values for each queue (reached serials) when the frame will have completed execution.
     ///
     /// To block until the frame is completed, use `Device::wait` with these progress values.
-    pub progress: QueueProgress,
+    pub progress: DeviceProgress,
 
     /// Results of `vkQueuePresent` calls made during submission of the frame.
     pub present_results: Vec<PresentOperationResult>,
@@ -497,7 +507,7 @@ pub struct SubmitResult {
 
 pub struct Frame<'a, UserContext> {
     passes: Vec<Pass<'a, UserContext>>,
-    initial_wait: QueueProgress,
+    initial_wait: DeviceProgress,
     commands: Vec<(usize, FrameCommand)>,
 }
 
@@ -532,7 +542,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     /// Adds a dependency on the completion of previous queue operations.
     ///
     /// Execution of the *whole* frame will wait for the operation represented by the future to complete.
-    pub fn add_dependency(&mut self, progress: QueueProgress) {
+    pub fn add_dependency(&mut self, progress: DeviceProgress) {
         self.initial_wait = self.initial_wait.join(progress);
     }
 
@@ -884,7 +894,7 @@ fn local_pass_index(serial: u64, frame_base_serial: u64) -> usize {
 /// Stores the set of resources owned by a currently executing frame.
 #[derive(Debug)]
 struct FrameInFlight {
-    signalled_serials: QueueProgress,
+    signalled_serials: DeviceProgress,
     //transient_allocations: Vec<gpu_allocator::vulkan::Allocation>,
     command_pools: Vec<submit::CommandAllocator>,
     semaphores: Vec<vk::Semaphore>,
@@ -895,7 +905,7 @@ struct FrameInFlight {
 /// Collected debugging information about a frame.
 struct SyncDebugInfo {
     tracking: slotmap::SecondaryMap<ResourceId, ResourceTrackingInfo>,
-    xq_sync_table: [QueueProgress; MAX_QUEUES],
+    xq_sync_table: [DeviceProgress; MAX_QUEUES],
 }
 
 impl SyncDebugInfo {
@@ -909,7 +919,8 @@ impl SyncDebugInfo {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct SubmitInfo {
-    pub happens_after: QueueProgress,
+    pub happens_after: Option<DeviceProgress>,
+    pub wait_before_submit: Option<DeviceProgress>,
     pub collect_debug_info: bool,
 }
 
@@ -1026,6 +1037,12 @@ impl Context {
     ///
     /// However, regardless of this, individual passes in the frame may still synchronize with earlier frames
     /// because of resource dependencies.
+    ///
+    /// # Arguments
+    /// * user_context user context passed to the recording & queue callbacks
+    /// * frame the frame to submit
+    /// * happens_after an optional progress value to synchronize the frame with on the device
+    /// * wait_before_submit an optional progress value to wait (on the CPU) for before submitting the work. Typically used for pacing purposes.
     pub fn submit_frame<UserContext>(
         &mut self,
         user_context: &mut UserContext,
@@ -1038,6 +1055,7 @@ impl Context {
         //let base_sn = self.last_sn;
         //let wait_init = submit_info.happens_after.serials;
 
+        // update known resource tracking information to their states after this frame
         let last_sn = {
             let mut device_objects = self.device.objects.lock().unwrap();
             let device_objects = &mut *device_objects;
@@ -1049,13 +1067,17 @@ impl Context {
                 resource_groups,
                 &mut frame,
                 self.last_sn,
-                submit_info.happens_after,
+                submit_info.happens_after.unwrap_or_default(),
             )
         };
 
         // wait for the frames submitted before the last one to finish, for pacing.
         // This also reclaims the resources referenced by the frames that are not in use anymore.
-        self.wait_for_frames_in_flight();
+
+        // Maximum time to wait for batches to finish.
+        const FRAME_PACING_TIMEOUT: Duration = Duration::from_secs(5);
+        self.retire_completed_frames(submit_info.wait_before_submit, FRAME_PACING_TIMEOUT)
+            .expect("failed to wait for a previous frame");
 
         //////////////////////////////////////////////////////////////////////////////////
         // Submit commands to the device queues

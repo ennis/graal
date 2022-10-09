@@ -4,7 +4,7 @@ extern crate test;
 use test::Bencher;
 
 use ash::vk;
-use graal::{ash::vk::PipelineStageFlags, QueueProgress, SubmissionNumber};
+use graal::{ash::vk::PipelineStageFlags, DeviceProgress, SubmissionNumber};
 use std::{fmt, fmt::Formatter};
 
 const EMPTY: vk::PipelineStageFlags = vk::PipelineStageFlags::empty();
@@ -146,7 +146,7 @@ struct PerStageTrackingInfo {
     compute: u64,
     transfer: u64,
     /// Sync sources from other queues.
-    foreign: QueueProgress,
+    foreign: DeviceProgress,
 }
 
 /// Execution dependency tracker.
