@@ -71,7 +71,7 @@ pub struct Swapchain {
 }
 
 /// Contains information about an image in a swapchain.
-#[derive(Copy, Clone, Debug)]
+#[derive(Debug)]
 pub struct SwapchainImage {
     /// Handle of the swapchain that owns this image.
     pub swapchain_handle: vk::SwapchainKHR,
@@ -494,11 +494,9 @@ impl Device {
             };
 
             for i in 0..queue_count {
-                queue_timelines[i] = unsafe {
-                    device
-                        .create_semaphore(&semaphore_create_info, None)
-                        .expect("failed to create semaphore")
-                };
+                queue_timelines[i] = device
+                    .create_semaphore(&semaphore_create_info, None)
+                    .expect("failed to create semaphore");
             }
         }
 
@@ -795,6 +793,12 @@ impl BufferId {
     pub fn resource_id(&self) -> ResourceId {
         self.0
     }
+
+    /// Produces an invalid BufferId, for testing.
+    #[cfg(test)]
+    pub fn invalid() -> BufferId {
+        BufferId(ResourceId::null())
+    }
 }
 
 /// TODO docs
@@ -805,6 +809,11 @@ impl ImageId {
     /// Returns the underlying ResourceId.
     pub fn resource_id(&self) -> ResourceId {
         self.0
+    }
+
+    /// Produces an invalid ImageId, for testing.
+    pub fn invalid() -> ImageId {
+        ImageId(ResourceId::null())
     }
 }
 

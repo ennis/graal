@@ -7,7 +7,7 @@ pub fn blit_images<UserContext>(
     size: (u32, u32),
     aspect_mask: vk::ImageAspectFlags,
 ) {
-    let mut blit_pass = PassBuilder::new()
+    let blit_pass = PassBuilder::new()
         .name("blit_images")
         .image_dependency(
             src_image.id,

@@ -280,7 +280,7 @@ fn main() {
                         }
                     });
                 frame.add_pass(blit_pass);
-                frame.present("present", &swapchain_image);
+                frame.present(&swapchain_image);
                 context.submit_frame(&mut (), frame, &SubmitInfo::default());
                 device.destroy_image(file_image_id);
                 device.destroy_image(swapchain_image.image_info.id);

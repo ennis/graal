@@ -603,7 +603,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
     }
 
     /// Presents a swapchain image to the associated swapchain.
-    pub fn present(&mut self, name: &str, image: &SwapchainImage) {
+    pub fn present(&mut self, image: SwapchainImage) {
         let mut pass = PassBuilder::new().queue(PassType::Present).image_dependency(
             image.image_info.id,
             vk::AccessFlags::MEMORY_READ,
@@ -616,6 +616,7 @@ impl<'a, UserContext> Frame<'a, UserContext> {
             image_index: image.image_index,
         });
         self.add_pass(pass);
+        self.destroy_image(image.image_info.id);
     }
 
     /*/// Dumps the frame to a JSON object.
