@@ -165,6 +165,8 @@ impl Context {
         let mut wait_semaphore_values = Vec::new();
         let mut wait_semaphore_dst_stages = Vec::new();
 
+        let mut d3d12_fence_submit = false;
+
         // end command buffers
         for &cb in batch.command_buffers.iter() {
             unsafe { self.device.device.end_command_buffer(cb).unwrap() }
@@ -186,6 +188,10 @@ impl Context {
                 }
                 SemaphoreSignalKind::Timeline(value) => {
                     signal_semaphore_values.push(value);
+                }
+                SemaphoreSignalKind::D3D12Fence(value) => {
+                    signal_semaphore_values.push(value);
+                    d3d12_fence_submit = true;
                 }
             }
         }
@@ -210,6 +216,10 @@ impl Context {
                 SemaphoreWaitKind::Timeline(value) => {
                     wait_semaphore_values.push(value);
                 }
+                SemaphoreWaitKind::D3D12Fence(value) => {
+                    wait_semaphore_values.push(value);
+                    d3d12_fence_submit = true;
+                }
             }
 
             // Every semaphore that is waited on (except queue timelines) is put in `used_semaphores`.
@@ -219,7 +229,24 @@ impl Context {
             used_semaphores.push(wait.semaphore);
         }
 
+        let d3d12_fence_submit_info_ptr;
+        let mut d3d12_fence_submit_info;
+
+        if d3d12_fence_submit {
+            d3d12_fence_submit_info = vk::D3D12FenceSubmitInfoKHR {
+                wait_semaphore_values_count: wait_semaphore_values.len() as u32,
+                p_wait_semaphore_values: wait_semaphore_values.as_ptr(),
+                signal_semaphore_values_count: signal_semaphore_values.len() as u32,
+                p_signal_semaphore_values: signal_semaphore_values.as_ptr(),
+                ..Default::default()
+            };
+            d3d12_fence_submit_info_ptr = &d3d12_fence_submit_info as *const _ as *const c_void;
+        } else {
+            d3d12_fence_submit_info_ptr = ptr::null();
+        }
+
         let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
+            p_next: d3d12_fence_submit_info_ptr,
             wait_semaphore_value_count: wait_semaphore_values.len() as u32,
             p_wait_semaphore_values: wait_semaphore_values.as_ptr(),
             signal_semaphore_value_count: signal_semaphore_values.len() as u32,
@@ -228,7 +255,7 @@ impl Context {
         };
 
         let submit_info = vk::SubmitInfo {
-            p_next: &mut timeline_submit_info as *mut _ as *mut c_void,
+            p_next: &timeline_submit_info as *const _ as *const c_void,
             wait_semaphore_count: wait_semaphores.len() as u32,
             p_wait_semaphores: wait_semaphores.as_ptr(),
             p_wait_dst_stage_mask: wait_semaphore_dst_stages.as_ptr(),
@@ -346,6 +373,7 @@ impl Context {
                 cmd_pools[q as usize].get_or_insert_with(|| self.create_command_pool(p.snn.queue()));
             // append to the last command buffer of the batch, otherwise create another one
 
+            // TODO: don't allocate a command buffer if the batch doesn't need it (no commands, only semaphore waits & signals)
             if batch.command_buffers.is_empty() {
                 let cb = command_pool.allocate_command_buffer(&self.device.device);
                 let begin_info = vk::CommandBufferBeginInfo { ..Default::default() };
@@ -490,7 +518,9 @@ impl Context {
                     // we signalled and waited on the semaphore, consider it consumed
                     used_semaphores.push(render_finished_semaphore);
                 }
-                None => {}
+                None => {
+                    batch.signal_snn = p.snn;
+                }
             }
 
             unsafe {
@@ -505,6 +535,9 @@ impl Context {
                     "submit_command_batch (queue = {}, reason: signal_queue_timelines={})",
                     q, p.signal_queue_timelines
                 );*/
+                for external_semaphore in p.external_semaphore_signals.iter() {
+                    batch.external_semaphore_signals.push(external_semaphore.clone());
+                }
                 self.submit_command_batch(q, batch, &mut used_semaphores);
                 batch.reset();
             }

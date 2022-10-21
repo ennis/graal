@@ -172,7 +172,8 @@ fn main() {
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
 
     let (device, mut context) = unsafe { graal::create_device_and_context(Some(surface)) };
-    let mut swapchain = unsafe { device.create_swapchain(surface, window.inner_size().into()) };
+    let surface_format = unsafe { device.get_preferred_surface_format(surface) };
+    let mut swapchain = unsafe { device.create_swapchain(surface, surface_format, window.inner_size().into()) };
     let mut swapchain_size = window.inner_size().into();
 
     event_loop.run(move |event, _, control_flow| {
@@ -215,6 +216,7 @@ fn main() {
 
                 let blit_w = file_image_width.min(swapchain_size.0);
                 let blit_h = file_image_height.min(swapchain_size.1);
+                let swapchain_image_id = swapchain_image.image_info.id;
 
                 let blit_pass = PassBuilder::new()
                     .name("blit to screen")
@@ -233,7 +235,7 @@ fn main() {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                     )
                     .record_callback(move |context, _, command_buffer| {
-                        let dst_image_handle = context.device().image_handle(swapchain_image.image_info.id);
+                        let dst_image_handle = context.device().image_handle(swapchain_image_id);
                         let src_image_handle = context.device().image_handle(file_image_id);
 
                         let regions = &[vk::ImageBlit {
@@ -280,10 +282,9 @@ fn main() {
                         }
                     });
                 frame.add_pass(blit_pass);
-                frame.present(&swapchain_image);
+                frame.present(swapchain_image);
                 context.submit_frame(&mut (), frame, &SubmitInfo::default());
                 device.destroy_image(file_image_id);
-                device.destroy_image(swapchain_image.image_info.id);
             }
             _ => (),
         }

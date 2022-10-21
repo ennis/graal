@@ -179,12 +179,14 @@ struct ResourceAccess {
 pub enum SemaphoreWaitKind {
     Binary,
     Timeline(u64),
+    D3D12Fence(u64),
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SemaphoreSignalKind {
     Binary,
     Timeline(u64),
+    D3D12Fence(u64),
 }
 
 /// Represents a semaphore wait operation outside of the queue timelines.
@@ -386,7 +388,7 @@ impl<'a, UserContext> PassBuilder<'a, UserContext> {
 
     /// Adds a semaphore wait operation: the pass will first wait for the specified semaphore to be signalled
     /// before starting.
-    pub fn external_semaphore_wait(
+    pub unsafe fn external_semaphore_wait(
         mut self,
         semaphore: vk::Semaphore,
         dst_stage: vk::PipelineStageFlags,
@@ -402,7 +404,11 @@ impl<'a, UserContext> PassBuilder<'a, UserContext> {
     }
 
     /// Adds a semaphore signal operation: when finished, the pass will signal the specified semaphore.
-    pub fn external_semaphore_signal(mut self, semaphore: vk::Semaphore, signal_kind: SemaphoreSignalKind) -> Self {
+    pub unsafe fn external_semaphore_signal(
+        mut self,
+        semaphore: vk::Semaphore,
+        signal_kind: SemaphoreSignalKind,
+    ) -> Self {
         self.external_semaphore_signals
             .push(SemaphoreSignal { semaphore, signal_kind });
 
@@ -1023,7 +1029,7 @@ impl Context {
                 ownership: ResourceOwnership::External,
             },
             handle,
-            format: swapchain.format,
+            format: swapchain.format.format,
         });
 
         Ok(SwapchainImage {

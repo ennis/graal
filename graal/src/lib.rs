@@ -7,7 +7,8 @@ pub use instance::{get_instance_extensions, get_vulkan_entry, get_vulkan_instanc
 pub use crate::{
     context::{
         format_aspect_mask, is_depth_and_stencil_format, is_depth_only_format, is_stencil_only_format, is_write_access,
-        CommandCallback, Context, Frame, PassBuilder, PassType, QueueCallback, RecordingContext, SubmitInfo,
+        CommandCallback, Context, Frame, PassBuilder, PassType, QueueCallback, RecordingContext, SemaphoreSignalKind,
+        SemaphoreWaitKind, SubmitInfo,
     },
     device::{
         create_device_and_context, get_mip_level_count, AllocationRequirements, BufferId, BufferInfo,

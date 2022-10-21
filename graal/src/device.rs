@@ -23,6 +23,8 @@ use tracing::{trace, trace_span};
 pub(crate) const MAX_QUEUES: usize = 4;
 
 /// Chooses a swapchain surface format among a list of supported formats.
+///
+/// TODO there's only one supported format right now...
 fn get_preferred_swapchain_surface_format(surface_formats: &[vk::SurfaceFormatKHR]) -> vk::SurfaceFormatKHR {
     surface_formats
         .iter()
@@ -66,8 +68,8 @@ fn get_preferred_swap_extent(framebuffer_size: (u32, u32), capabilities: &vk::Su
 pub struct Swapchain {
     pub handle: vk::SwapchainKHR,
     pub surface: vk::SurfaceKHR,
+    pub format: vk::SurfaceFormatKHR,
     pub images: Vec<vk::Image>,
-    pub format: vk::Format,
 }
 
 /// Contains information about an image in a swapchain.
@@ -604,15 +606,33 @@ impl Device {
     }
 
     /// Creates a swapchain object.
-    pub unsafe fn create_swapchain(&self, surface: vk::SurfaceKHR, size: (u32, u32)) -> Swapchain {
+    pub unsafe fn create_swapchain(
+        &self,
+        surface: vk::SurfaceKHR,
+        format: vk::SurfaceFormatKHR,
+        size: (u32, u32),
+    ) -> Swapchain {
         let mut swapchain = Swapchain {
             handle: Default::default(),
             surface,
             images: vec![],
-            format: Default::default(),
+            format,
         };
         self.resize_swapchain(&mut swapchain, size);
         swapchain
+    }
+
+    /// Returns the list of supported swapchain formats for the given surface.
+    pub unsafe fn get_surface_formats(&self, surface: vk::SurfaceKHR) -> Vec<vk::SurfaceFormatKHR> {
+        self.vk_khr_surface
+            .get_physical_device_surface_formats(self.physical_device, surface)
+            .unwrap()
+    }
+
+    /// Returns one supported surface format. Use if you don't care about the format of your swapchain.
+    pub unsafe fn get_preferred_surface_format(&self, surface: vk::SurfaceKHR) -> vk::SurfaceFormatKHR {
+        let surface_formats = self.get_surface_formats(surface);
+        get_preferred_swapchain_surface_format(&surface_formats)
     }
 
     /// Resizes a swapchain.
@@ -622,16 +642,15 @@ impl Device {
             .vk_khr_surface
             .get_physical_device_surface_capabilities(phy, swapchain.surface)
             .unwrap();
-        let formats = self
-            .vk_khr_surface
-            .get_physical_device_surface_formats(phy, swapchain.surface)
-            .unwrap();
+        /*let formats = self
+        .vk_khr_surface
+        .get_physical_device_surface_formats(phy, swapchain.surface)
+        .unwrap();*/
         let present_modes = self
             .vk_khr_surface
             .get_physical_device_surface_present_modes(phy, swapchain.surface)
             .unwrap();
 
-        let image_format = get_preferred_swapchain_surface_format(&formats);
         let present_mode = get_preferred_present_mode(&present_modes);
         let image_extent = get_preferred_swap_extent(size, &capabilities);
         let image_count =
@@ -645,8 +664,8 @@ impl Device {
             flags: Default::default(),
             surface: swapchain.surface,
             min_image_count: image_count,
-            image_format: image_format.format,
-            image_color_space: image_format.color_space,
+            image_format: swapchain.format.format,
+            image_color_space: swapchain.format.color_space,
             image_extent,
             image_array_layers: 1,
             image_usage: vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_DST,
@@ -672,7 +691,6 @@ impl Device {
 
         swapchain.handle = new_handle;
         swapchain.images = self.vk_khr_swapchain.get_swapchain_images(swapchain.handle).unwrap();
-        swapchain.format = image_format.format;
     }
 
     pub(crate) fn enter_frame(&self, frame_number: FrameNumber) {
@@ -1556,6 +1574,14 @@ impl Device {
                 .create_sampler(create_info, None)
                 .expect("failed to create sampler")
         }
+    }
+
+    /// Schedules destruction of the specified semaphore.
+    pub fn destroy_semaphore(&self, semaphore: vk::Semaphore) {
+        let mut objects = self.objects.lock().unwrap();
+        objects
+            .discarded_semaphores
+            .delete_later(semaphore, self.context_state.last_started_frame());
     }
 
     /// Schedules destruction of the specified sampler.
