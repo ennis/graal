@@ -42,6 +42,8 @@ fn get_preferred_swapchain_surface_format(surface_formats: &[vk::SurfaceFormatKH
 fn get_preferred_present_mode(available_present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
     if available_present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
         vk::PresentModeKHR::MAILBOX
+    } else if available_present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+        vk::PresentModeKHR::IMMEDIATE
     } else {
         vk::PresentModeKHR::FIFO
     }
@@ -1779,6 +1781,8 @@ impl Device {
     pub fn destroy_image(&self, id: ImageId) {
         // resources are really destroyed during `Context::cleanup_resources`, which checks that
         // all passes referencing this resource have finished executing.
+        //
+        // FIXME: if there's no work submitted to the context then the resource will never be released.
         let mut objects = self.objects.lock().expect("failed to lock resources");
         objects.resources.get_mut(id.0).unwrap().discarded = true;
     }

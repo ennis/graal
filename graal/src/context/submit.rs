@@ -15,7 +15,7 @@ use std::{
     ptr,
     time::Duration,
 };
-use tracing::trace_span;
+use tracing::{info, trace, trace_span, warn};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 //
@@ -230,7 +230,7 @@ impl Context {
         }
 
         let d3d12_fence_submit_info_ptr;
-        let mut d3d12_fence_submit_info;
+        let d3d12_fence_submit_info;
 
         if d3d12_fence_submit {
             d3d12_fence_submit_info = vk::D3D12FenceSubmitInfoKHR {
@@ -245,7 +245,7 @@ impl Context {
             d3d12_fence_submit_info_ptr = ptr::null();
         }
 
-        let mut timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
+        let timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
             p_next: d3d12_fence_submit_info_ptr,
             wait_semaphore_value_count: wait_semaphore_values.len() as u32,
             p_wait_semaphore_values: wait_semaphore_values.as_ptr(),
@@ -253,6 +253,8 @@ impl Context {
             p_signal_semaphore_values: signal_semaphore_values.as_ptr(),
             ..Default::default()
         };
+
+        //info!("signal semaphore values = {:?}", signal_semaphore_values);
 
         let submit_info = vk::SubmitInfo {
             p_next: &timeline_submit_info as *const _ as *const c_void,
@@ -288,6 +290,7 @@ impl Context {
             .iter()
             .position(|cmd_pool| cmd_pool.queue_family == queue_family)
         {
+            //info!("using recycled command pool {queue_index}",);
             // found one, remove it and return it
             self.submit_state.command_pools.swap_remove(pos)
         } else {
@@ -297,6 +300,10 @@ impl Context {
                 queue_family_index: queue_family,
                 ..Default::default()
             };
+            /*warn!(
+                "create_command_pool new pool for queue index {queue_index}, recycled command pools: {:?}",
+                self.submit_state.command_pools
+            );*/
             let command_pool = unsafe {
                 self.device
                     .device
@@ -550,6 +557,7 @@ impl Context {
         }
 
         let command_pools = cmd_pools.iter_mut().filter_map(|cmd_pool| cmd_pool.take()).collect();
+        //info!("last_signalled_serials: {:?}", self.submit_state.last_signalled_serials);
 
         // Add this frame to the list of "frames in flight": frames that might be executing on the device.
         // When this frame is completed, all resources of the frame will be automatically recycled.
@@ -605,12 +613,19 @@ impl Context {
         // retire all finished frames and reclaim their resources, starting from the oldest
         let current_progress = self.device.current_progress()?;
         let mut should_cleanup_resources = false;
+
+        /*info!(
+            "frames in flight: {}, current_progress={:?}",
+            self.submit_state.in_flight.len(),
+            current_progress
+        );*/
         loop {
             if self.submit_state.in_flight.is_empty() {
                 break;
             }
 
             let oldest_frame = self.submit_state.in_flight.front().unwrap();
+            //info!("trying to reclaim frame: {:?}", oldest_frame.signalled_serials);
 
             // break if the frame isn't finished yet (the device hasn't yet reached its progress value)
             if oldest_frame.signalled_serials > current_progress {

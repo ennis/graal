@@ -561,7 +561,9 @@ pub(super) fn synchronize_and_track_resources<'a, UserContext>(
 
     let num_passes = frame.passes.len();
     let mut i_cmd = 0;
-    for i in 0..num_passes {
+    let mut i = 0;
+    // not a for loop because we need to execute pre-pass commands even if there are no passes
+    loop {
         // execute pre-pass commands
         loop {
             if i_cmd < frame.commands.len() && frame.commands[i_cmd].0 == i {
@@ -583,6 +585,10 @@ pub(super) fn synchronize_and_track_resources<'a, UserContext>(
             }
         }
 
+        if i >= num_passes {
+            break;
+        }
+
         let (prev_passes, next_passes) = frame.passes.split_at_mut(i);
         let pass = &mut next_passes[0];
 
@@ -597,6 +603,8 @@ pub(super) fn synchronize_and_track_resources<'a, UserContext>(
         for access in accesses.iter() {
             add_resource_dependency(resources, &mut sync_state, prev_passes, pass, access);
         }
+
+        i += 1;
     }
 
     sync_state.current_sn
