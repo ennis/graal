@@ -1,6 +1,6 @@
 use crate::{
-    context::get_vk_sample_count, device::ResourceAllocation, vk, AllocationRequirements, Device, ImageInfo,
-    ImageRegistrationInfo, ImageResourceCreateInfo, ResourceOwnership, ResourceRegistrationInfo,
+    device::{Device, ResourceAllocation},
+    vk,
 };
 use ash::vk::{HANDLE, SECURITY_ATTRIBUTES};
 use gpu_allocator::MemoryLocation;
@@ -215,18 +215,13 @@ impl DeviceExtWindows for Device {
         let image_registration_info = ImageRegistrationInfo {
             resource: ResourceRegistrationInfo {
                 name,
-                ownership: ResourceOwnership::OwnedResource {
-                    requirements: AllocationRequirements {
-                        mem_req,
-                        location: MemoryLocation::Unknown,
-                    },
-                    allocation: Some(ResourceAllocation::External { device_memory }),
-                },
+                ownership: ResourceOwnership::Owned(ResourceAllocation::External { device_memory }),
                 initial_wait: None,
             },
             handle,
             format: Default::default(),
         };
+
         let id = self.register_image_resource(image_registration_info);
 
         ImageInfo { id, handle }
@@ -344,14 +339,7 @@ impl DeviceExtWindows for Device {
             resource: ResourceRegistrationInfo {
                 name,
                 // we are responsible for the deletion of the resource
-                ownership: ResourceOwnership::OwnedResource {
-                    requirements: AllocationRequirements {
-                        mem_req,
-                        location: MemoryLocation::Unknown,
-                    },
-                    // we provide our own device memory block
-                    allocation: Some(ResourceAllocation::External { device_memory }),
-                },
+                ownership: ResourceOwnership::Owned(ResourceAllocation::External { device_memory }),
                 initial_wait: None,
             },
             handle,

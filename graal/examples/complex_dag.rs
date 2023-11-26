@@ -3,10 +3,10 @@ use ash::{
     vk::{BufferUsageFlags, Rect2D, SampleCountFlags},
 };
 use graal::{
-    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk,
-    BufferDescriptor, BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId,
-    ImageInfo, ImageResourceCreateInfo, MemoryLocation, Norm, PipelineShaderStage, ResourceId,
-    ResourceMemoryInfo, VertexBufferView, VertexData, VertexInputInterface,
+    ash::version::DeviceV1_1, extract_descriptor_set_layouts_from_shader_stages, vk, BufferDescriptor,
+    BufferResourceCreateInfo, DescriptorSetInterface, FrameCreateInfo, ImageId, ImageInfo, ImageResourceCreateInfo,
+    MemoryLocation, Norm, PipelineShaderStage, ResourceId, ResourceMemoryInfo, VertexBufferView, VertexData,
+    VertexInputInterface,
 };
 use inline_spirv::include_spirv;
 use raw_window_handle::HasRawWindowHandle;
@@ -19,10 +19,7 @@ use winit::{
 
 /// Creates a render pass with a single subpass, writing to a single color target with the specified
 /// format.
-fn create_single_color_target_render_pass(
-    device: &ash::Device,
-    target_format: vk::Format,
-) -> vk::RenderPass {
+fn create_single_color_target_render_pass(device: &ash::Device, target_format: vk::Format) -> vk::RenderPass {
     let render_pass_attachments = &[vk::AttachmentDescription {
         flags: vk::AttachmentDescriptionFlags::MAY_ALIAS,
         format: target_format,
@@ -65,11 +62,7 @@ fn create_single_color_target_render_pass(
         ..Default::default()
     };
 
-    let render_pass = unsafe {
-        device
-            .create_render_pass(&render_pass_create_info, None)
-            .unwrap()
-    };
+    let render_pass = unsafe { device.create_render_pass(&render_pass_create_info, None).unwrap() };
 
     render_pass
 }
@@ -133,8 +126,7 @@ impl BackgroundPass {
         ];
 
         let mut set_layouts = Vec::new();
-        let layout_handle = context
-            .get_or_create_descriptor_set_layout_for_interface::<BackgroundShaderInterface>();
+        let layout_handle = context.get_or_create_descriptor_set_layout_for_interface::<BackgroundShaderInterface>();
         set_layouts.push(layout_handle);
 
         let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo {
@@ -257,10 +249,7 @@ impl BackgroundPass {
             ..Default::default()
         };
 
-        let render_pass = create_single_color_target_render_pass(
-            context.vulkan_device(),
-            vk::Format::B8G8R8A8_SRGB,
-        );
+        let render_pass = create_single_color_target_render_pass(context.vulkan_device(), vk::Format::B8G8R8A8_SRGB);
 
         let gpci = vk::GraphicsPipelineCreateInfo {
             flags: Default::default(),
@@ -343,7 +332,7 @@ fn load_image(
         _ => panic!("unsupported image format"),
     };
 
-    let mip_levels = graal::get_mip_level_count(width, height);
+    let mip_levels = graal::mip_level_count(width, height);
 
     // create the texture
     let ImageInfo {
@@ -371,11 +360,8 @@ fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = frame.alloc_upload_slice::<u8>(
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        byte_size as usize,
-        Some("staging"),
-    );
+    let mut staging_buffer =
+        frame.alloc_upload_slice::<u8>(vk::BufferUsageFlags::TRANSFER_SRC, byte_size as usize, Some("staging"));
 
     // read image data
     unsafe {
@@ -522,11 +508,7 @@ fn load_mesh(batch: &graal::Frame, obj_file_path: &Path) -> MeshData {
     );
 
     // staging
-    let staging_buffer = batch.upload_slice(
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        &vertices,
-        Some("staging"),
-    );
+    let staging_buffer = batch.upload_slice(vk::BufferUsageFlags::TRANSFER_SRC, &vertices, Some("staging"));
 
     let staging_buffer_handle = staging_buffer.handle;
 
@@ -591,8 +573,7 @@ fn depth_attachment(
 ) {
     (
         img,
-        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ
-            | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags::DEPTH_STENCIL_ATTACHMENT_WRITE,
         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
         vk::PipelineStageFlags::EARLY_FRAGMENT_TESTS,
         vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
@@ -745,40 +726,24 @@ fn main() {
                 test_pass(
                     &frame,
                     "P4",
-                    &[
-                        compute_read(img_d2),
-                        compute_read(img_c),
-                        compute_write(img_e),
-                    ],
+                    &[compute_read(img_d2), compute_read(img_c), compute_write(img_e)],
                 );
                 test_pass(&frame, "P5", &[compute_read(img_d1), compute_write(img_f)]);
                 test_pass(
                     &frame,
                     "P6",
-                    &[
-                        compute_read(img_e),
-                        compute_read(img_f),
-                        compute_write(img_g),
-                    ],
+                    &[compute_read(img_e), compute_read(img_f), compute_write(img_g)],
                 );
                 test_pass(&frame, "P7", &[compute_read(img_g), compute_write(img_h)]);
                 test_pass(&frame, "P8", &[compute_read(img_h), compute_write(img_i)]);
                 test_pass(
                     &frame,
                     "P9",
-                    &[
-                        compute_read(img_i),
-                        compute_read(img_g),
-                        compute_write(img_j),
-                    ],
+                    &[compute_read(img_i), compute_read(img_g), compute_write(img_j)],
                 );
                 test_pass(&frame, "P10", &[compute_read(img_j), compute_write(img_k)]);
 
-                test_pass(
-                    &frame,
-                    "P11",
-                    &[color_attachment_output(swapchain_image.image_info.id)],
-                );
+                test_pass(&frame, "P11", &[color_attachment_output(swapchain_image.image_info.id)]);
 
                 frame.present("P12", &swapchain_image);
                 frame.finish();

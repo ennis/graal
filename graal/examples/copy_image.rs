@@ -1,24 +1,28 @@
-use ash::vk::{BufferUsageFlags, Rect2D, SampleCountFlags};
 use graal::{
-    vk, BufferResourceCreateInfo, Frame, ImageId, ImageInfo, ImageResourceCreateInfo, MemoryLocation, PassBuilder,
-    ResourceId, SubmitInfo, Swapchain,
+    device::{BufferResourceCreateInfo, Device, ImageInfo, ImageResourceCreateInfo},
+    queue,
+    queue::{Queue, ResourceState, Submission},
+    vk, MemoryLocation,
 };
 use raw_window_handle::HasRawWindowHandle;
-use std::{mem, path::Path, ptr};
+use std::{mem, path::Path, ptr, time::Duration};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
 };
 
-fn load_image(
-    device: &graal::Device,
-    frame: &mut graal::Frame<()>,
-    path: &Path,
-    usage: graal::vk::ImageUsageFlags,
-    mipmaps: bool,
-) -> (graal::ImageId, u32, u32) {
+struct LoadImageResult {
+    image_info: ImageInfo,
+    width: u32,
+    height: u32,
+}
+
+fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFlags, mipmaps: bool) -> LoadImageResult {
     use openimageio::{ImageInput, TypeDesc};
+
+    let path = path.as_ref();
+    let device = queue.device().clone();
 
     let image_input = ImageInput::open(path).expect("could not open image file");
     let spec = image_input.spec();
@@ -56,7 +60,7 @@ fn load_image(
         _ => panic!("unsupported image format"),
     };
 
-    let mip_levels = graal::get_mip_level_count(width, height);
+    let mip_levels = graal::mip_level_count(width, height);
 
     // create the texture
     let ImageInfo {
@@ -110,53 +114,60 @@ fn load_image(
 
     let staging_buffer_handle = staging_buffer.handle;
 
-    // === upload pass ===
+    let cb = queue.allocate_command_buffer();
 
-    let upload_pass = PassBuilder::new()
-        .name("image upload")
-        .image_dependency(
-            image_id,
-            vk::AccessFlags::TRANSFER_WRITE,
-            vk::PipelineStageFlags::TRANSFER,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        )
-        .buffer_dependency(
-            staging_buffer.id,
-            vk::AccessFlags::TRANSFER_READ,
-            vk::PipelineStageFlags::TRANSFER,
-        )
-        .record_callback(move |context, _, command_buffer| unsafe {
-            let device = context.vulkan_device();
-            let regions = &[vk::BufferImageCopy {
-                buffer_offset: 0,
-                buffer_row_length: width,
-                buffer_image_height: height,
-                image_subresource: vk::ImageSubresourceLayers {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    mip_level: 0,
-                    base_array_layer: 0,
-                    layer_count: 1,
-                },
-                image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
-                image_extent: vk::Extent3D {
-                    width,
-                    height,
-                    depth: 1,
-                },
-            }];
+    let regions = &[vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: width,
+        buffer_image_height: height,
+        image_subresource: vk::ImageSubresourceLayers {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            mip_level: 0,
+            base_array_layer: 0,
+            layer_count: 1,
+        },
+        image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+        image_extent: vk::Extent3D {
+            width,
+            height,
+            depth: 1,
+        },
+    }];
 
-            device.cmd_copy_buffer_to_image(
-                command_buffer,
-                staging_buffer_handle,
-                image_handle,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                regions,
-            );
-        });
-    frame.add_pass(upload_pass);
-    frame.destroy_buffer(staging_buffer.id);
-    (image_id, width, height)
+    unsafe {
+        device.begin_command_buffer(
+            cb,
+            &vk::CommandBufferBeginInfo {
+                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                ..Default::default()
+            },
+        );
+        device.cmd_copy_buffer_to_image(
+            cb,
+            staging_buffer_handle,
+            image_handle,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            regions,
+        );
+        device.end_command_buffer(cb).unwrap();
+
+        let mut upload = queue.build_submission();
+        upload.set_name("image upload");
+        upload.use_buffer(staging_buffer.id, ResourceState::TRANSFER_SRC);
+        upload.use_image(image_id, ResourceState::TRANSFER_DST);
+        upload.push_command_buffer(cb);
+        upload.submit().expect("image upload failed");
+        queue.destroy_later(staging_buffer.id);
+    }
+
+    LoadImageResult {
+        image_info: ImageInfo {
+            handle: image_handle,
+            id: image_id,
+        },
+        width,
+        height,
+    }
 }
 
 fn main() {
@@ -166,77 +177,57 @@ fn main() {
         .with_span_events(tracing_subscriber::fmt::format::FmtSpan::ACTIVE)
         .init();
 
-    let event_loop = EventLoop::new();
+    let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-    let surface = graal::surface::get_vulkan_surface(window.raw_window_handle());
+    let surface = graal::surface::get_vulkan_surface(window.raw_window_handle().unwrap());
 
-    let (device, mut context) = unsafe { graal::create_device_and_context(Some(surface)) };
+    let (device, mut queue) = unsafe { graal::create_device_and_queue(Some(surface)) };
     let surface_format = unsafe { device.get_preferred_surface_format(surface) };
     let mut swapchain = unsafe { device.create_swapchain(surface, surface_format, window.inner_size().into()) };
     let mut swapchain_size = window.inner_size().into();
 
-    event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Poll;
-        match event {
-            Event::WindowEvent { window_id, event } => match event {
-                WindowEvent::CloseRequested => {
-                    println!("The close button was pressed; stopping");
-                    *control_flow = ControlFlow::Exit
-                }
-                WindowEvent::Resized(size) => unsafe {
-                    swapchain_size = size.into();
-                    device.resize_swapchain(&mut swapchain, swapchain_size);
-                },
-                _ => {}
-            },
-            Event::MainEventsCleared => {
-                window.request_redraw();
-            }
-            Event::RedrawRequested(_) => {
-                let swapchain_image = unsafe { context.acquire_next_swapchain_image(&swapchain) };
-
-                let swapchain_image = match swapchain_image {
-                    Ok(image) => image,
-                    Err(err) => {
-                        eprintln!("vkAcquireNextImage failed: {}", err);
-                        return;
+    event_loop
+        .run(move |event, event_loop| {
+            match event {
+                Event::WindowEvent { window_id, event } => match event {
+                    WindowEvent::CloseRequested => {
+                        println!("The close button was pressed; stopping");
+                        event_loop.exit();
                     }
-                };
+                    WindowEvent::Resized(size) => unsafe {
+                        swapchain_size = size.into();
+                        device.resize_swapchain(&mut swapchain, swapchain_size);
+                    },
+                    WindowEvent::RedrawRequested => unsafe {
+                        // SAFETY: swapchain is valid
+                        let swapchain_image =
+                            queue.acquire_next_swapchain_image(&swapchain, Duration::from_millis(100));
 
-                let mut frame = Frame::new();
+                        let swapchain_image = match swapchain_image {
+                            Ok(image) => image,
+                            Err(err) => {
+                                eprintln!("vkAcquireNextImage failed: {}", err);
+                                return;
+                            }
+                        };
 
-                let (file_image_id, file_image_width, file_image_height) = load_image(
-                    &device,
-                    &mut frame,
-                    "data/haniyasushin_keiki.jpg".as_ref(),
-                    vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
-                    false,
-                );
+                        let LoadImageResult {
+                            image_info,
+                            width,
+                            height,
+                        } = load_image(
+                            &mut queue,
+                            "data/haniyasushin_keiki.jpg",
+                            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
+                            false,
+                        );
 
-                let blit_w = file_image_width.min(swapchain_size.0);
-                let blit_h = file_image_height.min(swapchain_size.1);
-                let swapchain_image_id = swapchain_image.image_info.id;
+                        let blit_w = width.min(swapchain_size.0);
+                        let blit_h = height.min(swapchain_size.1);
+                        let swapchain_image_id = swapchain_image.image_info.id;
 
-                let blit_pass = PassBuilder::new()
-                    .name("blit to screen")
-                    .image_dependency(
-                        file_image_id,
-                        vk::AccessFlags::TRANSFER_READ,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                    )
-                    .image_dependency(
-                        swapchain_image.image_info.id,
-                        vk::AccessFlags::TRANSFER_WRITE,
-                        vk::PipelineStageFlags::TRANSFER,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                    )
-                    .record_callback(move |context, _, command_buffer| {
-                        let dst_image_handle = context.device().image_handle(swapchain_image_id);
-                        let src_image_handle = context.device().image_handle(file_image_id);
+                        let cb = queue.allocate_command_buffer();
 
                         let regions = &[vk::ImageBlit {
                             src_subresource: vk::ImageSubresourceLayers {
@@ -269,24 +260,50 @@ fn main() {
                             ],
                         }];
 
-                        unsafe {
-                            context.vulkan_device().cmd_blit_image(
-                                command_buffer,
-                                src_image_handle,
-                                vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                                dst_image_handle,
-                                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                                regions,
-                                vk::Filter::NEAREST,
-                            );
-                        }
-                    });
-                frame.add_pass(blit_pass);
-                frame.present(swapchain_image);
-                context.submit_frame(&mut (), frame, &SubmitInfo::default());
-                device.destroy_image(file_image_id);
+                        let device = queue.device();
+                        device
+                            .begin_command_buffer(
+                                cb,
+                                &vk::CommandBufferBeginInfo {
+                                    flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                                    ..Default::default()
+                                },
+                            )
+                            .unwrap();
+                        device.cmd_blit_image(
+                            cb,
+                            image_info.handle,
+                            vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                            swapchain_image.image_info.handle,
+                            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                            regions,
+                            vk::Filter::NEAREST,
+                        );
+                        device.end_command_buffer(cb).unwrap();
+
+                        let mut blit = queue.build_submission();
+                        blit.set_name("blit");
+                        blit.use_image(image_info.id, ResourceState::TRANSFER_SRC);
+                        blit.use_image(swapchain_image_id, ResourceState::TRANSFER_DST);
+                        blit.push_command_buffer(cb);
+                        let render_finished = blit.signal();
+                        blit.submit().expect("blit failed");
+
+                        // transition swapchain image to present
+                        queue
+                            .transition_image(swapchain_image_id, ResourceState::PRESENT)
+                            .unwrap();
+                        queue.present(render_finished, &swapchain_image).unwrap();
+                        queue.destroy_later(image_info.id);
+                        queue.end_frame().unwrap();
+                    },
+                    _ => {}
+                },
+                Event::AboutToWait => {
+                    window.request_redraw();
+                }
+                _ => (),
             }
-            _ => (),
-        }
-    });
+        })
+        .expect("event loop run failed");
 }

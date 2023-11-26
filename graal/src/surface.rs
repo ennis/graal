@@ -1,6 +1,6 @@
 #[cfg(windows)]
 mod platform {
-    use crate::{VULKAN_ENTRY, VULKAN_INSTANCE};
+    use crate::instance::{VULKAN_ENTRY, VULKAN_INSTANCE};
     use ash::{extensions::khr::Win32Surface, vk};
     use lazy_static::lazy_static;
     use raw_window_handle::RawWindowHandle;
@@ -19,8 +19,8 @@ mod platform {
 
         let create_info = vk::Win32SurfaceCreateInfoKHR {
             flags: Default::default(),
-            hinstance: win32_handle.hinstance as *const c_void,
-            hwnd: win32_handle.hwnd as *const c_void,
+            hinstance: win32_handle.hinstance.unwrap().get() as *const c_void,
+            hwnd: win32_handle.hwnd.get() as *const c_void,
             ..Default::default()
         };
         unsafe {

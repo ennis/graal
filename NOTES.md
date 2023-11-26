@@ -53,3 +53,23 @@ Between work items, the user should push "resource barriers", which indicate in 
 This is the equivalent of the image and buffer dependencies (`add_image_dependency`, etc.) of passes.
 
 The library tracks the current state of all resources and figures out which barriers to insert.
+
+# Graal V2 API
+
+Issue: Except for other than images & buffers, we don't track on which queues objects are used. In order to reclaim them, 
+we need to signal the timeline on every queue that might use it, even if the queue is otherwise unused.
+
+"Solution": move deferred object destruction to queues
+
+# Module org, again
+
+From the user POV: no module hierarchy.
+
+Internally:
+- `device` contains most of the things resource IDs, and RAII wrappers, `Buffer` and `Image`, plus typed wrappers.
+- `device` contains `Device`, `create_device_and_queue`
+
+
+# Can we avoid waiting on multiple frames?
+
+If a resource is used on multiple queues, require the user to synchronize with all queues before deleting the 

@@ -60,7 +60,7 @@ pub fn load_image(
         _ => panic!("unsupported image format"),
     };
 
-    let mip_levels = graal::get_mip_level_count(width, height);
+    let mip_levels = graal::mip_level_count(width, height);
 
     // create the texture
     let image = frame.context().create_image(
@@ -86,11 +86,8 @@ pub fn load_image(
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let mut staging_buffer = frame.alloc_upload_slice::<u8>(
-        vk::BufferUsageFlags::TRANSFER_SRC,
-        byte_size as usize,
-        Some("staging"),
-    );
+    let mut staging_buffer =
+        frame.alloc_upload_slice::<u8>(vk::BufferUsageFlags::TRANSFER_SRC, byte_size as usize, Some("staging"));
 
     // read image data
     unsafe {

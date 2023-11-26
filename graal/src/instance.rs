@@ -50,12 +50,10 @@ fn create_vulkan_instance() -> ash::Instance {
 
         // Convert instance extension strings into C-strings
         let c_instance_extensions: Vec<_> = INSTANCE_EXTENSIONS.iter().map(|&s| CString::new(s).unwrap()).collect();
-
         let instance_extensions: Vec<_> = c_instance_extensions.iter().map(|s| s.as_ptr()).collect();
 
         // Convert validation layer names into C-strings
         let c_validation_layers: Vec<_> = VALIDATION_LAYERS.iter().map(|&s| CString::new(s).unwrap()).collect();
-
         let validation_layers: Vec<_> = c_validation_layers.iter().map(|s| s.as_ptr()).collect();
 
         let application_info = vk::ApplicationInfo {
@@ -64,8 +62,8 @@ fn create_vulkan_instance() -> ash::Instance {
             application_version: 0,
             p_engine_name: b"GRAAL\0".as_ptr() as *const c_char,
             engine_version: 0,
-            // require vulkan 1.2
-            api_version: vk::make_api_version(0, 1, 2, 0),
+            // require vulkan 1.3
+            api_version: vk::make_api_version(0, 1, 3, 0),
             ..Default::default()
         };
 
