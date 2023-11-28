@@ -1,9 +1,15 @@
 [workspace]
 members = [
-    "graal",                 # graphics resource abstraction layer
-    "graal-bench",           # graphics resource abstraction layer - testbench
-    "graal-spirv",           # graphics resource abstraction layer - SPIRV reflection utilities
+    "graal",         # graphics resource abstraction layer
+    "mlr",           # "mid-level rendering"
+    "mlr-macros",           # "mid-level rendering"
 ]
+resolver = "2"
+
+[workspace.dependencies]
+graal = { path = "graal" }
+mlr = { path = "mlr" }
+mlr-macros = { path = "mlr-macros" }
 
 [profile.release]
 debug = true

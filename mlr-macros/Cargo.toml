@@ -1,0 +1,19 @@
+[package]
+name = "mlr-macros"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+log = "0.4"
+quote = "1"
+syn = "2"
+darling = { version="0.20.3", features=["diagnostics"] }
+proc-macro2 = "1"
+
+[lib]
+proc-macro = true
+
+[dev-dependencies]
+mlr = { workspace=true }

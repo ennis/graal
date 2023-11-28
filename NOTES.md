@@ -72,4 +72,84 @@ Internally:
 
 # Can we avoid waiting on multiple frames?
 
-If a resource is used on multiple queues, require the user to synchronize with all queues before deleting the 
+If a resource is used on multiple queues, require the user to synchronize with all queues before deleting the resource
+
+
+# Middle-layer
+
+- RAII resource wrappers
+- blit image
+- mipmap generation
+- descriptor shit
+- typed buffers
+- vertex formats
+- `uniforms!` macro
+- rendering
+- clear color / depth
+
+- draw layers: 
+  - loop 1: bind pipeline
+    - loop 2: bind uniforms
+      - loop 3: draw calls 
+
+
+Use VK_KHR_dynamic_rendering and VK_EXT_descriptor_buffer.
+Possibly VK_KHR_push_descriptor so that we don't have to manage the memory for descriptors at all.
+
+
+Use a ref to `Queue` to submit work.
+Issue: RAII deletion of resources needs backref to owner `Queue`, but `Queue` is not shareable.
+
+Solution:
+- set a flag in the resource tracker and have queues scan all resources on end_frame to recycle all discarded resources.
+
+Alternative:
+- all resources are `Rc<Resource>`, tracking info stored in a `RefCell` inside it. 
+  -> even so, still need an rc backref to the queue, pay (negligible) cost of Rc alloc
+
+```rust
+
+// Use when creating pipelines and queue.render
+#[derive(FragmentOutput)]
+struct DefaultOutputOutput {
+  #[color_attachment]
+  color: ImageView<>,
+}
+
+#[derive(VertexInput)]
+struct VertexInput {
+  
+}
+
+/// The type describes a DescriptorSetLayout,
+/// instances of the type can be used to fill a descriptor buffer
+#[derive(Descriptors)]
+struct ShaderArguments {
+  
+}
+
+fn test() {
+  let render_output = DefaultRenderPassOutput { .. };
+
+  queue.render(render_output, |rctx| {
+    // rctx: RenderCtxt<DefaultRenderPassOutput>
+    
+    // set_pipeline(P) where P: Pipeline<FragmentOutput=DefaultRenderPassOutput> 
+    rctx.set_pipeline(pipeline, |shctx| {
+        // shctx: ShaderPipelineCtx
+        
+        // with_vertex_input(P::VertexInput) where 
+        shctx.with_vertex_input(vertex_input, |drawctx| {
+            // drawctx: DrawCtx
+            // issue argument buffer binds & draw calls
+            draw_ctx.bind_arguments(0, scene_args);
+            draw_ctx.bind_arguments(1, scene_args);
+            draw_ctx.push_constants(...);
+            
+        });
+    });
+    
+  })
+}
+
+```

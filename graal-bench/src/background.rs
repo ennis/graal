@@ -47,6 +47,17 @@ struct BackgroundShaderInterface {
     uniforms: graal::BufferDescriptor<BackgroundUniforms>,
 }
 
+#[derive(Shader)]
+#[shader(vertex(path = "shaders/background.vert"))]
+#[shader(fragment(path = "shaders/background.frag"))]
+struct BackgroundShader {
+    #[layout(vertex_buffer, binding = 0)]
+    vertices: graal::VertexBufferView<Vertex2D>,
+
+    #[layout(uniform_buffer, binding = 0)]
+    uniforms: BackgroundUniforms,
+}
+
 // --- Pass ----------------------------------------------------------------------------------------
 pub struct BackgroundPass {
     pipeline: vk::Pipeline,
@@ -79,8 +90,7 @@ impl BackgroundPass {
         ];
 
         let mut set_layouts = Vec::new();
-        let layout_handle = context
-            .get_or_create_descriptor_set_layout_for_interface::<BackgroundShaderInterface>();
+        let layout_handle = context.get_or_create_descriptor_set_layout_for_interface::<BackgroundShaderInterface>();
         set_layouts.push(layout_handle);
 
         let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo {
@@ -194,10 +204,7 @@ impl BackgroundPass {
             ..Default::default()
         };
 
-        let render_pass = create_single_color_target_render_pass(
-            context.vulkan_device(),
-            vk::Format::B8G8R8A8_SRGB,
-        );
+        let render_pass = create_single_color_target_render_pass(context.vulkan_device(), vk::Format::B8G8R8A8_SRGB);
 
         let gpci = vk::GraphicsPipelineCreateInfo {
             flags: Default::default(),
@@ -282,9 +289,7 @@ impl BackgroundPass {
             pass.set_commands(move |context, cb| {
                 unsafe {
                     let descriptor_set =
-                        context.create_descriptor_set(&BackgroundShaderInterface {
-                            uniforms: ubo.into(),
-                        });
+                        context.create_descriptor_set(&BackgroundShaderInterface { uniforms: ubo.into() });
 
                     let output_view = context.create_image_view(&vk::ImageViewCreateInfo {
                         flags: vk::ImageViewCreateFlags::empty(),
@@ -302,13 +307,8 @@ impl BackgroundPass {
                         ..Default::default()
                     });
 
-                    let framebuffer = context.create_framebuffer(
-                        target_size.0,
-                        target_size.1,
-                        1,
-                        render_pass,
-                        &[output_view],
-                    );
+                    let framebuffer =
+                        context.create_framebuffer(target_size.0, target_size.1, 1, render_pass, &[output_view]);
 
                     let render_pass_begin_info = vk::RenderPassBeginInfo {
                         render_pass,
@@ -363,11 +363,9 @@ impl BackgroundPass {
                             },
                         }],
                     );
-                    context.vulkan_device().cmd_bind_pipeline(
-                        cb,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        pipeline,
-                    );
+                    context
+                        .vulkan_device()
+                        .cmd_bind_pipeline(cb, vk::PipelineBindPoint::GRAPHICS, pipeline);
                     context.vulkan_device().cmd_draw(cb, 6, 1, 0, 0);
                     context.vulkan_device().cmd_end_render_pass(cb);
                 }
@@ -378,10 +376,7 @@ impl BackgroundPass {
 
 /// Creates a render pass with a single subpass, writing to a single color target with the specified
 /// format.
-fn create_single_color_target_render_pass(
-    device: &graal::ash::Device,
-    target_format: vk::Format,
-) -> vk::RenderPass {
+fn create_single_color_target_render_pass(device: &graal::ash::Device, target_format: vk::Format) -> vk::RenderPass {
     let render_pass_attachments = &[vk::AttachmentDescription {
         flags: vk::AttachmentDescriptionFlags::empty(),
         format: target_format,
@@ -424,11 +419,7 @@ fn create_single_color_target_render_pass(
         ..Default::default()
     };
 
-    let render_pass = unsafe {
-        device
-            .create_render_pass(&render_pass_create_info, None)
-            .unwrap()
-    };
+    let render_pass = unsafe { device.create_render_pass(&render_pass_create_info, None).unwrap() };
 
     render_pass
 }

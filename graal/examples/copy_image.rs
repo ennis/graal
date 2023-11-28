@@ -1,5 +1,5 @@
 use graal::{
-    device::{BufferResourceCreateInfo, Device, ImageInfo, ImageResourceCreateInfo},
+    device::{BufferResourceCreateInfo, Device, ImageHandle, ImageResourceCreateInfo},
     queue,
     queue::{Queue, ResourceState, Submission},
     vk, MemoryLocation,
@@ -13,7 +13,7 @@ use winit::{
 };
 
 struct LoadImageResult {
-    image_info: ImageInfo,
+    image_info: ImageHandle,
     width: u32,
     height: u32,
 }
@@ -63,14 +63,14 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
     let mip_levels = graal::mip_level_count(width, height);
 
     // create the texture
-    let ImageInfo {
-        handle: image_handle,
+    let ImageHandle {
+        vk: image_handle,
         id: image_id,
     } = device.create_image(
         path.to_str().unwrap(),
         MemoryLocation::GpuOnly,
         &ImageResourceCreateInfo {
-            image_type: vk::ImageType::TYPE_2D,
+            type_: vk::ImageType::TYPE_2D,
             usage: usage | vk::ImageUsageFlags::TRANSFER_DST,
             format: vk_format,
             extent: vk::Extent3D {
@@ -112,7 +112,7 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
             .expect("failed to read image");
     }
 
-    let staging_buffer_handle = staging_buffer.handle;
+    let staging_buffer_handle = staging_buffer.vk;
 
     let cb = queue.allocate_command_buffer();
 
@@ -157,12 +157,12 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
         upload.use_image(image_id, ResourceState::TRANSFER_DST);
         upload.push_command_buffer(cb);
         upload.submit().expect("image upload failed");
-        queue.destroy_later(staging_buffer.id);
+        queue.device().destroy_buffer(staging_buffer.id);
     }
 
     LoadImageResult {
-        image_info: ImageInfo {
-            handle: image_handle,
+        image_info: ImageHandle {
+            vk: image_handle,
             id: image_id,
         },
         width,
@@ -225,7 +225,7 @@ fn main() {
 
                         let blit_w = width.min(swapchain_size.0);
                         let blit_h = height.min(swapchain_size.1);
-                        let swapchain_image_id = swapchain_image.image_info.id;
+                        let swapchain_image_id = swapchain_image.handle.id;
 
                         let cb = queue.allocate_command_buffer();
 
@@ -272,9 +272,9 @@ fn main() {
                             .unwrap();
                         device.cmd_blit_image(
                             cb,
-                            image_info.handle,
+                            image_info.vk,
                             vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-                            swapchain_image.image_info.handle,
+                            swapchain_image.handle.vk,
                             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                             regions,
                             vk::Filter::NEAREST,
@@ -294,8 +294,9 @@ fn main() {
                             .transition_image(swapchain_image_id, ResourceState::PRESENT)
                             .unwrap();
                         queue.present(render_finished, &swapchain_image).unwrap();
-                        queue.destroy_later(image_info.id);
                         queue.end_frame().unwrap();
+
+                        queue.device().destroy_image(image_info.id);
                     },
                     _ => {}
                 },

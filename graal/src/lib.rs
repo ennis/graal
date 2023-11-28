@@ -3,7 +3,9 @@
 pub use ash::{self, vk};
 pub use gpu_allocator::MemoryLocation;
 
+pub mod buffer;
 pub mod device;
+pub mod image;
 pub mod instance;
 pub mod platform;
 pub mod queue;

@@ -1,7 +1,7 @@
 //! Memory resources (images and buffers) and resource groups.
 use super::{
-    BufferInfo, BufferRegistrationInfo, BufferResource, BufferResourceCreateInfo, ImageInfo, ImageRegistrationInfo,
-    ImageResource, ImageResourceCreateInfo, Resource, ResourceKind, ResourceRegistrationInfo,
+    BufferHandle, BufferRegistrationInfo, BufferResource, BufferResourceCreateInfo, ImageHandle, ImageRegistrationInfo,
+    ImageResource, ImageResourceCreateInfo, OwnerQueue, Resource, ResourceKind, ResourceRegistrationInfo,
 };
 use crate::{
     device::{BufferId, Device, GroupId, ImageId, ResourceAllocation, ResourceId},
@@ -9,9 +9,9 @@ use crate::{
 };
 use ash::vk::Handle;
 use gpu_allocator::vulkan::AllocationScheme;
-use tracing::debug;
+use std::mem;
 
-pub(super) struct ResourceGroup {
+pub(crate) struct ResourceGroup {
     // The timeline values that a pass needs to wait for to ensure an execution dependency between the pass
     // and all writers of the resources in the group.
     //pub(crate) wait: TimelineValues,
@@ -67,43 +67,73 @@ pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
     }
 }
 
+unsafe fn destroy_resource(device: &Device, resource: &mut Resource) {
+    if let ResourceAllocation::External = resource.allocation {
+        return;
+    }
+
+    // destroy the object
+    match resource.kind {
+        ResourceKind::Buffer(ref buf) => device.device.destroy_buffer(buf.handle, None),
+        ResourceKind::Image(ref img) => device.device.destroy_image(img.handle, None),
+    };
+
+    // release the associated memory
+    // the mem::replace is there to move out the allocation object (which isn't Clone)
+    match mem::replace(&mut resource.allocation, ResourceAllocation::External) {
+        ResourceAllocation::Allocation { allocation } => device
+            .allocator
+            .borrow_mut()
+            .free(allocation)
+            .expect("failed to free memory"),
+        ResourceAllocation::Transient { .. } => {
+            todo!("destroy transient resources")
+        }
+        ResourceAllocation::DeviceMemory { device_memory } => {
+            device.device.free_memory(device_memory, None);
+        }
+        ResourceAllocation::External => {
+            unreachable!()
+        }
+    }
+}
+
 impl Device {
-    unsafe fn destroy_resource(&self, id: ResourceId) {
+    /*unsafe fn destroy_resource(&self, id: ResourceId) {
         //trace!(?id, name = r.name.as_str(), tracking=?r.tracking, "destroy_resource");
         debug!("destroy_resource {:?}", id);
         let mut resources = self.resources.borrow_mut();
         let res = resources.remove(id).expect("invalid resource id");
-        let destroy_resource = |device: &ash::Device, kind: &ResourceKind| match kind {
-            ResourceKind::Buffer(buf) => device.destroy_buffer(buf.handle, None),
-            ResourceKind::Image(img) => device.destroy_image(img.handle, None),
-        };
+        destroy_resource()
+    }*/
 
-        // the mem::replace is there to move out the allocation object (which isn't Clone)
-        match res.allocation {
-            ResourceAllocation::Allocation { allocation } => {
-                destroy_resource(&self.device, &res.kind);
-                self.allocator
-                    .borrow_mut()
-                    .free(allocation)
-                    .expect("failed to free memory")
-            }
-            ResourceAllocation::Transient { .. } => {
-                todo!("destroy transient resources")
-            }
-            ResourceAllocation::DeviceMemory { device_memory } => {
-                destroy_resource(&self.device, &res.kind);
-                self.device.free_memory(device_memory, None);
-            }
-            ResourceAllocation::External => {}
-        }
-    }
-
-    /// Destroys an image resource immediately.
+    /*/// Destroys an image resource immediately.
     pub unsafe fn destroy_image(&self, id: ImageId) {
         self.destroy_resource(id.into());
     }
 
     /// Destroys a buffer resource immediately.
+    pub unsafe fn destroy_buffer(&self, id: BufferId) {
+        self.destroy_resource(id.into());
+    }*/
+
+    /// Marks a resource for deletion once the queue that currently owns it is done with it.
+    unsafe fn destroy_resource(&self, id: ResourceId) {
+        let mut resources = self.resources.borrow_mut();
+        let resource = resources.get_mut(id).expect("invalid resource id");
+        if resource.owner == OwnerQueue::None {
+            resources.remove(id);
+        } else {
+            resource.discarded = true;
+        }
+    }
+
+    /// Destroys an image resource.
+    pub unsafe fn destroy_image(&self, id: ImageId) {
+        self.destroy_resource(id.into());
+    }
+
+    /// Destroys a buffer resource.
     pub unsafe fn destroy_buffer(&self, id: BufferId) {
         self.destroy_resource(id.into());
     }
@@ -167,14 +197,14 @@ impl Device {
         name: &str,
         location: MemoryLocation,
         image_info: &ImageResourceCreateInfo,
-    ) -> ImageInfo {
+    ) -> ImageHandle {
         // for now all resources are CONCURRENT, because that's the only way they can
         // be read across multiple queues.
         // Maybe exclusive ownership will be needed at some point, but then we should prevent
         // them from being used across multiple queues. I know that there's the possibility of doing
         // a "queue ownership transfer", but that shit is incomprehensible.
         let create_info = vk::ImageCreateInfo {
-            image_type: image_info.image_type,
+            image_type: image_info.type_,
             format: image_info.format,
             extent: image_info.extent,
             mip_levels: image_info.mip_levels,
@@ -226,7 +256,7 @@ impl Device {
             })
         };
 
-        ImageInfo { id, handle }
+        ImageHandle { id, vk: handle }
     }
 
     /// Creates a new buffer resource.
@@ -238,7 +268,7 @@ impl Device {
         name: &str,
         location: MemoryLocation,
         buffer_create_info: &BufferResourceCreateInfo,
-    ) -> BufferInfo {
+    ) -> BufferHandle {
         // create the buffer object first
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
@@ -302,7 +332,11 @@ impl Device {
             })
         };
 
-        BufferInfo { id, handle, mapped_ptr }
+        BufferHandle {
+            id,
+            vk: handle,
+            mapped_ptr,
+        }
     }
 
     /// Registers an existing buffer resource.
@@ -336,13 +370,37 @@ impl Device {
         let id = self.resources.borrow_mut().insert(Resource {
             name: info.name.to_string(),
             discarded: false,
-            tracking: Default::default(),
             kind,
             allocation: info.allocation,
             group: None,
+            flush_mask: Default::default(),
+            visible: Default::default(),
+            layout: Default::default(),
+            owner: OwnerQueue::None,
+            stages: Default::default(),
+            wait_semaphore: None,
+            timestamp: 0,
         });
 
         self.set_debug_object_name(object_type, object_handle, info.name, None);
         id
     }
+
+    // Cleanup expired resources on the specified queue.
+    pub(crate) unsafe fn cleanup_queue_resources(&self, queue_index: usize, completed_timestamp: u64) {
+        let mut resources = self.resources.borrow_mut();
+        resources.retain(|_id, resource| {
+            if resource.discarded
+                && resource.owner == OwnerQueue::Exclusive(queue_index)
+                && resource.timestamp <= completed_timestamp
+            {
+                destroy_resource(self, resource);
+                false
+            } else {
+                true
+            }
+        })
+    }
 }
+
+// Image { handle, Rc<Queue> }

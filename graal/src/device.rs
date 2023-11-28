@@ -7,7 +7,7 @@ use crate::{
     platform_impl,
     queue::{Queue, SemaphoreWait, SignaledSemaphore},
 };
-use ash::{vk, vk::Handle};
+use ash::vk;
 use slotmap::{Key, SlotMap};
 use std::{cell::RefCell, ffi::CString, fmt, ops::Deref, os::raw::c_void, ptr, ptr::NonNull, rc::Rc};
 
@@ -29,6 +29,7 @@ pub struct Device {
     pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
     pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
     pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
+
     pub(crate) resources: RefCell<ResourceMap>,
     pub(crate) resource_groups: RefCell<ResourceGroupMap>,
 }
@@ -96,23 +97,22 @@ impl From<BufferId> for ResourceId {
 
 /// Holds information about a buffer resource.
 #[derive(Copy, Clone, Debug)]
-pub struct BufferInfo {
+pub struct BufferHandle {
     /// ID of the buffer resource.
     pub id: BufferId,
     /// Vulkan handle of the buffer.
-    pub handle: vk::Buffer,
+    pub vk: vk::Buffer,
     /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
-    // TODO: Option<NonNull>
     pub mapped_ptr: Option<NonNull<c_void>>,
 }
 
 /// Holds information about an image resource.
 #[derive(Copy, Clone, Debug)]
-pub struct ImageInfo {
+pub struct ImageHandle {
     /// ID of the image resource.
     pub id: ImageId,
     /// Vulkan handle of the image.
-    pub handle: vk::Image,
+    pub vk: vk::Image,
 }
 
 #[derive(Debug)]
@@ -150,15 +150,15 @@ pub struct SwapchainImage {
     /// Handle of the swapchain that owns this image.
     pub swapchain: vk::SwapchainKHR,
     /// Index of the image in the swap chain.
-    pub image_index: u32,
-    pub image_info: ImageInfo,
+    pub index: u32,
+    pub handle: ImageHandle,
 }
 
 /// Information passed to `Context::create_image` to describe the image to be created.
 #[derive(Copy, Clone, Debug)]
 pub struct ImageResourceCreateInfo {
     /// Dimensionality of the image.
-    pub image_type: vk::ImageType,
+    pub type_: vk::ImageType,
     /// Image usage flags. Must include all intended uses of the image.
     pub usage: vk::ImageUsageFlags,
     /// Format of the image.
@@ -236,6 +236,8 @@ impl Device {
 pub(crate) const MAX_QUEUES: usize = 4;
 
 /// Defines the queue indices for each usage (graphics, compute, transfer, present).
+///
+/// FIXME: only allocate multiple queues if requested
 #[derive(Copy, Clone, Default)]
 pub(crate) struct QueueIndices {
     /// The queue that should be used for graphics operations. It is also guaranteed to support compute and transfer operations.
@@ -415,41 +417,13 @@ pub(crate) struct BufferResource {
 
 /// Describes how the resource is access by different queues.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum QueueOwnership {
+pub(crate) enum OwnerQueue {
     /// No lock on the resource.
     None,
     /// The specified queue holds an exclusive lock on the resource.
-    Exclusive(u16),
+    Exclusive(usize),
     /// The specified queues (queue mask) are accessing the resource for reading concurrently.
     Concurrent(u16),
-}
-
-#[derive(Debug)]
-pub(crate) struct ResourceTrackingInfo {
-    /// Access types that need flushing (srcAccessMask).
-    pub(crate) flush_mask: vk::AccessFlags2,
-    /// Which access types can see the last write to the resource.
-    pub(crate) visible: vk::AccessFlags2,
-    /// Current image layout if the resource is an image. Ignored otherwise.
-    pub(crate) layout: vk::ImageLayout,
-    pub(crate) queue_ownership: QueueOwnership,
-    /// The stages that last accessed the resource. Valid only on the writer queue.
-    pub(crate) stages: vk::PipelineStageFlags2,
-    /// The binary semaphore to wait for before accessing the resource.
-    pub(crate) wait_semaphore: Option<SignaledSemaphore>,
-}
-
-impl Default for ResourceTrackingInfo {
-    fn default() -> Self {
-        ResourceTrackingInfo {
-            flush_mask: Default::default(),
-            layout: Default::default(),
-            visible: Default::default(),
-            stages: Default::default(),
-            wait_semaphore: Default::default(),
-            queue_ownership: QueueOwnership::None,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -464,15 +438,34 @@ pub(crate) struct Resource {
     pub(crate) name: String,
     /// Whether this pass has been discarded during the last frame.
     pub(crate) discarded: bool,
-    /// Who owns the resource.
+    /// The allocation for the resource.
     pub(crate) allocation: ResourceAllocation,
     /// Details specific to the kind of resource (buffer or image).
     pub(crate) kind: ResourceKind,
     /// For frozen resources, the group that the resource belongs to. Otherwise `None` if the resource
     /// is not frozen.
     pub(crate) group: Option<GroupId>,
-    /// Tracking information.
-    pub(crate) tracking: ResourceTrackingInfo,
+
+    /// Access types that need flushing (srcAccessMask).
+    pub(crate) flush_mask: vk::AccessFlags2,
+    /// Which access types can see the last write to the resource.
+    pub(crate) visible: vk::AccessFlags2,
+    /// Current image layout if the resource is an image. Ignored otherwise.
+    pub(crate) layout: vk::ImageLayout,
+    pub(crate) owner: OwnerQueue,
+    /// The stages that last accessed the resource. Valid only on the writer queue.
+    pub(crate) stages: vk::PipelineStageFlags2,
+    /// The binary semaphore to wait for before accessing the resource.
+    pub(crate) wait_semaphore: Option<SignaledSemaphore>,
+
+    /// Timestamp of the last access to the resource on its owner queue.
+    ///
+    /// It's a value of the timeline semaphore of the queue.
+    ///
+    /// TODO: it's only used for deferred deletion, to ensure that no queue is still using the resource.
+    /// We could replace that by a set of semaphore waits in order to support waiting on a resource
+    /// used concurrently by multiple queues.
+    pub(crate) timestamp: u64,
 }
 
 impl Resource {

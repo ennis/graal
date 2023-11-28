@@ -1,7 +1,7 @@
 use crate::{
     command_allocator::CommandBufferAllocator,
     device::{
-        BufferId, Device, GroupId, ImageId, ImageInfo, ImageRegistrationInfo, QueueOwnership, ResourceAllocation,
+        BufferId, Device, GroupId, ImageHandle, ImageId, ImageRegistrationInfo, OwnerQueue, ResourceAllocation,
         ResourceId, ResourceKind, ResourceMap, ResourceRegistrationInfo, Swapchain, SwapchainImage,
     },
     is_write_access, vk,
@@ -9,6 +9,30 @@ use crate::{
 use ash::{prelude::VkResult, vk::Buffer};
 use std::{collections::VecDeque, ffi::c_void, mem, ops::Deref, ptr, rc::Rc, time::Duration};
 use tracing::debug;
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Wrapper around a Vulkan queue that tracks the use of resources.
+pub struct Queue {
+    device: Rc<Device>,
+    queue_index: usize,
+    queue_family_index: u32,
+    queue: vk::Queue,
+    timeline: vk::Semaphore,
+    free_cb_allocs: Vec<CommandBufferAllocator>,
+
+    /// Last signalled value on the timeline semaphore of the queue.
+    last_signaled: u64,
+
+    //------ Recycled resources ------
+    /// Binary semaphores for which we've submitted a wait operation.
+    semaphores: Vec<UnsignaledSemaphore>,
+
+    // ------ in flight resources ------
+    /// Resources of frames that are currently executing on the GPU.
+    current: InFlightResources,
+    submitted: VecDeque<InFlightResources>,
+}
 
 /// A wrapper around a signaled binary semaphore.
 #[derive(Debug)]
@@ -52,32 +76,10 @@ impl ResourceState {
     };
 }
 
-/// Wrapper around a Vulkan queue that tracks the use of resources.
-pub struct Queue {
-    device: Rc<Device>,
-    queue_index: usize,
-    queue_family_index: u32,
-    queue: vk::Queue,
-    timeline: vk::Semaphore,
-    free_cb_allocs: Vec<CommandBufferAllocator>,
-
-    /// Last signalled value on the timeline semaphore of the queue.
-    last_signaled: u64,
-
-    //------ Recycled resources ------
-    /// Binary semaphores for which we've submitted a wait operation.
-    semaphores: Vec<UnsignaledSemaphore>,
-
-    // ------ in flight resources ------
-    /// Resources of frames that are currently executing on the GPU.
-    current_frame: InFlightResources,
-    submitted: VecDeque<InFlightResources>,
-}
-
 /// In-flight resources.
 #[derive(Debug)]
 struct InFlightResources {
-    timeline_value: u64,
+    timestamp: u64,
     /// Command pool
     cb_alloc: CommandBufferAllocator,
     /// Deferred deletion list
@@ -102,8 +104,8 @@ impl Queue {
             last_signaled: 0,
             semaphores: vec![],
             queue_family_index,
-            current_frame: InFlightResources {
-                timeline_value: 1,
+            current: InFlightResources {
+                timestamp: 1,
                 cb_alloc,
                 deferred_delete: vec![],
             },
@@ -138,7 +140,7 @@ impl Queue {
 
     /// Allocates a command buffer.
     pub fn allocate_command_buffer(&mut self) -> vk::CommandBuffer {
-        self.current_frame.cb_alloc.alloc(&self.device.device)
+        self.current.cb_alloc.alloc(&self.device.device)
     }
 
     /// Acquires the next image in a swapchain.
@@ -182,8 +184,8 @@ impl Queue {
 
         Ok(SwapchainImage {
             swapchain: swapchain.handle,
-            image_info: ImageInfo { id, handle },
-            image_index,
+            handle: ImageHandle { id, vk: handle },
+            index: image_index,
         })
     }
 
@@ -198,7 +200,7 @@ impl Queue {
             p_wait_semaphores: &render_finished.0,
             swapchain_count: 1,
             p_swapchains: &swapchain_image.swapchain,
-            p_image_indices: &swapchain_image.image_index,
+            p_image_indices: &swapchain_image.index,
             p_results: ptr::null_mut(),
             ..Default::default()
         };
@@ -449,13 +451,9 @@ impl<'a> Submission<'a> {
     pub unsafe fn submit(mut self) -> VkResult<()> {
         let mut barrier_builder = PipelineBarrierBuilder::default();
 
-        {
-            let mut resources = self.queue.device.resources.borrow_mut();
-            let resources = &mut *resources;
-            // Build barriers and update resource states
-            for use_ in self.uses.iter() {
-                add_resource_dependency(self.queue.queue_index, use_, resources, &mut barrier_builder);
-            }
+        // Build barriers and update resource states
+        for use_ in self.uses.iter() {
+            self.queue.record_resource_use(use_, &mut barrier_builder);
         }
 
         // Push a command buffer with the necessary barriers
@@ -587,99 +585,98 @@ impl<'a> Submission<'a> {
     }
 }
 
-/// Given a resource use, and the current state of the resource, adds the necessary barriers
-/// and updates the known state of the resource.
-fn add_resource_dependency(
-    queue_index: usize,
-    use_: &ResourceUse,
-    resources: &mut ResourceMap,
-    barriers: &mut PipelineBarrierBuilder,
-) {
-    let resource = resources.get_mut(use_.id).expect("unknown resource");
-    assert!(!resource.discarded, "used a discarded resource: {:?}", resource);
-    assert!(
-        resource.group.is_none(),
-        "add_resource_dependency cannot be called on group-synced resources"
-    );
-    let tracking = &mut resource.tracking;
-
-    let writes_visible = match tracking.queue_ownership {
-        QueueOwnership::None => {
-            // first use, acquire ownership
-            tracking.queue_ownership = QueueOwnership::Exclusive(queue_index as u16);
-            // no writes yet
-            true
-        }
-        QueueOwnership::Exclusive(queue) => {
-            assert_eq!(
-                queue, queue_index as u16,
-                "resource is owned by another queue; use Submission::queue_release/Submission::queue_acquire to transfer ownership"
-            );
-            tracking.visible.contains(use_.access_mask) || tracking.visible.contains(vk::AccessFlags2::MEMORY_READ)
-        }
-        QueueOwnership::Concurrent(_queues) => {
-            todo!("queue concurrent access")
-        }
-    };
-
-    // We need to insert a memory dependency if:
-    // - the image needs a layout transition
-    // - the resource has writes that are not visible to the target access
-    //
-    // We need to insert an execution dependency if:
-    // - we're writing to the resource (write-after-read hazard, write-after-write hazard)
-    if !writes_visible || tracking.layout != use_.initial_layout || is_write_access(use_.access_mask) {
-        match resource.kind {
-            ResourceKind::Buffer(ref buffer) => {
-                let barrier = barriers.get_or_create_buffer_barrier(buffer.handle);
-                barrier.buffer = buffer.handle;
-                barrier.src_stage_mask |= tracking.stages;
-                barrier.dst_stage_mask |= use_.stage_mask;
-                barrier.src_access_mask |= tracking.flush_mask;
-                barrier.dst_access_mask |= use_.access_mask;
-            }
-            ResourceKind::Image(ref image) => {
-                let barrier = barriers.get_or_create_image_barrier(image.handle);
-                barrier.image = image.handle;
-                barrier.src_stage_mask |= tracking.stages;
-                barrier.dst_stage_mask |= use_.stage_mask;
-                barrier.src_access_mask |= tracking.flush_mask;
-                barrier.dst_access_mask |= use_.access_mask;
-                barrier.old_layout = tracking.layout;
-                assert_eq!(use_.initial_layout, use_.final_layout, "unsupported layout transition");
-                barrier.new_layout = use_.initial_layout;
-                barrier.subresource_range = vk::ImageSubresourceRange {
-                    aspect_mask: image.all_aspects,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    ..Default::default()
-                };
-                tracking.layout = use_.final_layout;
-            }
-        }
-    }
-
-    if is_write_access(use_.access_mask) {
-        // we're writing to the resource, so reset visibility...
-        tracking.visible = vk::AccessFlags2::empty();
-        // ... but signal that there is data to flush.
-        tracking.flush_mask |= use_.access_mask;
-    } else {
-        // This memory dependency makes all writes on the resource available, and
-        // visible to the types specified in `access.access_mask`.
-        // There's no write, so we don't need to flush anything.
-        tracking.flush_mask = vk::AccessFlags2::empty();
-        tracking.visible |= use_.access_mask;
-    }
-
-    // Update the resource stage mask
-    tracking.stages = use_.stage_mask;
-    tracking.queue_ownership = QueueOwnership::Exclusive(queue_index as u16);
-}
-
 impl Queue {
+    /// Given a resource use, and the current state of the resource, adds the necessary barriers
+    /// and updates the known state of the resource.
+    fn record_resource_use(&self, use_: &ResourceUse, barriers: &mut PipelineBarrierBuilder) {
+        let queue_index = self.queue_index;
+        let timestamp = self.current.timestamp;
+        let mut resources = self.device.resources.borrow_mut();
+        let resource = resources.get_mut(use_.id).expect("unknown resource");
+
+        assert!(!resource.discarded, "used a discarded resource: {:?}", resource);
+        assert!(
+            resource.group.is_none(),
+            "add_resource_dependency cannot be called on group-synced resources"
+        );
+
+        let writes_visible = match resource.owner {
+            OwnerQueue::None => {
+                // first use, acquire ownership
+                resource.owner = OwnerQueue::Exclusive(queue_index);
+                // no writes yet
+                true
+            }
+            OwnerQueue::Exclusive(queue) => {
+                assert_eq!(
+                    queue, queue_index,
+                    "resource is owned by another queue; use Submission::queue_release/Submission::queue_acquire to transfer ownership"
+                );
+                resource.visible.contains(use_.access_mask) || resource.visible.contains(vk::AccessFlags2::MEMORY_READ)
+            }
+            OwnerQueue::Concurrent(_queues) => {
+                todo!("queue concurrent access")
+            }
+        };
+
+        // We need to insert a memory dependency if:
+        // - the image needs a layout transition
+        // - the resource has writes that are not visible to the target access
+        //
+        // We need to insert an execution dependency if:
+        // - we're writing to the resource (write-after-read hazard, write-after-write hazard)
+        if !writes_visible || resource.layout != use_.initial_layout || is_write_access(use_.access_mask) {
+            match resource.kind {
+                ResourceKind::Buffer(ref buffer) => {
+                    let barrier = barriers.get_or_create_buffer_barrier(buffer.handle);
+                    barrier.buffer = buffer.handle;
+                    barrier.src_stage_mask |= resource.stages;
+                    barrier.dst_stage_mask |= use_.stage_mask;
+                    barrier.src_access_mask |= resource.flush_mask;
+                    barrier.dst_access_mask |= use_.access_mask;
+                }
+                ResourceKind::Image(ref image) => {
+                    let barrier = barriers.get_or_create_image_barrier(image.handle);
+                    barrier.image = image.handle;
+                    barrier.src_stage_mask |= resource.stages;
+                    barrier.dst_stage_mask |= use_.stage_mask;
+                    barrier.src_access_mask |= resource.flush_mask;
+                    barrier.dst_access_mask |= use_.access_mask;
+                    barrier.old_layout = resource.layout;
+                    assert_eq!(use_.initial_layout, use_.final_layout, "unsupported layout transition");
+                    barrier.new_layout = use_.initial_layout;
+                    barrier.subresource_range = vk::ImageSubresourceRange {
+                        aspect_mask: image.all_aspects,
+                        base_mip_level: 0,
+                        level_count: vk::REMAINING_MIP_LEVELS,
+                        base_array_layer: 0,
+                        layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        ..Default::default()
+                    };
+                    resource.layout = use_.final_layout;
+                }
+            }
+        }
+
+        if is_write_access(use_.access_mask) {
+            // we're writing to the resource, so reset visibility...
+            resource.visible = vk::AccessFlags2::empty();
+            // ... but signal that there is data to flush.
+            resource.flush_mask |= use_.access_mask;
+        } else {
+            // This memory dependency makes all writes on the resource available, and
+            // visible to the types specified in `access.access_mask`.
+            // There's no write, so we don't need to flush anything.
+            resource.flush_mask = vk::AccessFlags2::empty();
+            resource.visible |= use_.access_mask;
+        }
+
+        // Update the resource stage mask
+        resource.stages = use_.stage_mask;
+        resource.timestamp = timestamp;
+        resource.owner = OwnerQueue::Exclusive(queue_index);
+    }
+
     pub fn build_submission(&mut self) -> Submission {
         Submission::new(self)
     }
@@ -687,7 +684,7 @@ impl Queue {
     pub fn end_frame(&mut self) -> VkResult<()> {
         let submit_result = unsafe {
             let semaphores = [self.timeline];
-            let values = [self.current_frame.timeline_value];
+            let values = [self.current.timestamp];
             let timeline_submit_info = vk::TimelineSemaphoreSubmitInfo {
                 p_next: ptr::null(),
                 wait_semaphore_value_count: 0,
@@ -712,11 +709,19 @@ impl Queue {
             self.device.queue_submit(self.queue, &[submit_info], vk::Fence::null())
         };
 
-        self.last_signaled = self.current_frame.timeline_value;
+        self.last_signaled = self.current.timestamp;
 
         // Do cleanup first so that we can recycle command pools
-        self.cleanup();
+        let completed_timestamp = self.cleanup();
 
+        // Scan the list of resources that are owned by the queue and that have been discarded
+        unsafe {
+            // SAFETY: we waited for the queue to be finished with the resources
+            self.device
+                .cleanup_queue_resources(self.queue_index, completed_timestamp);
+        }
+
+        // Setup resources for the next frame
         let cb_alloc = self.free_cb_allocs.pop().unwrap_or_else(|| {
             debug!("creating new command buffer allocator");
             let queue_family = self.device.queue_family_index(self.queue_index);
@@ -725,9 +730,9 @@ impl Queue {
         });
 
         self.submitted.push_front(mem::replace(
-            &mut self.current_frame,
+            &mut self.current,
             InFlightResources {
-                timeline_value: self.last_signaled + 1,
+                timestamp: self.last_signaled + 1,
                 cb_alloc,
                 deferred_delete: vec![],
             },
@@ -736,10 +741,8 @@ impl Queue {
     }
 }
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum DeferredDestroyObject {
-    Image(ImageId),
-    Buffer(BufferId),
     ImageView(vk::ImageView),
     Sampler(vk::Sampler),
     PipelineLayout(vk::PipelineLayout),
@@ -747,7 +750,7 @@ pub enum DeferredDestroyObject {
     Semaphore(vk::Semaphore),
 }
 
-impl From<ImageId> for DeferredDestroyObject {
+/*impl From<ImageId> for DeferredDestroyObject {
     fn from(image: ImageId) -> Self {
         DeferredDestroyObject::Image(image)
     }
@@ -756,7 +759,8 @@ impl From<BufferId> for DeferredDestroyObject {
     fn from(buffer: BufferId) -> Self {
         DeferredDestroyObject::Buffer(buffer)
     }
-}
+}*/
+
 impl From<vk::ImageView> for DeferredDestroyObject {
     fn from(view: vk::ImageView) -> Self {
         DeferredDestroyObject::ImageView(view)
@@ -796,31 +800,26 @@ impl Queue {
 
     pub unsafe fn destroy_later(&mut self, object: impl Into<DeferredDestroyObject>) {
         let obj = object.into();
-        let resource_id: Option<ResourceId> = match obj {
+        /*let resource_id: Option<ResourceId> = match obj {
             DeferredDestroyObject::Image(image) => Some(image.into()),
             DeferredDestroyObject::Buffer(buffer) => Some(buffer.into()),
             _ => None,
-        };
-        if let Some(resource_id) = resource_id {
+        };*/
+        /*if let Some(resource_id) = resource_id {
             // For image and buffers, check that they are synchronized on this queue
-            let ownership = self
-                .device
-                .resources
-                .borrow()
-                .get(resource_id)
-                .unwrap()
-                .tracking
-                .queue_ownership;
+            let mut resources = self.device.resources.borrow_mut();
+            let resource = resources.get_mut(resource_id).expect("invalid or expired resource ID");
             assert_eq!(
-                ownership,
+                resource.tracking.queue_ownership,
                 QueueOwnership::Exclusive(self.queue_index as u16),
                 "destroy_later called on a resource that is not synchronized on this queue. Use acquire"
             );
-        }
-        self.current_frame.deferred_delete.push(obj);
+            resource.discarded = true;
+        }*/
+        self.current.deferred_delete.push(obj);
     }
 
-    fn cleanup(&mut self) {
+    fn cleanup(&mut self) -> u64 {
         let completed = unsafe {
             self.device
                 .device
@@ -832,15 +831,16 @@ impl Queue {
             let Some(oldest_frame) = self.submitted.front() else {
                 break;
             };
-            if oldest_frame.timeline_value > completed {
+            if oldest_frame.timestamp > completed {
                 break;
             }
             debug!(
                 "cleaning up frame {} on queue {}",
-                oldest_frame.timeline_value, self.queue_index
+                oldest_frame.timestamp, self.queue_index
             );
             // reclaim resources of the oldest frame that has completed
             let frame = self.submitted.pop_front().unwrap();
+
             // deferred deletion
             unsafe {
                 for obj in frame.deferred_delete {
@@ -860,13 +860,6 @@ impl Queue {
                         DeferredDestroyObject::Semaphore(semaphore) => {
                             self.device.device.destroy_semaphore(semaphore, None);
                         }
-                        DeferredDestroyObject::Image(image) => self.device.destroy_image(image),
-                        DeferredDestroyObject::Buffer(buffer) => {
-                            self.device.destroy_buffer(buffer);
-                        }
-                        _ => {
-                            unimplemented!()
-                        }
                     }
                 }
             }
@@ -878,5 +871,7 @@ impl Queue {
             }
             self.free_cb_allocs.push(cb_alloc);
         }
+
+        completed
     }
 }
