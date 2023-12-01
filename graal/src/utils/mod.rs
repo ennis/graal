@@ -1,6 +1,6 @@
 use crate::{
     device::ImageHandle,
-    queue::{Queue, ResourceState},
+    queue::{Queue, ResourceState, Submission},
     vk,
 };
 
@@ -65,10 +65,10 @@ pub unsafe fn blit_images(
     );
     device.end_command_buffer(cb).unwrap();
 
-    let mut blit = queue.build_submission();
+    let mut blit = Submission::new();
     blit.set_name("blit_images");
     blit.use_image(src_image.id, ResourceState::TRANSFER_SRC);
     blit.use_image(dst_image.id, ResourceState::TRANSFER_DST);
     blit.push_command_buffer(cb);
-    blit.submit().expect("blit_images failed");
+    queue.submit(blit).expect("blit_images failed");
 }

@@ -153,3 +153,8 @@ fn test() {
 }
 
 ```
+
+
+# Issue: tracking non-resource objects across queues
+Deleting an object: must assume that all queues can need it.
+

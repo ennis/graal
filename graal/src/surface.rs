@@ -1,14 +1,15 @@
 #[cfg(windows)]
 mod platform {
-    use crate::instance::{VULKAN_ENTRY, VULKAN_INSTANCE};
+    use crate::instance::{get_vulkan_entry, get_vulkan_instance};
     use ash::{extensions::khr::Win32Surface, vk};
-    use lazy_static::lazy_static;
+    use once_cell::sync::Lazy;
     use raw_window_handle::RawWindowHandle;
     use std::os::raw::c_void;
 
-    lazy_static! {
-        pub(crate) static ref VULKAN_SURFACE_WIN32_KHR: Win32Surface =
-            Win32Surface::new(&*VULKAN_ENTRY, &*VULKAN_INSTANCE);
+    static VK_KHR_SURFACE_WIN32: Lazy<Win32Surface> = Lazy::new(create_vk_khr_surface);
+
+    fn create_vk_khr_surface() -> Win32Surface {
+        ash::extensions::khr::Win32Surface::new(get_vulkan_entry(), get_vulkan_instance())
     }
 
     pub fn get_vulkan_surface(handle: RawWindowHandle) -> vk::SurfaceKHR {
@@ -24,7 +25,7 @@ mod platform {
             ..Default::default()
         };
         unsafe {
-            VULKAN_SURFACE_WIN32_KHR
+            VK_KHR_SURFACE_WIN32
                 .create_win32_surface(&create_info, None)
                 .expect("failed to create win32 surface")
         }

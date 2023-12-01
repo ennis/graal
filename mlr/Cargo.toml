@@ -7,5 +7,6 @@ edition = "2021"
 
 [dependencies]
 memoffset = "0.9.0"
+ordered-float = "4.1.1"
 graal = { workspace = true }
 mlr-macros = { workspace = true }

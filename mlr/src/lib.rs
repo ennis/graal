@@ -1,7 +1,11 @@
 //pub mod argument;
+pub mod argument;
 pub mod attachments;
 pub mod buffer;
+mod device;
 pub mod image;
+mod queue;
+mod sampler;
 pub mod vertex;
 
 /*

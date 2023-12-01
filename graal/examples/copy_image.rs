@@ -151,12 +151,12 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
         );
         device.end_command_buffer(cb).unwrap();
 
-        let mut upload = queue.build_submission();
+        let mut upload = Submission::new();
         upload.set_name("image upload");
         upload.use_buffer(staging_buffer.id, ResourceState::TRANSFER_SRC);
         upload.use_image(image_id, ResourceState::TRANSFER_DST);
         upload.push_command_buffer(cb);
-        upload.submit().expect("image upload failed");
+        queue.submit(upload).expect("image upload failed");
         queue.device().destroy_buffer(staging_buffer.id);
     }
 
@@ -182,7 +182,8 @@ fn main() {
 
     let surface = graal::surface::get_vulkan_surface(window.raw_window_handle().unwrap());
 
-    let (device, mut queue) = unsafe { graal::create_device_and_queue(Some(surface)) };
+    let (device, mut queue) =
+        unsafe { graal::create_device_and_queue(Some(surface)).expect("failed to create device") };
     let surface_format = unsafe { device.get_preferred_surface_format(surface) };
     let mut swapchain = unsafe { device.create_swapchain(surface, surface_format, window.inner_size().into()) };
     let mut swapchain_size = window.inner_size().into();
@@ -281,13 +282,13 @@ fn main() {
                         );
                         device.end_command_buffer(cb).unwrap();
 
-                        let mut blit = queue.build_submission();
+                        let mut blit = Submission::new();
                         blit.set_name("blit");
                         blit.use_image(image_info.id, ResourceState::TRANSFER_SRC);
                         blit.use_image(swapchain_image_id, ResourceState::TRANSFER_DST);
                         blit.push_command_buffer(cb);
-                        let render_finished = blit.signal();
-                        blit.submit().expect("blit failed");
+                        let render_finished = blit.signal(queue.get_or_create_semaphore());
+                        queue.submit(blit).expect("blit failed");
 
                         // transition swapchain image to present
                         queue

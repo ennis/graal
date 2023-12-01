@@ -4,41 +4,94 @@ mod resource;
 
 use crate::{
     device::resource::ResourceGroup,
+    instance::{vk_khr_debug_utils, vk_khr_surface},
     platform_impl,
     queue::{Queue, SemaphoreWait, SignaledSemaphore},
 };
 use ash::vk;
 use slotmap::{Key, SlotMap};
-use std::{cell::RefCell, ffi::CString, fmt, ops::Deref, os::raw::c_void, ptr, ptr::NonNull, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    ffi::CString,
+    fmt,
+    ops::Deref,
+    os::raw::c_void,
+    ptr,
+    ptr::NonNull,
+    rc::Rc,
+};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Wrapper around a vulkan device, associated queues and tracked resources.
-pub struct Device {
+pub(crate) struct DeviceInner {
     /// Underlying vulkan device
-    pub device: ash::Device,
+    pub(crate) device: ash::Device,
     /// Platform-specific extension functions
     pub(crate) platform_extensions: platform_impl::PlatformExtensions,
     pub(crate) physical_device: vk::PhysicalDevice,
     pub(crate) physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
     pub(crate) physical_device_properties: vk::PhysicalDeviceProperties,
     //pub(crate) physical_device_features: vk::PhysicalDeviceFeatures,
-    pub(crate) queues_info: QueuesInfo,
+    queues: Vec<QueueData>,
     pub(crate) allocator: RefCell<gpu_allocator::vulkan::Allocator>,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
-    pub(crate) vk_khr_surface: ash::extensions::khr::Surface,
-    pub(crate) vk_ext_debug_utils: ash::extensions::ext::DebugUtils,
-    pub(crate) debug_messenger: vk::DebugUtilsMessengerEXT,
 
     pub(crate) resources: RefCell<ResourceMap>,
     pub(crate) resource_groups: RefCell<ResourceGroupMap>,
+    deletion_lists: RefCell<Vec<DeferredDeletionList>>,
+}
+
+#[derive(Clone)]
+pub struct Device {
+    pub(crate) inner: Rc<DeviceInner>,
+}
+
+struct DeferredDeletionList {
+    // Timestamp that we should wait for on each queue before deleting the objects.
+    timestamps: Vec<u64>,
+    // Objects to delete.
+    objects: Vec<DeferredDeletionObject>,
+}
+
+// when deleting an object:
+// - push it to the current deletion list
+//
+// when finishing a frame on a queue
+// -
+
+// Alternative:
+// - require the user to periodically call "end_frame" on the device, which will automatically signal the timelines of all queues
+
+struct QueueData {
+    /// Family index.
+    family_index: u32,
+    /// Index within queues of the same family (see vkGetDeviceQueue).
+    index: u32,
+    queue: vk::Queue,
+    timeline: vk::Semaphore,
+    next_submission_timestamp: Cell<u64>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum DeviceCreateError {
+    #[error(transparent)]
+    Vulkan(#[from] vk::Result),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feature {}
+
+pub struct QueueFamilyConfig {
+    pub family_index: u32,
+    pub count: u32,
 }
 
 impl Deref for Device {
     type Target = ash::Device;
 
     fn deref(&self) -> &Self::Target {
-        &self.device
+        &self.inner.device
     }
 }
 
@@ -211,60 +264,42 @@ pub enum ResourceAllocation {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+#[derive(Debug)]
+pub enum DeferredDeletionObject {
+    ImageView(vk::ImageView),
+    Sampler(vk::Sampler),
+    PipelineLayout(vk::PipelineLayout),
+    Pipeline(vk::Pipeline),
+    Semaphore(vk::Semaphore),
+}
 
-impl Device {
-    /// Returns handle to a queue by index.
-    pub fn queue(&self, index: usize) -> vk::Queue {
-        assert!(index < self.queues_info.queue_count);
-        self.queues_info.queues[index]
+impl From<vk::ImageView> for DeferredDeletionObject {
+    fn from(view: vk::ImageView) -> Self {
+        DeferredDeletionObject::ImageView(view)
     }
-
-    /// Returns the queue family index of the specified queue.
-    pub fn queue_family_index(&self, index: usize) -> u32 {
-        assert!(index < self.queues_info.queue_count);
-        self.queues_info.families[index]
+}
+impl From<vk::Sampler> for DeferredDeletionObject {
+    fn from(sampler: vk::Sampler) -> Self {
+        DeferredDeletionObject::Sampler(sampler)
     }
-
-    /// Returns the timeline semaphore of the specified queue.
-    pub fn queue_timeline(&self, index: usize) -> vk::Semaphore {
-        assert!(index < self.queues_info.queue_count);
-        self.queues_info.timelines[index]
+}
+impl From<vk::PipelineLayout> for DeferredDeletionObject {
+    fn from(layout: vk::PipelineLayout) -> Self {
+        DeferredDeletionObject::PipelineLayout(layout)
+    }
+}
+impl From<vk::Pipeline> for DeferredDeletionObject {
+    fn from(pipeline: vk::Pipeline) -> Self {
+        DeferredDeletionObject::Pipeline(pipeline)
+    }
+}
+impl From<vk::Semaphore> for DeferredDeletionObject {
+    fn from(semaphore: vk::Semaphore) -> Self {
+        DeferredDeletionObject::Semaphore(semaphore)
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-pub(crate) const MAX_QUEUES: usize = 4;
-
-/// Defines the queue indices for each usage (graphics, compute, transfer, present).
-///
-/// FIXME: only allocate multiple queues if requested
-#[derive(Copy, Clone, Default)]
-pub(crate) struct QueueIndices {
-    /// The queue that should be used for graphics operations. It is also guaranteed to support compute and transfer operations.
-    pub graphics: u8,
-    /// The queue that should be used for asynchronous compute operations.
-    pub compute: u8,
-    /// The queue that should be used for asynchronous transfer operations.
-    pub transfer: u8,
-    /// The queue that should be used for presentation.
-    // TODO remove? this is always equal to graphics
-    pub present: u8,
-}
-
-/// Information about the queues of a device.
-#[derive(Copy, Clone, Default)]
-pub(crate) struct QueuesInfo {
-    /// Number of created queues.
-    pub(crate) queue_count: usize,
-    /// Queue indices by usage.
-    pub(crate) indices: QueueIndices,
-    /// The queue family index of each queue. The first `queue_count` entries are valid, the rest is unspecified.
-    pub(crate) families: [u32; MAX_QUEUES],
-    /// The queue handle of each queue. The first `queue_count` entries are valid, the rest is unspecified.
-    pub(crate) queues: [vk::Queue; MAX_QUEUES],
-    /// Timeline semaphores for each queue, used for cross-queue and inter-frame synchronization
-    pub(crate) timelines: [vk::Semaphore; MAX_QUEUES],
-}
 
 impl fmt::Debug for Device {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -272,7 +307,8 @@ impl fmt::Debug for Device {
     }
 }
 
-// SWAPCHAINS
+////////////////////////////////////////////////////////////////////////////////////////////////////
+// SWAPCHAIN STUFF
 
 /// Chooses a swapchain surface format among a list of supported formats.
 ///
@@ -310,8 +346,8 @@ impl Device {
 
     /// Returns the list of supported swapchain formats for the given surface.
     pub unsafe fn get_surface_formats(&self, surface: vk::SurfaceKHR) -> Vec<vk::SurfaceFormatKHR> {
-        self.vk_khr_surface
-            .get_physical_device_surface_formats(self.physical_device, surface)
+        vk_khr_surface()
+            .get_physical_device_surface_formats(self.inner.physical_device, surface)
             .unwrap()
     }
 
@@ -323,17 +359,15 @@ impl Device {
 
     /// Resizes a swapchain.
     pub unsafe fn resize_swapchain(&self, swapchain: &mut Swapchain, size: (u32, u32)) {
-        let phy = self.physical_device;
-        let capabilities = self
-            .vk_khr_surface
+        let phy = self.inner.physical_device;
+        let capabilities = vk_khr_surface()
             .get_physical_device_surface_capabilities(phy, swapchain.surface)
             .unwrap();
         /*let formats = self
         .vk_khr_surface
         .get_physical_device_surface_formats(phy, swapchain.surface)
         .unwrap();*/
-        let present_modes = self
-            .vk_khr_surface
+        let present_modes = vk_khr_surface()
             .get_physical_device_surface_present_modes(phy, swapchain.surface)
             .unwrap();
 
@@ -367,16 +401,21 @@ impl Device {
         };
 
         let new_handle = self
+            .inner
             .vk_khr_swapchain
             .create_swapchain(&create_info, None)
             .expect("failed to create swapchain");
         if swapchain.handle != vk::SwapchainKHR::null() {
             // FIXME what if the images are in use?
-            self.vk_khr_swapchain.destroy_swapchain(swapchain.handle, None);
+            self.inner.vk_khr_swapchain.destroy_swapchain(swapchain.handle, None);
         }
 
         swapchain.handle = new_handle;
-        swapchain.images = self.vk_khr_swapchain.get_swapchain_images(swapchain.handle).unwrap();
+        swapchain.images = self
+            .inner
+            .vk_khr_swapchain
+            .get_swapchain_images(swapchain.handle)
+            .unwrap();
     }
 
     /*/// Returns the current values of all queue timelines (i.e. the "progress" value on the device).
@@ -395,10 +434,12 @@ impl Device {
     }*/
 }
 
-pub unsafe fn create_device_and_queue(present_surface: Option<vk::SurfaceKHR>) -> (Rc<Device>, Queue) {
-    let device = Rc::new(Device::new(present_surface));
-    let queue = Queue::new(device.clone(), device.queues_info.indices.graphics as usize);
-    (device, queue)
+pub unsafe fn create_device_and_queue(
+    present_surface: Option<vk::SurfaceKHR>,
+) -> Result<(Device, Queue), DeviceCreateError> {
+    let device = Device::new(present_surface)?;
+    let queue = device.get_queue_by_global_index(0);
+    Ok((device, queue))
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -497,9 +538,10 @@ impl Device {
                 name.to_string()
             };
             let object_name = CString::new(name.as_str()).unwrap();
-            self.vk_ext_debug_utils
+
+            vk_khr_debug_utils()
                 .set_debug_utils_object_name(
-                    self.device.handle(),
+                    self.inner.device.handle(),
                     &vk::DebugUtilsObjectNameInfoEXT {
                         object_type,
                         object_handle,
@@ -515,7 +557,8 @@ impl Device {
     ///
     /// Returns `ResourceId::null()` if `handle` doesn't refer to a resource managed by this context.
     pub(crate) fn image_resource_by_handle(&self, handle: vk::Image) -> ResourceId {
-        self.resources
+        self.inner
+            .resources
             .borrow()
             .iter()
             .find_map(|(id, r)| match &r.kind {
@@ -535,7 +578,8 @@ impl Device {
     ///
     /// Returns `ResourceId::null()` if `handle` doesn't refer to a resource managed by this context.
     pub(crate) fn buffer_resource_by_handle(&self, handle: vk::Buffer) -> ResourceId {
-        self.resources
+        self.inner
+            .resources
             .borrow()
             .iter()
             .find_map(|(id, r)| match &r.kind {
@@ -551,6 +595,14 @@ impl Device {
             .unwrap_or_else(ResourceId::null)
     }
 
+    pub fn raw(&self) -> &ash::Device {
+        &self.inner.device
+    }
+
+    pub fn vk_khr_swapchain(&self) -> &ash::extensions::khr::Swapchain {
+        &self.inner.vk_khr_swapchain
+    }
+
     /*
     /// Waits for the specified timeline values to be reached on each queue.
     pub fn wait(&self, timeline_values: &TimelineValues, timeout: Duration) -> Result<(), vk::Result> {
@@ -559,7 +611,7 @@ impl Device {
         let wait_info = vk::SemaphoreWaitInfo {
             semaphore_count: self.queues_info.queue_count as u32,
             p_semaphores: self.queues_info.timelines.as_ptr(),
-            p_values: timeline_values.0.as_ptr(),
+            p_values: timeline_values.inner.as_ptr(),
             ..Default::default()
         };
 
