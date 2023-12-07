@@ -69,6 +69,11 @@ impl ResourceState {
         access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
     };
+    pub const DEPTH_STENCIL_ATTACHMENT: ResourceState = ResourceState {
+        stages: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
+        access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
+        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    };
     pub const PRESENT: ResourceState = ResourceState {
         stages: vk::PipelineStageFlags2::NONE,
         access: vk::AccessFlags2::NONE,

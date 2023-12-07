@@ -1,5 +1,5 @@
 use mlr::{
-    vertex::{Norm, Vertex, VertexAttributeDescriptor},
+    vertex::{Norm, Vertex, VertexAttributeDescription},
     vk,
 };
 
@@ -17,15 +17,15 @@ fn test_vertex_layout() {
     assert_eq!(
         <VertexPNT as Vertex>::ATTRIBUTES,
         &[
-            VertexAttributeDescriptor {
+            VertexAttributeDescription {
                 format: vk::Format::R32G32B32_SFLOAT,
                 offset: 0
             },
-            VertexAttributeDescriptor {
+            VertexAttributeDescription {
                 format: vk::Format::R32G32B32_SFLOAT,
                 offset: 12
             },
-            VertexAttributeDescriptor {
+            VertexAttributeDescription {
                 format: vk::Format::R16G16_UNORM,
                 offset: 24
             }

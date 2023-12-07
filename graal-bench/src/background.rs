@@ -23,40 +23,45 @@ impl Vertex2D {
     }
 }
 
-#[derive(Copy, Clone, Debug, graal::VertexInputInterface)]
+#[derive(Copy, Clone, Debug, graal::VertexInput)]
 struct Vertex2DInput {
-    #[layout(binding = 0, location = 0, per_vertex)]
+    #[vertex_input(binding = 0, location = 0, per_vertex)]
     vertices: graal::VertexBufferView<Vertex2D>,
 }
 
 // --- Uniform structs -----------------------------------------------------------------------------
 
-#[derive(Copy, Clone, Debug)]
+#[derive(PushConstants, Copy, Clone, Debug)]
 #[repr(C)]
-struct BackgroundUniforms {
+struct BackgroundParams {
+    #[stages(fragment)]
     u_resolution: [f32; 2],
+    #[stages(fragment)]
     u_scroll_offset: [f32; 2],
+    #[stages(fragment)]
     u_zoom: f32,
 }
+
 // --- Shader interfaces ---------------------------------------------------------------------------
-
-#[derive(graal::DescriptorSetInterface)]
-#[repr(C)]
-struct BackgroundShaderInterface {
-    #[layout(binding = 0, uniform_buffer, stages(fragment))]
-    uniforms: graal::BufferDescriptor<BackgroundUniforms>,
+#[derive(Attachments)]
+struct GBuffers {
+    #[attachment(color, format=R16G16B16A16_SFLOAT)]
+    color: mlr::image::ImageHandle,
+    // assume color by default
+    #[attachment(format=R16G16_SFLOAT)]
+    normal: mlr::image::ImageHandle,
+    #[attachment(color, format=R16G16_SFLOAT)]
+    tangent: mlr::image::ImageHandle,
+    #[attachment(depth, format=R16G16_SFLOAT)]
+    depth: mlr::image::ImageHandle,
 }
 
-#[derive(Shader)]
-#[shader(vertex(path = "shaders/background.vert"))]
-#[shader(fragment(path = "shaders/background.frag"))]
-struct BackgroundShader {
-    #[layout(vertex_buffer, binding = 0)]
-    vertices: graal::VertexBufferView<Vertex2D>,
-
-    #[layout(uniform_buffer, binding = 0)]
-    uniforms: BackgroundUniforms,
-}
+type BackgroundPipeline = GraphicsPipeline![
+    vertex_input = Vertex2DInput,
+    attachments = GBuffers,
+    arguments = (SceneParamsArguments),
+    push_constants = BackgroundParams
+];
 
 // --- Pass ----------------------------------------------------------------------------------------
 pub struct BackgroundPass {

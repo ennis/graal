@@ -1,12 +1,12 @@
 //! Vertex-related types
 use crate::vk;
-use std::marker::PhantomData;
+use std::{borrow::Cow, marker::PhantomData};
 
 pub use mlr_macros::Vertex;
 
 /// Trait implemented by types that represent vertex data in a vertex buffer.
 pub unsafe trait Vertex: Copy + 'static {
-    const ATTRIBUTES: &'static [VertexAttributeDescriptor];
+    const ATTRIBUTES: &'static [VertexAttributeDescription];
 }
 
 /// Trait implemented by types that can serve as indices.
@@ -26,7 +26,7 @@ pub enum VertexIndexFormat {
 
 /// Description of a vertex attribute within a vertex layout.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
-pub struct VertexAttributeDescriptor {
+pub struct VertexAttributeDescription {
     pub format: vk::Format,
     pub offset: u32,
 }
@@ -180,6 +180,39 @@ pub struct VertexBufferView<T: Vertex> {
     pub _phantom: PhantomData<*const T>,
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#[derive(Copy, Clone, Debug)]
+pub struct VertexBufferLayoutDescription {
+    pub binding: u32,
+    pub stride: u32,
+    pub input_rate: vk::VertexInputRate,
+}
+
+#[derive(Copy, Clone, Debug)]
+pub struct VertexInputAttributeDescription {
+    pub location: u32,
+    pub binding: u32,
+    pub format: vk::Format,
+    pub offset: u32,
+}
+
+pub trait StaticVertexInput {
+    /// Vertex buffers
+    const BUFFER_LAYOUT: &'static [VertexBufferLayoutDescription];
+
+    /// Vertex attributes.
+    const ATTRIBUTES: &'static [VertexInputAttributeDescription];
+}
+
+pub trait VertexInput {
+    /// Vertex buffer bindings
+    fn buffer_layout(&self) -> Cow<[VertexBufferLayoutDescription]>;
+
+    /// Vertex attributes.
+    fn attributes(&self) -> Cow<[VertexInputAttributeDescription]>;
+}
+
 /*
 pub trait VertexBindingInterface {
     const ATTRIBUTES: &'static [VertexAttributeDescriptor];
@@ -219,41 +252,36 @@ impl<T: VertexInputInterface> VertexInputInterfaceExt for T {
         }
     }
 }*/
-/*
-pub mod vertex_macro_helpers {
-    use graal::vk;
-    use mlr::vertex::VertexAttribute;
 
-    pub const fn append_attributes<const N: usize>(
-        head: &'static [vk::VertexInputAttributeDescription],
-        binding: u32,
-        base_location: u32,
-        tail: &'static [VertexAttribute],
-    ) -> [vk::VertexInputAttributeDescription; N] {
-        const NULL_ATTR: vk::VertexInputAttributeDescription = vk::VertexInputAttributeDescription {
-            location: 0,
-            binding: 0,
-            format: vk::Format::UNDEFINED,
-            offset: 0,
-        };
-        let mut result = [NULL_ATTR; N];
-        let mut i = 0;
-        while i < head.len() {
-            result[i] = head[i];
-            i += 1;
-        }
-        while i < N {
-            let j = i - head.len();
-            result[i] = vk::VertexInputAttributeDescription {
-                location: base_location + j as u32,
-                binding,
-                format: tail[j].format,
-                offset: tail[j].offset,
-            };
-            i += 1;
-        }
-
-        result
+#[doc(hidden)]
+pub const fn append_attributes<const N: usize>(
+    head: &'static [VertexInputAttributeDescription],
+    binding: u32,
+    base_location: u32,
+    tail: &'static [VertexAttributeDescription],
+) -> [VertexInputAttributeDescription; N] {
+    const NULL_ATTR: VertexInputAttributeDescription = VertexInputAttributeDescription {
+        location: 0,
+        binding: 0,
+        format: vk::Format::UNDEFINED,
+        offset: 0,
+    };
+    let mut result = [NULL_ATTR; N];
+    let mut i = 0;
+    while i < head.len() {
+        result[i] = head[i];
+        i += 1;
     }
+    while i < N {
+        let j = i - head.len();
+        result[i] = VertexInputAttributeDescription {
+            location: base_location + j as u32,
+            binding,
+            format: tail[j].format,
+            offset: tail[j].offset,
+        };
+        i += 1;
+    }
+
+    result
 }
-*/

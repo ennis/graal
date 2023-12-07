@@ -36,6 +36,7 @@ pub(crate) struct DeviceInner {
     queues: Vec<QueueData>,
     pub(crate) allocator: RefCell<gpu_allocator::vulkan::Allocator>,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
+    pub(crate) vk_ext_shader_object: ash::extensions::ext::ShaderObject,
 
     pub(crate) resources: RefCell<ResourceMap>,
     pub(crate) resource_groups: RefCell<ResourceGroupMap>,
@@ -53,15 +54,6 @@ struct DeferredDeletionList {
     // Objects to delete.
     objects: Vec<DeferredDeletionObject>,
 }
-
-// when deleting an object:
-// - push it to the current deletion list
-//
-// when finishing a frame on a queue
-// -
-
-// Alternative:
-// - require the user to periodically call "end_frame" on the device, which will automatically signal the timelines of all queues
 
 struct QueueData {
     /// Family index.
@@ -268,9 +260,11 @@ pub enum ResourceAllocation {
 pub enum DeferredDeletionObject {
     ImageView(vk::ImageView),
     Sampler(vk::Sampler),
+    DescriptorSetLayout(vk::DescriptorSetLayout),
     PipelineLayout(vk::PipelineLayout),
     Pipeline(vk::Pipeline),
     Semaphore(vk::Semaphore),
+    Shader(vk::ShaderEXT),
 }
 
 impl From<vk::ImageView> for DeferredDeletionObject {
@@ -296,6 +290,16 @@ impl From<vk::Pipeline> for DeferredDeletionObject {
 impl From<vk::Semaphore> for DeferredDeletionObject {
     fn from(semaphore: vk::Semaphore) -> Self {
         DeferredDeletionObject::Semaphore(semaphore)
+    }
+}
+impl From<vk::DescriptorSetLayout> for DeferredDeletionObject {
+    fn from(layout: vk::DescriptorSetLayout) -> Self {
+        DeferredDeletionObject::DescriptorSetLayout(layout)
+    }
+}
+impl From<vk::ShaderEXT> for DeferredDeletionObject {
+    fn from(shader: vk::ShaderEXT) -> Self {
+        DeferredDeletionObject::Shader(shader)
     }
 }
 

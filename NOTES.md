@@ -158,3 +158,38 @@ fn test() {
 # Issue: tracking non-resource objects across queues
 Deleting an object: must assume that all queues can need it.
 
+
+# Hot-reloading shaders:
+- Essential
+- Maybe don't bundle the compiler? Have a daemon that watches GLSL changes and recompiles?
+
+# Descriptor set layouts
+Where to stash them?
+
+1. hash-cache in device: meh
+2. cache by argument type: need a lazy static associated to the type or unique typeid for the argument struct
+3. owned by the shader object: descriptor set layout duplicated between all shaders with the same interface
+4. have the application store them somewhere => go fuck yourself
+5. create a VkDescriptorSetLayout on-the-fly when needed and delete just after => it needs to be alive when using a descriptor set of the specified layout
+
+2.1 lazy_static associated to the type: can't work with generics
+
+Issue: associating a DescriptorSetLayout to a type statically requires the type to be `Any` (not great, but OK) and that we use a type map.
+
+Otherwise, requires the type to have no generics: ouch.
+Associating a DescriptorSetLayout instance to a type that can be generic is near-intractable (look up "rust generic statics").
+
+=> store layouts in the Shaders
+
+Issue: pipeline layouts need descriptor set layouts, but pipeline layouts are associated to multiple shaders
+
+# Bindless?
+
+Would eliminate the need for separate descriptor set layouts: just pass everything in push constants.
+Each resource has one index (GPU handle) into a global descriptor table.
+This table is stored in a descriptor set. There's one per-queue, same across frames. 
+
+Alternatively:
+- linear allocation of descriptors in a buffer with VK_EXT_descriptor_buffer
+- no changes in the shader
+

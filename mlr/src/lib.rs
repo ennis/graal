@@ -2,10 +2,12 @@
 pub mod argument;
 pub mod attachments;
 pub mod buffer;
-mod device;
+pub mod device;
 pub mod image;
+mod pipeline_layout;
 mod queue;
 mod sampler;
+mod shader;
 pub mod vertex;
 
 /*
@@ -24,3 +26,6 @@ pub use graal::vk;
 pub use memoffset::offset_of as __offset_of;
 #[doc(hidden)]
 pub use memoffset::offset_of_tuple as __offset_of_tuple;
+
+//#[doc(hidden)]
+//pub use bytemuck;

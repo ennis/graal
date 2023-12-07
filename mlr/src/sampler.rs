@@ -2,6 +2,7 @@ use crate::{device::Device, vk};
 use ordered_float::OrderedFloat;
 use std::rc::Weak;
 
+/*
 macro_rules! impl_static_sampler_type {
     ($v:vis $name:ident, $mag:ident, $min:ident, $mipmap_mode:ident, $addr_u:ident, $addr_v:ident, $addr_w:ident) => {
         #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -43,8 +44,9 @@ macro_rules! impl_static_sampler_type {
 
 impl_static_sampler_type!(pub Linear_ClampToEdge, LINEAR, LINEAR, LINEAR, CLAMP_TO_EDGE, CLAMP_TO_EDGE, CLAMP_TO_EDGE);
 impl_static_sampler_type!(pub Nearest_ClampToEdge, NEAREST, NEAREST, NEAREST, CLAMP_TO_EDGE, CLAMP_TO_EDGE, CLAMP_TO_EDGE);
+*/
 
-#[derive(Clone, Debug, PartialEq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, Ord, PartialOrd)]
 pub struct SamplerCreateInfo {
     pub mag_filter: vk::Filter,
     pub min_filter: vk::Filter,

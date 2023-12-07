@@ -3,14 +3,7 @@ use proc_macro2::TokenStream;
 use quote::quote;
 use syn::spanned::Spanned;
 
-pub fn derive_vertex(input: proc_macro::TokenStream) -> TokenStream {
-    match derive_vertex_(input) {
-        Ok(tokens) => tokens,
-        Err(e) => e.into_compile_error(),
-    }
-}
-
-fn derive_vertex_(input: proc_macro::TokenStream) -> syn::Result<TokenStream> {
+pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<TokenStream> {
     let derive_input: syn::DeriveInput = syn::parse(input)?;
 
     // check for struct

@@ -5,6 +5,7 @@ use super::{
     Resource, ResourceKind, ResourceRegistrationInfo,
 };
 use crate::{
+    aspects_for_format,
     device::{BufferId, Device, GroupId, ImageId, ResourceAllocation, ResourceId},
     is_write_access, vk, MemoryLocation,
 };
@@ -22,36 +23,6 @@ pub(crate) struct ResourceGroup {
     // ignored if waiting on multiple queues
     pub(crate) src_access_mask: vk::AccessFlags2,
     pub(crate) dst_access_mask: vk::AccessFlags2,
-}
-
-fn is_depth_and_stencil_format(fmt: vk::Format) -> bool {
-    matches!(
-        fmt,
-        vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
-    )
-}
-
-fn is_depth_only_format(fmt: vk::Format) -> bool {
-    matches!(
-        fmt,
-        vk::Format::D16_UNORM | vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT
-    )
-}
-
-fn is_stencil_only_format(fmt: vk::Format) -> bool {
-    matches!(fmt, vk::Format::S8_UINT)
-}
-
-fn aspects_for_format(fmt: vk::Format) -> vk::ImageAspectFlags {
-    if is_depth_only_format(fmt) {
-        vk::ImageAspectFlags::DEPTH
-    } else if is_stencil_only_format(fmt) {
-        vk::ImageAspectFlags::STENCIL
-    } else if is_depth_and_stencil_format(fmt) {
-        vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
-    } else {
-        vk::ImageAspectFlags::COLOR
-    }
 }
 
 pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
@@ -367,63 +338,6 @@ impl Device {
         ImageId(id)
     }
 
-    // Cleanup expired resources on the specified queue.
-    pub(crate) unsafe fn cleanup_queue_resources(&self, queue_index: usize, completed_timestamp: u64) {
-        let mut resources = self.inner.resources.borrow_mut();
-        resources.retain(|_id, resource| {
-            if resource.discarded
-                && resource.owner == OwnerQueue::Exclusive(queue_index)
-                && resource.timestamp <= completed_timestamp
-            {
-                self.destroy_resource_now(resource);
-                false
-            } else {
-                true
-            }
-        });
-
-        // We cleanup non-resource objects here, even though they're not associated with the queue.
-        //
-        // We could also do that in an hypothetical `Device::end_frame` method,
-        // but we don't want to add another method that the user would need to call periodically
-        // when there's already `Queue::end_frame` (which calls cleanup_queue_resources).
-        self.cleanup_objects();
-    }
-
-    pub fn set_current_queue_timestamp(&self, queue: usize, timestamp: u64) {
-        self.inner.queues[queue].next_submission_timestamp.set(timestamp);
-    }
-
-    pub fn delete_later(&self, object: impl Into<DeferredDeletionObject>) {
-        let object = object.into();
-
-        // get next submission timestamps on all queues
-        let mut next_submission_timestamps = vec![0; self.inner.queues.len()];
-        for (i, q) in self.inner.queues.iter().enumerate() {
-            next_submission_timestamps[i] = q.next_submission_timestamp.get();
-        }
-
-        // add the object to the current deletion list if the timestamps are the same
-        // otherwise create a new deletion list with the up-to-date timestamps
-        let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
-        if deletion_lists.is_empty() {
-            deletion_lists.push(DeferredDeletionList {
-                timestamps: next_submission_timestamps,
-                objects: vec![object],
-            });
-        } else {
-            let last = deletion_lists.last_mut().unwrap();
-            if last.timestamps != next_submission_timestamps {
-                deletion_lists.push(DeferredDeletionList {
-                    timestamps: next_submission_timestamps,
-                    objects: vec![object],
-                });
-            } else {
-                last.objects.push(object);
-            }
-        }
-    }
-
     fn cleanup_objects(&self) {
         let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
 
@@ -458,11 +372,74 @@ impl Device {
                         DeferredDeletionObject::Semaphore(semaphore) => unsafe {
                             self.inner.device.destroy_semaphore(*semaphore, None);
                         },
+                        DeferredDeletionObject::Shader(shader) => unsafe {
+                            self.inner.vk_ext_shader_object.destroy_shader(*shader, None);
+                        },
+                        DeferredDeletionObject::DescriptorSetLayout(layout) => unsafe {
+                            self.inner.device.destroy_descriptor_set_layout(*layout, None);
+                        },
                     }
                 }
             }
 
             !expired
         });
+    }
+
+    // Cleanup expired resources on the specified queue.
+    pub(crate) unsafe fn cleanup_queue_resources(&self, queue_index: usize, completed_timestamp: u64) {
+        let mut resources = self.inner.resources.borrow_mut();
+        resources.retain(|_id, resource| {
+            if resource.discarded
+                && resource.owner == OwnerQueue::Exclusive(queue_index)
+                && resource.timestamp <= completed_timestamp
+            {
+                self.destroy_resource_now(resource);
+                false
+            } else {
+                true
+            }
+        });
+
+        // We cleanup non-resource objects here, even though they're not associated with the queue.
+        //
+        // We could also do that in an hypothetical `Device::end_frame` method,
+        // but we don't want to add another method that the user would need to call periodically
+        // when there's already `Queue::end_frame` (which calls cleanup_queue_resources).
+        self.cleanup_objects();
+    }
+
+    pub(crate) fn set_current_queue_timestamp(&self, queue: usize, timestamp: u64) {
+        self.inner.queues[queue].next_submission_timestamp.set(timestamp);
+    }
+
+    pub fn delete_later(&self, object: impl Into<DeferredDeletionObject>) {
+        let object = object.into();
+
+        // get next submission timestamps on all queues
+        let mut next_submission_timestamps = vec![0; self.inner.queues.len()];
+        for (i, q) in self.inner.queues.iter().enumerate() {
+            next_submission_timestamps[i] = q.next_submission_timestamp.get();
+        }
+
+        // add the object to the current deletion list if the timestamps are the same
+        // otherwise create a new deletion list with the up-to-date timestamps
+        let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
+        if deletion_lists.is_empty() {
+            deletion_lists.push(DeferredDeletionList {
+                timestamps: next_submission_timestamps,
+                objects: vec![object],
+            });
+        } else {
+            let last = deletion_lists.last_mut().unwrap();
+            if last.timestamps != next_submission_timestamps {
+                deletion_lists.push(DeferredDeletionList {
+                    timestamps: next_submission_timestamps,
+                    objects: vec![object],
+                });
+            } else {
+                last.objects.push(object);
+            }
+        }
     }
 }

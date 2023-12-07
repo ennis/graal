@@ -124,7 +124,11 @@ unsafe fn find_queue_family(
     best_queue_family.expect("could not find a compatible queue")
 }
 
-const DEVICE_EXTENSIONS: &[&str] = &["VK_KHR_swapchain"];
+const DEVICE_EXTENSIONS: &[&str] = &[
+    "VK_KHR_swapchain",
+    //"VK_KHR_dynamic_rendering",   // promoted to core in 1.3
+    "VK_KHR_push_descriptor",
+];
 
 impl Device {
     fn find_compatible_memory_type_internal(
@@ -224,6 +228,7 @@ impl Device {
 
         // More stuff
         let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(instance, &device);
+        let vk_ext_shader_object = ash::extensions::ext::ShaderObject::new(instance, &device);
         let physical_device_memory_properties = instance.get_physical_device_memory_properties(physical_device);
         let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
         let physical_device_properties = instance.get_physical_device_properties(physical_device);
@@ -238,6 +243,7 @@ impl Device {
                 queues,
                 allocator: RefCell::new(allocator),
                 vk_khr_swapchain,
+                vk_ext_shader_object,
                 resources: RefCell::new(Default::default()),
                 resource_groups: RefCell::new(Default::default()),
                 deletion_lists: RefCell::new(vec![]),
