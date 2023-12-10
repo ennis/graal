@@ -1,9 +1,13 @@
 use crate::{device::Device, sampler::Sampler, vk};
-use graal::device::{BufferHandle, ImageHandle};
-use std::{borrow::Cow, ffi::c_void};
+use graal::{
+    device::{BufferHandle, ImageHandle},
+    queue::{ResourceState, Submission},
+};
+use std::{borrow::Cow, ffi::c_void, mem, ptr};
 
 pub use mlr_macros::{Arguments, PushConstants};
 
+/*
 pub trait ArgumentVisitor {
     /// Image resource + descriptor.
     fn visit_image(
@@ -12,8 +16,8 @@ pub trait ArgumentVisitor {
         image: ImageHandle,
         image_view: vk::ImageView,
         descriptor_type: vk::DescriptorType,
-        access_mask: vk::AccessFlags,
-        stage_mask: vk::PipelineStageFlags,
+        access_mask: vk::AccessFlags2,
+        stage_mask: vk::PipelineStageFlags2,
         layout: vk::ImageLayout,
     );
 
@@ -39,7 +43,7 @@ pub trait ArgumentVisitor {
     // NOTE: I tried to make it a `&[u8]` instead of `*const c_void`+size but this requires bytemuck and I couldn't make
     // the bytemuck derives work inside the `#[derive(Arguments)]` macro (https://github.com/Lokathor/bytemuck/issues/159).
     unsafe fn visit_inline_uniform_block(&mut self, binding: u32, byte_size: usize, data: *const c_void);
-}
+}*/
 
 #[derive(Debug, Clone)]
 pub struct ArgumentsLayout<'a> {
@@ -53,20 +57,43 @@ pub trait StaticArguments: Arguments {
     /// This can be used to create/fetch a DescriptorSetLayout without needing
     /// an instance.
     const LAYOUT: ArgumentsLayout<'static>;
+}
 
-    // Creates the VkDescriptorSetLayout object that represents `LAYOUT`.
-    //
-    // The returned object is expected to live for the duration of the application
-    // (it is leaked, essentially).
-    //fn create_descriptor_set_layout(device: &Device) -> vk::DescriptorSetLayout;
+/// Description of one argument in an argument block.
+pub struct ArgumentDescription {
+    pub binding: u32,
+    pub descriptor_type: vk::DescriptorType,
+    pub kind: ArgumentKind,
+}
+
+/// Kind of argument.
+#[derive(Debug, Clone)]
+pub enum ArgumentKind {
+    Image {
+        image: ImageHandle,
+        image_view: vk::ImageView,
+        resource_state: ResourceState,
+    },
+    Buffer {
+        buffer: BufferHandle,
+        resource_state: ResourceState,
+        offset: usize,
+        size: usize,
+    },
 }
 
 pub trait Arguments {
-    /// Visit all arguments in the block.
-    fn visit<A: ArgumentVisitor>(&self, visitor: &mut A);
+    /// The type of inline data for this argument.
+    type InlineData: Copy + 'static;
+
+    /// Returns an iterator over all descriptors contained in this object.
+    fn arguments(&self) -> impl Iterator<Item = ArgumentDescription> + '_;
+
+    /// Returns the inline data for this argument.
+    fn inline_data(&self) -> Cow<Self::InlineData>;
 }
 
-pub unsafe trait DescriptorBinding {
+pub unsafe trait Argument {
     /// Descriptor type.
     const DESCRIPTOR_TYPE: vk::DescriptorType;
     /// Number of descriptors represented by this object.
@@ -76,7 +103,14 @@ pub unsafe trait DescriptorBinding {
     /// Which shader stages can access a resource for this binding.
     const SHADER_STAGES: vk::ShaderStageFlags;
 
-    fn visit<A: ArgumentVisitor>(&self, binding: u32, visitor: &mut A);
+    /// Returns the argument description for this object.
+    ///
+    /// Used internally by the `Arguments` derive macro.
+    ///
+    /// # Arguments
+    ///
+    /// * `binding`: the binding number of this argument.
+    fn argument_description(&self, binding: u32) -> ArgumentDescription;
 }
 
 pub trait StaticPushConstants {
@@ -111,21 +145,25 @@ pub struct SampledImage {
     pub(crate) view: vk::ImageView,
 }
 
-unsafe impl DescriptorBinding for SampledImage {
+unsafe impl Argument for SampledImage {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::SAMPLED_IMAGE;
     const DESCRIPTOR_COUNT: u32 = 1;
     const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
 
-    fn visit<A: ArgumentVisitor>(&self, binding: u32, visitor: &mut A) {
-        visitor.visit_image(
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
             binding,
-            self.image,
-            self.view,
-            vk::DescriptorType::SAMPLED_IMAGE,
-            vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        );
+            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            kind: ArgumentKind::Image {
+                image: self.image,
+                image_view: self.view,
+                resource_state: ResourceState {
+                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    access: vk::AccessFlags2::SHADER_READ,
+                    stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+                },
+            },
+        }
     }
 }
 
@@ -198,19 +236,26 @@ pub struct UniformBuffer<T> {
     _phantom: std::marker::PhantomData<fn() -> T>,
 }
 
-unsafe impl<T> DescriptorBinding for UniformBuffer<T> {
+unsafe impl<T> Argument for UniformBuffer<T> {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::UNIFORM_BUFFER;
     const DESCRIPTOR_COUNT: u32 = 1;
-    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL_COMMANDS;
 
-    fn visit<A: ArgumentVisitor>(&self, binding: u32, visitor: &mut A) {
-        visitor.visit_buffer(
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
             binding,
-            self.buffer,
-            vk::DescriptorType::UNIFORM_BUFFER,
-            vk::AccessFlags::UNIFORM_READ,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-        );
+            descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+            kind: ArgumentKind::Buffer {
+                buffer: self.buffer,
+                resource_state: ResourceState {
+                    layout: vk::ImageLayout::UNDEFINED,
+                    access: vk::AccessFlags2::UNIFORM_READ,
+                    stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+                },
+                offset: self.offset as usize,
+                size: self.range as usize,
+            },
+        }
     }
 }
 
@@ -244,3 +289,5 @@ where
     P: ArgumentSet<{ N }>,
 {
 }
+
+////////////////////////////////////////////////////////////////////////////////////////////////////

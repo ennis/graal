@@ -1,5 +1,4 @@
 use crate::{
-    command_allocator::CommandBufferAllocator,
     device::{
         BufferId, Device, GroupId, ImageHandle, ImageId, ImageRegistrationInfo, OwnerQueue, ResourceAllocation,
         ResourceId, ResourceKind, ResourceRegistrationInfo, Swapchain, SwapchainImage,
@@ -42,6 +41,7 @@ pub struct SignaledSemaphore(pub(crate) vk::Semaphore);
 #[derive(Debug)]
 pub struct UnsignaledSemaphore(pub(crate) vk::Semaphore);
 
+#[derive(Copy, Clone, Debug)]
 pub struct ResourceState {
     pub stages: vk::PipelineStageFlags2,
     pub access: vk::AccessFlags2,
@@ -74,11 +74,70 @@ impl ResourceState {
         access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
         layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     };
+    pub const VERTEX_BUFFER: ResourceState = ResourceState {
+        stages: vk::PipelineStageFlags2::VERTEX_INPUT,
+        access: vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
+        layout: vk::ImageLayout::UNDEFINED,
+    };
     pub const PRESENT: ResourceState = ResourceState {
         stages: vk::PipelineStageFlags2::NONE,
         access: vk::AccessFlags2::NONE,
         layout: vk::ImageLayout::PRESENT_SRC_KHR,
     };
+}
+
+/// Allocates command buffers in a `vk::CommandPool` and allows re-use of freed command buffers.
+#[derive(Debug)]
+struct CommandBufferAllocator {
+    queue_family: u32,
+    command_pool: vk::CommandPool,
+    free: Vec<vk::CommandBuffer>,
+    used: Vec<vk::CommandBuffer>,
+}
+
+impl CommandBufferAllocator {
+    unsafe fn new(device: &ash::Device, queue_family_index: u32) -> CommandBufferAllocator {
+        // create a new one
+        let create_info = vk::CommandPoolCreateInfo {
+            flags: vk::CommandPoolCreateFlags::TRANSIENT,
+            queue_family_index,
+            ..Default::default()
+        };
+        let command_pool = device
+            .create_command_pool(&create_info, None)
+            .expect("failed to create a command pool");
+
+        CommandBufferAllocator {
+            queue_family: queue_family_index,
+            command_pool,
+            free: vec![],
+            used: vec![],
+        }
+    }
+
+    fn alloc(&mut self, device: &ash::Device) -> vk::CommandBuffer {
+        let cb = self.free.pop().unwrap_or_else(|| unsafe {
+            let allocate_info = vk::CommandBufferAllocateInfo {
+                command_pool: self.command_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let buffers = device
+                .allocate_command_buffers(&allocate_info)
+                .expect("failed to allocate command buffers");
+            buffers[0]
+        });
+        self.used.push(cb);
+        cb
+    }
+
+    unsafe fn reset(&mut self, device: &ash::Device) {
+        device
+            .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+            .unwrap();
+        self.free.append(&mut self.used)
+    }
 }
 
 /// In-flight resources.
@@ -157,7 +216,7 @@ impl Queue {
         timeout: Duration,
     ) -> Result<SwapchainImage, vk::Result> {
         let image_available = self.get_or_create_semaphore();
-        let (image_index, _suboptimal) = match self.device.vk_khr_swapchain().acquire_next_image(
+        let (image_index, _suboptimal) = match self.device.khr_swapchain().acquire_next_image(
             swapchain.handle,
             timeout.as_nanos() as u64,
             image_available.0,
@@ -211,7 +270,7 @@ impl Queue {
             p_results: ptr::null_mut(),
             ..Default::default()
         };
-        let result = self.device.vk_khr_swapchain().queue_present(self.queue, &present_info);
+        let result = self.device.khr_swapchain().queue_present(self.queue, &present_info);
         // we signalled and waited on the semaphore, consider it consumed
         self.semaphores.push(UnsignaledSemaphore(render_finished.0));
         result

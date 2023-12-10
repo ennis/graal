@@ -33,7 +33,7 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
     let mut inline_data_member_types = vec![];
 
     // `visitor.visit(binding0, &self.field); visitor.visit(binding1, &self.field2); ...`
-    let mut visit_stmts = vec![];
+    let mut argument_infos = vec![];
 
     let mut next_binding_index: u32 = 0;
     let mut has_binding_zero = false;
@@ -108,8 +108,8 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
                     p_immutable_samplers : ::std::ptr::null()
                 },
             });
-            visit_stmts.push(quote! {
-                #CRATE::argument::DescriptorBinding::visit(&self.#member, #binding_index, visitor);
+            argument_infos.push(quote! {
+                #CRATE::argument::Argument::argument_info(&self.#member, #binding_index);
             });
         } else {
             let ty = &f.ty;
@@ -126,7 +126,7 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
     }
 
     // statements to visit inline data in Arguments::visit
-    let visit_inline_data;
+    let return_inline_data;
     let inline_data_struct;
 
     if !inline_data_members.is_empty() {
@@ -170,18 +170,17 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
             }
         };
 
-        visit_inline_data = quote! {
+        return_inline_data = quote! {
             let inline_data = #inline_data_struct_name {
                 #(#inline_data_member_init)*
             };
-            // SAFETY: inline_data points to a valid memory location of the specified size
-            unsafe {
-                visitor.visit_inline_uniform_block(0, ::std::mem::size_of::<#inline_data_struct_name>(), &inline_data as *const _ as *const ::std::ffi::c_void);
-            }
+            inline_data
         };
     } else {
-        inline_data_struct = quote! {};
-        visit_inline_data = quote! {};
+        inline_data_struct = quote! { () };
+        return_inline_data = quote! {
+            ::std::borrow::Cow::Borrowed(&())
+        };
     }
 
     // Check that we have no generics (doesn't work with DescriptorSetLayout caching)
@@ -194,6 +193,8 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
 
     let struct_name = &derive_input.ident;
     let (impl_generics, ty_generics, where_clause) = derive_input.generics.split_for_impl();
+
+    let arguments_seq = 0..argument_infos.len();
 
     Ok(quote! {
         #inline_data_struct
@@ -214,9 +215,26 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
         }
 
         impl #impl_generics #CRATE::argument::Arguments for #struct_name #ty_generics #where_clause {
-            fn visit<A: #CRATE::argument::ArgumentVisitor>(&self, visitor: &mut A) {
-                #visit_inline_data
-                #(#visit_stmts)*
+
+            /// The type of inline data for this argument.
+            type InlineData = #inline_data_struct;
+
+            /// Returns an iterator over all descriptors contained in this object.
+            fn arguments(&self) -> impl Iterator<Item = ArgumentInfo> + '_ {
+                let mut index = 0;
+                std::iter::from_fn(move || {
+                    let r = match index {
+                        #(#arguments_seq => Some(#argument_infos),)*
+                        _ => None,
+                    };
+                    index += 1;
+                    r
+                })
+            }
+
+            /// Returns the inline data for this argument.
+            fn inline_data(&self) -> Cow<Self::InlineData> {
+                #return_inline_data
             }
         }
     })

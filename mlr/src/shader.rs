@@ -1,19 +1,19 @@
 use crate::{
     argument::{Arguments, PushConstants, StaticArguments, StaticPushConstants},
     attachments::{Attachments, StaticAttachments},
-    device::Device,
+    device::{Device, PipelineInterface, StaticPipelineInterface},
+    encoder::RenderEncoder,
     pipeline_layout::PipelineLayout,
+    vertex::StaticVertexInput,
     vk,
 };
-use graal::ash;
 use once_cell::sync::Lazy;
 use std::{
-    ffi::{c_void, CString},
+    borrow::Cow,
+    ffi::{c_char, c_void, CString},
     path::{Path, PathBuf},
     ptr,
 };
-
-pub trait HasArguments<A: Arguments> {}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ShaderSource<'a> {
@@ -21,9 +21,11 @@ pub enum ShaderSource<'a> {
     File(&'a Path),
 }
 
+#[derive(Debug, Clone, Copy)]
 pub enum ShaderKind {
     Vertex,
     Fragment,
+    Geometry,
     Compute,
     TessControl,
     TessEvaluation,
@@ -37,6 +39,7 @@ impl ShaderKind {
             ShaderKind::Vertex => vk::ShaderStageFlags::VERTEX,
             ShaderKind::Fragment => vk::ShaderStageFlags::FRAGMENT,
             ShaderKind::Compute => vk::ShaderStageFlags::COMPUTE,
+            ShaderKind::Geometry => vk::ShaderStageFlags::GEOMETRY,
             ShaderKind::TessControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
             ShaderKind::TessEvaluation => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
             ShaderKind::Mesh => vk::ShaderStageFlags::MESH_NV,
@@ -52,73 +55,7 @@ pub struct ShaderCreateInfo<'a> {
     pub layouts: &'a [&'a [vk::DescriptorSetLayoutBinding]],
 }
 
-const COMPILER: Lazy<shaderc::Compiler> =
-    Lazy::new(|| shaderc::Compiler::new().expect("failed to create shader compiler"));
-
-#[derive(Debug, thiserror::Error)]
-pub enum ShaderCreationError {
-    #[error("I/O error")]
-    Io(#[from] std::io::Error),
-    #[error("compilation error")]
-    Shaderc(#[from] shaderc::Error),
-}
-
-/// Compiles a shader to SPIR-V
-fn compile_shader(create_info: &ShaderCreateInfo) -> Result<Vec<u32>, ShaderCreationError> {
-    let source_from_path;
-    let source_content = match create_info.source {
-        ShaderSource::Content(str) => str,
-        ShaderSource::File(path) => {
-            source_from_path = std::fs::read_to_string(path)?;
-            source_from_path.as_str()
-        }
-    };
-    let kind = match create_info.kind {
-        ShaderKind::Vertex => shaderc::ShaderKind::Vertex,
-        ShaderKind::Fragment => shaderc::ShaderKind::Fragment,
-        ShaderKind::Compute => shaderc::ShaderKind::Compute,
-        ShaderKind::TessControl => shaderc::ShaderKind::TessControl,
-        ShaderKind::TessEvaluation => shaderc::ShaderKind::TessEvaluation,
-        ShaderKind::Mesh => shaderc::ShaderKind::Mesh,
-        ShaderKind::Task => shaderc::ShaderKind::Task,
-    };
-
-    let mut compile_options = shaderc::CompileOptions::new().unwrap();
-    let mut base_include_path = std::env::current_dir().expect("failed to get current directory");
-
-    match create_info.source {
-        ShaderSource::File(path) => {
-            if let Some(parent) = path.parent() {
-                base_include_path = parent.to_path_buf();
-            }
-        }
-        _ => {}
-    }
-
-    compile_options.set_include_callback(move |requested_source, type_, requesting_source, include_depth| {
-        let mut path = base_include_path.clone();
-        path.push(requested_source);
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(e) => return Err(e.to_string()),
-        };
-        Ok(shaderc::ResolvedInclude {
-            resolved_name: path.display().to_string(),
-            content,
-        })
-    });
-
-    let compilation_artifact = COMPILER.compile_into_spirv(
-        source_content,
-        kind,
-        "main",
-        create_info.entry_point,
-        Some(&compile_options),
-    )?;
-
-    Ok(compilation_artifact.as_binary().into())
-}
-
+/*
 /// Represents a shader.
 pub struct Shader {
     device: graal::device::Device,
@@ -135,8 +72,8 @@ impl Drop for Shader {
             }
         }
     }
-}
-
+}*/
+/*
 fn create_shaders(device: &Device, create_infos: &[ShaderCreateInfo]) -> Result<Vec<Shader>, ShaderCreationError> {
     let mut shader_create_infos: Vec<vk::ShaderCreateInfoEXT> = Vec::with_capacity(create_infos.len());
 
@@ -180,9 +117,15 @@ fn create_shaders(device: &Device, create_infos: &[ShaderCreateInfo]) -> Result<
 
     todo!()
     //    Ok(())
-}
+}*/
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Shader code + entry point
+pub struct ShaderEntryPoint<'a> {
+    pub code: ShaderCode<'a>,
+    pub entry_point: &'a str,
+}
 
 /// Specifies the code of a shader.
 #[derive(Debug, Clone, Copy)]
@@ -197,17 +140,17 @@ pub enum ShaderCode<'a> {
 pub enum GraphicsShaders {
     /// Shaders of the primitive shading pipeline (the classic vertex, tessellation, geometry and fragment shaders).
     PrimitiveShading {
-        vertex: ShaderCode<'static>,
-        tess_control: Option<ShaderCode<'static>>,
-        tess_evaluation: Option<ShaderCode<'static>>,
-        geometry: Option<ShaderCode<'static>>,
-        fragment: ShaderCode<'static>,
+        vertex: ShaderEntryPoint<'static>,
+        tess_control: Option<ShaderEntryPoint<'static>>,
+        tess_evaluation: Option<ShaderEntryPoint<'static>>,
+        geometry: Option<ShaderEntryPoint<'static>>,
+        fragment: ShaderEntryPoint<'static>,
     },
     /// Shaders of the mesh shading pipeline (the new mesh and task shaders).
     MeshShading {
-        mesh: ShaderCode<'static>,
-        task: ShaderCode<'static>,
-        fragment: ShaderCode<'static>,
+        mesh: ShaderEntryPoint<'static>,
+        task: ShaderEntryPoint<'static>,
+        fragment: ShaderEntryPoint<'static>,
     },
 }
 
@@ -220,56 +163,26 @@ pub struct GraphicsPipelineCreateInfo {
     pub color_blend: vk::PipelineColorBlendStateCreateInfo,
 }
 
-pub struct GraphicsPipeline<Args, PushCst, Output> {
+pub struct GraphicsPipeline {
+    device: graal::device::Device,
     pipeline: vk::Pipeline,
-    pipeline_layout: PipelineLayout,
-    _phantom: std::marker::PhantomData<fn() -> (Args, PushCst, Output)>,
+    pipeline_layout: vk::PipelineLayout,
 }
 
-impl<Args: StaticArguments, PushCst: StaticPushConstants, Output: StaticAttachments>
-    GraphicsPipeline<Args, PushCst, Output>
-{
-    /// Creates a new graphics pipeline with the given configuration.
-    pub fn new(device: &Device, create_info: &GraphicsPipelineCreateInfo) -> Self {
-        // create pipeline layout
-        let pipeline_layout = PipelineLayout::new(
+impl GraphicsPipeline {
+    pub(super) fn new(
+        device: graal::device::Device,
+        pipeline: vk::Pipeline,
+        pipeline_layout: vk::PipelineLayout,
+    ) -> Self {
+        Self {
             device,
-            &[&<Args as StaticArguments>::LAYOUT],
-            PushCst::PUSH_CONSTANT_RANGES,
-        );
-
-
-
-        let pipeline_create_info = vk::GraphicsPipelineCreateInfo {
-            s_type: Default::default(),
-            p_next: (),
-            flags: Default::default(),
-            stage_count: 0,
-            p_stages: (),
-            // Ignored, set dynamically
-            p_vertex_input_state: vk::PipelineVertexInputStateCreateInfo::default(),
-            p_input_assembly_state: (),
-            p_tessellation_state: (),
-            p_viewport_state: (),
-            p_rasterization_state: (),
-            p_multisample_state: (),
-            p_depth_stencil_state: (),
-            p_color_blend_state: (),
-            p_dynamic_state: (),
-            layout: Default::default(),
-            render_pass: Default::default(),
-            subpass: 0,
-            base_pipeline_handle: Default::default(),
-            base_pipeline_index: 0,
-            ..Default::default(),
+            pipeline,
+            pipeline_layout,
         }
     }
-}
 
-/// Specifies the type of a graphics pipeline with the given vertex input, arguments and push constants.
-#[macro_export]
-macro_rules! GraphicsPipeline {
-    [arguments = ($($args:ty),*) $(, push_constants=$push_cst_ty:ty)?, output_attachments = $attachments:ty] => {
-
-    };
+    pub fn pipeline(&self) -> vk::Pipeline {
+        self.pipeline
+    }
 }

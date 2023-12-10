@@ -229,6 +229,7 @@ impl Device {
         // More stuff
         let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(instance, &device);
         let vk_ext_shader_object = ash::extensions::ext::ShaderObject::new(instance, &device);
+        let vk_khr_push_descriptor = ash::extensions::khr::PushDescriptor::new(instance, &device);
         let physical_device_memory_properties = instance.get_physical_device_memory_properties(physical_device);
         let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
         let physical_device_properties = instance.get_physical_device_properties(physical_device);
@@ -244,6 +245,7 @@ impl Device {
                 allocator: RefCell::new(allocator),
                 vk_khr_swapchain,
                 vk_ext_shader_object,
+                vk_khr_push_descriptor,
                 resources: RefCell::new(Default::default()),
                 resource_groups: RefCell::new(Default::default()),
                 deletion_lists: RefCell::new(vec![]),

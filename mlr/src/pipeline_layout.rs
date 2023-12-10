@@ -27,46 +27,10 @@ impl Drop for PipelineLayout {
 }
 
 impl PipelineLayout {
-    pub fn new(
-        device: &Device,
-        arg_layouts: &[&ArgumentsLayout],
-        push_constant_ranges: &[vk::PushConstantRange],
-    ) -> PipelineLayout {
-        let mut set_layouts = Vec::with_capacity(arg_layouts.len());
-        for &layout in arg_layouts.iter() {
-            let create_info = vk::DescriptorSetLayoutCreateInfo {
-                flags: vk::DescriptorSetLayoutCreateFlags::empty(),
-                binding_count: layout.bindings.len() as u32,
-                p_bindings: layout.bindings.as_ptr(),
-                ..Default::default()
-            };
-            let sl = unsafe {
-                device
-                    .create_descriptor_set_layout(&create_info, None)
-                    .expect("failed to create descriptor set layout")
-            };
-            set_layouts.push(sl);
-        }
+    pub fn new(device: &Device) -> PipelineLayout {}
 
-        let create_info = vk::PipelineLayoutCreateInfo {
-            set_layout_count: set_layouts.len() as u32,
-            p_set_layouts: set_layouts.as_ptr(),
-            push_constant_range_count: push_constant_ranges.len() as u32,
-            p_push_constant_ranges: push_constant_ranges.as_ptr(),
-            ..Default::default()
-        };
-
-        let pipeline_layout = unsafe {
-            device
-                .create_pipeline_layout(&create_info, None)
-                .expect("failed to create pipeline layout")
-        };
-
-        PipelineLayout {
-            device: device.device().clone(),
-            set_layouts,
-            pipeline_layout,
-        }
+    pub fn pipeline_layout(&self) -> vk::PipelineLayout {
+        self.pipeline_layout
     }
 }
 

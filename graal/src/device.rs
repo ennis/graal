@@ -24,6 +24,11 @@ use std::{
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Wrapper around a vulkan device, associated queues and tracked resources.
+#[derive(Clone)]
+pub struct Device {
+    pub(crate) inner: Rc<DeviceInner>,
+}
+
 pub(crate) struct DeviceInner {
     /// Underlying vulkan device
     pub(crate) device: ash::Device,
@@ -37,15 +42,11 @@ pub(crate) struct DeviceInner {
     pub(crate) allocator: RefCell<gpu_allocator::vulkan::Allocator>,
     pub(crate) vk_khr_swapchain: ash::extensions::khr::Swapchain,
     pub(crate) vk_ext_shader_object: ash::extensions::ext::ShaderObject,
+    pub(crate) vk_khr_push_descriptor: ash::extensions::khr::PushDescriptor,
 
     pub(crate) resources: RefCell<ResourceMap>,
     pub(crate) resource_groups: RefCell<ResourceGroupMap>,
     deletion_lists: RefCell<Vec<DeferredDeletionList>>,
-}
-
-#[derive(Clone)]
-pub struct Device {
-    pub(crate) inner: Rc<DeviceInner>,
 }
 
 struct DeferredDeletionList {
@@ -603,8 +604,14 @@ impl Device {
         &self.inner.device
     }
 
-    pub fn vk_khr_swapchain(&self) -> &ash::extensions::khr::Swapchain {
+    /// Function pointers for VK_KHR_swapchain.
+    pub fn khr_swapchain(&self) -> &ash::extensions::khr::Swapchain {
         &self.inner.vk_khr_swapchain
+    }
+
+    /// Function pointers for VK_KHR_push_descriptor.
+    pub fn khr_push_descriptor(&self) -> &ash::extensions::khr::PushDescriptor {
+        &self.inner.vk_khr_push_descriptor
     }
 
     /*

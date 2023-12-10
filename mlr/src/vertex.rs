@@ -2,6 +2,7 @@
 use crate::vk;
 use std::{borrow::Cow, marker::PhantomData};
 
+use crate::buffer::{BufferAny, BufferRangeAny};
 pub use mlr_macros::Vertex;
 
 /// Trait implemented by types that represent vertex data in a vertex buffer.
@@ -197,6 +198,13 @@ pub struct VertexInputAttributeDescription {
     pub offset: u32,
 }
 
+#[derive(Copy, Clone, Debug)]
+pub struct VertexBufferDescriptor<'a> {
+    pub binding: u32,
+    pub buffer_range: BufferRangeAny<'a>,
+    pub stride: u32,
+}
+
 pub trait StaticVertexInput {
     /// Vertex buffers
     const BUFFER_LAYOUT: &'static [VertexBufferLayoutDescription];
@@ -211,6 +219,9 @@ pub trait VertexInput {
 
     /// Vertex attributes.
     fn attributes(&self) -> Cow<[VertexInputAttributeDescription]>;
+
+    /// Returns an iterator over the vertex buffers referenced in this object.
+    fn vertex_buffers(&self) -> impl Iterator<Item = VertexBufferDescriptor<'_>>;
 }
 
 /*

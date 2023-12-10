@@ -7,7 +7,16 @@ pub use graal::device::ImageHandle;
 
 /// Wrapper around a Vulkan image.
 #[derive(Clone, Debug)]
-pub struct ImageAny(Rc<ImageInner>);
+pub struct ImageAny {
+    device: Device,
+    handle: ImageHandle,
+    usage: vk::ImageUsageFlags,
+    type_: vk::ImageType,
+    format: vk::Format,
+    extent: vk::Extent3D,
+    /// Cached ImageViews.
+    views: Vec<(ImageViewInfo, vk::ImageView)>,
+}
 
 /// A view over a subresource range of an image.
 #[derive(Copy, Clone)]
@@ -42,16 +51,7 @@ pub struct ImageViewInfo {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug)]
-struct ImageInner {
-    device: Rc<Device>,
-    handle: ImageHandle,
-    usage: vk::ImageUsageFlags,
-    type_: vk::ImageType,
-    format: vk::Format,
-    extent: vk::Extent3D,
-    /// Cached ImageViews.
-    views: Vec<(ImageViewInfo, vk::ImageView)>,
-}
+struct ImageInner {}
 
 impl ImageAny {
     /// Returns the `vk::ImageType` of the image.
@@ -125,13 +125,13 @@ impl ImageAny {
 
     /// Creates a `VkImageView` object.
     pub(crate) fn create_view(&self, info: &ImageViewInfo) -> vk::ImageView {
-        if let Some((_, view)) = self.0.views.iter().find(|(i, _)| i == info) {
+        if let Some((_, view)) = self.views.iter().find(|(i, _)| i == info) {
             return *view;
         }
 
         let create_info = vk::ImageViewCreateInfo {
             flags: vk::ImageViewCreateFlags::empty(),
-            image: self.0.handle.vk,
+            image: self.handle.vk,
             view_type: info.view_type,
             format: info.format,
             components: vk::ComponentMapping {
@@ -152,8 +152,7 @@ impl ImageAny {
 
         // SAFETY: the device is valid, the create info is valid
         unsafe {
-            self.0
-                .device
+            self.device
                 .create_image_view(&create_info, None)
                 .expect("failed to create image view")
         }
