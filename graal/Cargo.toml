@@ -14,6 +14,11 @@ once_cell = "1.18.0"
 #serde_json = "1.0"
 tracing = "0.1.40"
 thiserror = "1.0.30"
+memoffset = "0.9.0"
+ordered-float = "4.1.1"
+shaderc = "0.8.3"
+graal-macros = { workspace = true }
+fxhash = "0.2.1"
 
 [dependencies.winapi]
 version = "0.3.9"
@@ -31,10 +36,10 @@ features = [
 [dev-dependencies]
 winit = "0.29.4"
 obj = "0.10.2"
+glam = "0.24.2"
 inline-spirv = "0.1.4"
 openimageio = { path = "../../openimageio-rs" }
 tracing-subscriber = { version = "0.2.17", features = ["fmt"] }
-windows = { version = "0.39.0", features = ["Win32_Graphics_Direct3D11", "Win32_Foundation", "Win32_Graphics_Direct3D", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Security"] }
 
 [build-dependencies]
 shaderc = "0.8.3"

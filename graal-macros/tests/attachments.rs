@@ -1,8 +1,4 @@
-use mlr::{
-    attachments::{Attachments, StaticAttachments},
-    image::{ImageAny, ImageHandle},
-    vk::Format,
-};
+use graal::{vk::Format, Attachments, ImageAny, StaticAttachments};
 
 #[derive(Attachments)]
 struct GBuffers<'a> {

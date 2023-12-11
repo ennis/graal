@@ -1,26 +1,43 @@
 //! Buffers
-use graal::{device::Device, vk};
-use std::rc::Rc;
+use std::{ffi::c_void, ptr::NonNull};
 
-pub use graal::device::BufferHandle;
+use crate::{
+    device::{Device, RefCounted},
+    vk, BufferId,
+};
 
 /// Wrapper around a Vulkan buffer.
 #[derive(Debug)]
 pub struct BufferAny {
     device: Device,
-    handle: BufferHandle,
+    id: RefCounted<BufferId>,
+    handle: vk::Buffer,
     size: usize,
     usage: vk::BufferUsageFlags,
+    mapped_ptr: Option<NonNull<c_void>>,
 }
 
 impl BufferAny {
-    pub(super) fn new(device: Device, handle: BufferHandle, size: usize, usage: vk::BufferUsageFlags) -> Self {
+    pub(super) fn new(
+        device: Device,
+        id: RefCounted<BufferId>,
+        handle: vk::Buffer,
+        size: usize,
+        usage: vk::BufferUsageFlags,
+        mapped_ptr: Option<NonNull<c_void>>,
+    ) -> Self {
         Self {
             device,
+            id,
             handle,
             size,
             usage,
+            mapped_ptr,
         }
+    }
+
+    pub fn id(&self) -> RefCounted<BufferId> {
+        self.id.clone()
     }
 
     /// Returns the size of the buffer in bytes.
@@ -34,7 +51,7 @@ impl BufferAny {
     }
 
     /// Returns the buffer handle.
-    pub fn handle(&self) -> BufferHandle {
+    pub fn handle(&self) -> vk::Buffer {
         self.handle
     }
 
@@ -45,19 +62,11 @@ impl BufferAny {
 
     /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
     pub fn mapped_data(&self) -> Option<*mut u8> {
-        self.handle.mapped_ptr.map(|ptr| ptr.as_ptr() as *mut u8)
+        self.mapped_ptr.map(|ptr| ptr.as_ptr() as *mut u8)
     }
 }
 
-impl Drop for BufferAny {
-    fn drop(&mut self) {
-        unsafe {
-            // SAFETY: we own the buffer and it is valid
-            self.device.destroy_buffer(self.handle.id);
-        }
-    }
-}
-
+#[derive(Copy, Clone, Debug)]
 pub struct BufferRangeAny<'a> {
     pub buffer: &'a BufferAny,
     pub offset: usize,
@@ -67,12 +76,12 @@ pub struct BufferRangeAny<'a> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Typed buffers.
-#[derive(Clone)]
 pub struct Buffer<T> {
     any: BufferAny,
     _marker: std::marker::PhantomData<T>,
 }
 
+#[derive(Copy, Clone)]
 pub struct BufferRange<'a, T> {
     pub buffer: &'a Buffer<T>,
     pub offset: usize,

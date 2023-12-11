@@ -1,3 +1,4 @@
+use graal::Queue;
 use winit::{
     event::MouseButton,
     keyboard::{Key, NamedKey},
@@ -26,13 +27,6 @@ impl App {
         // TODO
     }
 
-    pub fn render(&mut self) {
-
-        /*self.device.render(attachments, |render_ctx| {
-
-            render_ctx.
-
-        });*/
-    }
+    pub fn render(&mut self, queue: &mut Queue) {}
     pub fn on_exit(&mut self) {}
 }

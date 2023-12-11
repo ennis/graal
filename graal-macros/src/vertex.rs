@@ -32,16 +32,16 @@ pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<Token
         }
 
         let format = if normalized_attr {
-            quote!(<#CRATE::vertex::Norm<#field_ty> as #CRATE::vertex::VertexAttribute>::FORMAT)
+            quote!(<#CRATE::vertex::Norm<#field_ty> as #CRATE::VertexAttribute>::FORMAT)
         } else {
-            quote!(<#field_ty as #CRATE::vertex::VertexAttribute>::FORMAT)
+            quote!(<#field_ty as #CRATE::VertexAttribute>::FORMAT)
         };
 
         match f.ident {
             None => {
                 let index = syn::Index::from(i);
                 attribute_descs.push(quote! {
-                    #CRATE::vertex::VertexAttributeDescriptor {
+                    #CRATE::VertexAttributeDescriptor {
                         format: #format,
                         offset: #CRATE::__offset_of_tuple!(#struct_name, #index) as u32,
                     }
@@ -49,7 +49,7 @@ pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<Token
             }
             Some(ref ident) => {
                 attribute_descs.push(quote! {
-                    #CRATE::vertex::VertexAttributeDescriptor {
+                    #CRATE::VertexAttributeDescriptor {
                         format: #format,
                         offset: #CRATE::__offset_of!(#struct_name, #ident) as u32,
                     }
@@ -61,8 +61,8 @@ pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<Token
     let (impl_generics, ty_generics, where_clause) = derive_input.generics.split_for_impl();
 
     Ok(quote! {
-        unsafe impl #impl_generics #CRATE::vertex::Vertex for #struct_name #ty_generics #where_clause {
-            const ATTRIBUTES: &'static [#CRATE::vertex::VertexAttributeDescriptor] = {
+        unsafe impl #impl_generics #CRATE::Vertex for #struct_name #ty_generics #where_clause {
+            const ATTRIBUTES: &'static [#CRATE::VertexAttributeDescriptor] = {
                 &[#(#attribute_descs,)*]
             };
         }

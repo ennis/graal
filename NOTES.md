@@ -294,3 +294,22 @@ I won't use graal alone anyway.
 
 Get vulkan/metal/dx12 for free.
 Made primarily for portability
+
+# ImageViews
+
+We want to keep ImageViews. However, they should keep the parent image alive. This means that either `ImageAny` is an `Rc<ImageInner>`
+or that resources have an internal refcount.
+
+Ref count overview:
+- add a `ref_count: usize` to `Resource`
+- add `Device::resource_add_ref(&self, resource_id)`
+- `Device::destroy_resource` only decreases the refcount.
+
+Device API:
+
+    // ID-based
+    create_resource() -> ResourceId
+    destroy_resource(id)
+
+    // Arc-based
+    create_resource() -> Arc<Resource>

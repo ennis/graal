@@ -75,7 +75,7 @@ pub(crate) fn derive_push_constants(input: proc_macro::TokenStream) -> syn::Resu
     let (impl_generics, ty_generics, where_clause) = derive_input.generics.split_for_impl();
 
     Ok(quote! {
-        impl #impl_generics #CRATE::argument::StaticPushConstants for #struct_name #ty_generics #where_clause {
+        impl #impl_generics #CRATE::StaticPushConstants for #struct_name #ty_generics #where_clause {
             const PUSH_CONSTANT_RANGES: &'static [#CRATE::vk::PushConstantRange] = &[
                 #(#push_constant_ranges)*
             ];

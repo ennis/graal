@@ -1,13 +1,9 @@
-use crate::vk;
-use graal::{
-    aspects_for_format,
-    device::ImageHandle,
-    queue::{ResourceState, Submission},
+use crate::{
+    image::{ImageAny, ImageViewInfo},
+    vk, ImageView,
 };
-use std::borrow::Cow;
 
-use crate::image::{ImageAny, ImageSubresourceRange, ImageViewInfo};
-pub use mlr_macros::Attachments;
+pub use graal_macros::Attachments;
 
 /// Trait implemented for types that contain attachments.
 pub trait StaticAttachments {
@@ -21,8 +17,7 @@ pub trait StaticAttachments {
 
 /// Describes a color, depth, or stencil attachment.
 pub struct Attachment<'a> {
-    pub image: &'a ImageAny,
-    pub view_info: ImageViewInfo,
+    pub image_view: &'a ImageView,
     pub load_op: vk::AttachmentLoadOp,
     pub store_op: vk::AttachmentStoreOp,
     pub clear_value: Option<vk::ClearValue>,
@@ -106,9 +101,14 @@ pub trait AsAttachment<'a> {
 }
 
 /// References to images can be used as attachments.
-impl<'a> AsAttachment<'a> for &'a ImageAny {
+impl<'a> AsAttachment<'a> for &'a ImageView {
     fn as_attachment(&self) -> Attachment<'a> {
-        self.attachment()
+        Attachment {
+            image_view: self,
+            load_op: Default::default(),
+            store_op: Default::default(),
+            clear_value: None,
+        }
     }
 }
 

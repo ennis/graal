@@ -1,6 +1,8 @@
 mod aabb;
 mod app;
 mod camera_control;
+mod mesh;
+mod scene;
 
 use winit::{
     event::{Event, WindowEvent},
@@ -13,7 +15,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-    let surface = graal::surface::get_vulkan_surface(window.raw_window_handle().unwrap());
+    let surface = graal::get_vulkan_surface(window.raw_window_handle().unwrap());
 
     let (device, mut queue) =
         unsafe { graal::create_device_and_queue(Some(surface)).expect("failed to create device") };

@@ -1,5 +1,5 @@
 [package]
-name = "mlr-macros"
+name = "graal-macros"
 version = "0.1.0"
 edition = "2021"
 
@@ -16,4 +16,4 @@ proc-macro2 = "1"
 proc-macro = true
 
 [dev-dependencies]
-mlr = { workspace=true }
+graal = { workspace=true }

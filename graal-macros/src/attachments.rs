@@ -85,9 +85,8 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                     if meta.path.is_ident("clear_color") {
                         let value = meta.value()?;
                         let color: syn::Expr = value.parse()?;
-                        clear_color = Some(
-                            quote!(#CRATE::vk::ClearColorValue::from(#CRATE::attachments::ClearColorValue::from(#color))),
-                        );
+                        clear_color =
+                            Some(quote!(#CRATE::vk::ClearColorValue::from(#CRATE::ClearColorValue::from(#color))));
                         is_color = true;
                         return Ok(());
                     }
@@ -221,7 +220,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                     unreachable!()
                 };
                 quote! {
-                     #CRATE::attachments::AsAttachment::as_attachment(&#CRATE::attachments::AttachmentOverride(
+                     #CRATE::AsAttachment::as_attachment(&#CRATE::AttachmentOverride(
                         self.#field_name,
                         #load_op,
                         #store_op,
@@ -230,7 +229,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                 }
             } else {
                 // no overrides
-                quote!(#CRATE::attachments::AsAttachment::as_attachment(&self.#field_name))
+                quote!(#CRATE::AsAttachment::as_attachment(&self.#field_name))
             };
 
         let format = quote!(#CRATE::vk::Format::#format);
@@ -264,14 +263,14 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
     let color_attachment_seq = 0..color_attachments.len();
 
     Ok(quote! {
-        impl #impl_generics #CRATE::attachments::StaticAttachments for #struct_name #ty_generics #where_clause {
+        impl #impl_generics #CRATE::StaticAttachments for #struct_name #ty_generics #where_clause {
             const COLOR: &'static [#CRATE::vk::Format] = &[#(#color_formats),*];
             const DEPTH: Option<#CRATE::vk::Format> = #depth_format;
             const STENCIL: Option<#CRATE::vk::Format> = #stencil_format;
         }
 
-        impl #impl_generics #CRATE::attachments::Attachments for #struct_name #ty_generics #where_clause {
-            fn color_attachments(&self) -> impl Iterator<Item = #CRATE::attachments::Attachment<'_>> + '_ {
+        impl #impl_generics #CRATE::Attachments for #struct_name #ty_generics #where_clause {
+            fn color_attachments(&self) -> impl Iterator<Item = #CRATE::Attachment<'_>> + '_ {
                 let mut index = 0;
                 std::iter::from_fn(move || {
                     let r = match index {
@@ -283,11 +282,11 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                 })
             }
 
-            fn depth_attachment(&self) -> Option<#CRATE::attachments::Attachment> {
+            fn depth_attachment(&self) -> Option<#CRATE::Attachment> {
                 #depth_attachment
             }
 
-            fn stencil_attachment(&self) -> Option<#CRATE::attachments::Attachment> {
+            fn stencil_attachment(&self) -> Option<#CRATE::Attachment> {
                 #stencil_attachment
             }
         }

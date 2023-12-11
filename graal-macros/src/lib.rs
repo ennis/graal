@@ -27,11 +27,9 @@ const CRATE: CrateName = CrateName;
 
 impl ToTokens for CrateName {
     fn to_tokens(&self, tokens: &mut TokenStream) {
-        tokens.append(syn::Ident::new("mlr", Span::call_site()))
+        tokens.append(syn::Ident::new("graal", Span::call_site()))
     }
 }
-
-type FieldList = syn::punctuated::Punctuated<syn::Field, syn::Token![,]>;
 
 #[derive(Default, PartialEq, Eq)]
 struct StageFlags {
@@ -63,7 +61,7 @@ impl StageFlags {
         }
     }
 
-    fn all_graphics() -> Self {
+    /*fn all_graphics() -> Self {
         Self {
             vertex: false,
             tess_control: false,
@@ -76,7 +74,7 @@ impl StageFlags {
             all: false,
             all_graphics: true,
         }
-    }
+    }*/
 
     fn from_meta_list(meta_list: &MetaList) -> syn::Result<StageFlags> {
         let mut stage_flags = StageFlags::default();

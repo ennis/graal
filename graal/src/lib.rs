@@ -2,15 +2,42 @@
 
 pub use ash::{self, vk};
 pub use gpu_allocator::MemoryLocation;
+#[doc(hidden)]
+pub use memoffset::offset_of as __offset_of;
+#[doc(hidden)]
+pub use memoffset::offset_of_tuple as __offset_of_tuple;
 
-pub mod device;
-pub mod instance;
-pub mod platform;
-pub mod queue;
-pub mod surface;
-pub mod utils;
+pub use argument::*;
+pub use attachments::*;
+pub use buffer::*;
+pub use device::{create_device_and_queue, *};
+pub use error::*;
+pub use image::*;
+pub use instance::*;
+pub use pipeline::*;
+pub use platform::*;
+pub use rect::*;
+pub use resource_state::*;
+pub use sampler::*;
+pub use surface::*;
+pub use vertex::*;
 
+mod argument;
+mod attachments;
+mod buffer;
+mod device;
+mod error;
+mod image;
+mod instance;
+mod pipeline;
+mod platform;
 mod platform_impl;
+mod rect;
+mod resource_state;
+mod sampler;
+mod surface;
+pub mod utils;
+mod vertex;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -75,5 +102,3 @@ pub fn aspects_for_format(fmt: vk::Format) -> vk::ImageAspectFlags {
         vk::ImageAspectFlags::COLOR
     }
 }
-
-pub use device::create_device_and_queue;

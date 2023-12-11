@@ -1,9 +1,9 @@
-use crate::vk;
+use crate::{device::DeviceCreateError, vk};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to create device")]
-    DeviceCreationFailed(#[from] graal::device::DeviceCreateError),
+    DeviceCreationFailed(#[from] DeviceCreateError),
     #[error("I/O error")]
     Io(#[from] std::io::Error),
     #[error("compilation error")]

@@ -1,7 +1,4 @@
-use mlr::{
-    argument::{Arguments, PushConstants, SampledImage, StaticArguments, StaticPushConstants, UniformBuffer},
-    vk,
-};
+use graal::{vk, Arguments, PushConstants, SampledImage, StaticArguments, StaticPushConstants, UniformBuffer};
 use std::mem;
 
 #[repr(C)]

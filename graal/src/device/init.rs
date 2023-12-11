@@ -1,10 +1,8 @@
 //! Device initialization helpers
-use super::{Device, DeviceCreateError, DeviceInner, Feature, QueueData, QueueFamilyConfig};
+use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig};
 use crate::{
     instance::{get_vulkan_entry, get_vulkan_instance, vk_khr_surface},
-    platform_impl,
-    queue::Queue,
-    vk,
+    platform_impl, vk,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -234,6 +232,9 @@ impl Device {
         let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
         let physical_device_properties = instance.get_physical_device_properties(physical_device);
 
+        // Compiler
+        let compiler = shaderc::Compiler::new().expect("failed to create the shader compiler");
+
         Ok(Device {
             inner: Rc::new(DeviceInner {
                 device,
@@ -249,6 +250,8 @@ impl Device {
                 resources: RefCell::new(Default::default()),
                 resource_groups: RefCell::new(Default::default()),
                 deletion_lists: RefCell::new(vec![]),
+                sampler_cache: RefCell::new(Default::default()),
+                compiler,
             }),
         })
     }
@@ -277,7 +280,7 @@ impl Device {
 
         // ------ Setup device create info ------
         let queue_priorities = [1.0f32];
-        let mut device_queue_create_infos = &[vk::DeviceQueueCreateInfo {
+        let device_queue_create_infos = &[vk::DeviceQueueCreateInfo {
             flags: Default::default(),
             queue_family_index: graphics_queue_family,
             queue_count: 1,

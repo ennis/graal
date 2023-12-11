@@ -1,9 +1,4 @@
-use crate::{
-    device::ImageHandle,
-    queue::{Queue, ResourceState, Submission},
-    vk,
-};
-
+/*
 pub unsafe fn blit_images(
     queue: &mut Queue,
     src_image: ImageHandle,
@@ -12,7 +7,7 @@ pub unsafe fn blit_images(
     height: u32,
     aspect_mask: vk::ImageAspectFlags,
 ) {
-    let cb = queue.allocate_command_buffer();
+    let cb = queue.create_command_buffer();
     let regions = &[vk::ImageBlit {
         src_subresource: vk::ImageSubresourceLayers {
             aspect_mask,
@@ -72,3 +67,4 @@ pub unsafe fn blit_images(
     blit.push_command_buffer(cb);
     queue.submit(blit).expect("blit_images failed");
 }
+*/

@@ -1,7 +1,7 @@
 use crate::{expect_struct_fields, CRATE};
 use darling::usage::{CollectTypeParams, GenericsExt, Purpose};
 use proc_macro2::{Ident, Span, TokenStream};
-use quote::quote;
+use quote::{quote, ToTokens};
 use syn::spanned::Spanned;
 
 pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<TokenStream> {
@@ -102,15 +102,13 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
             bindings.push(quote! {
                 #CRATE::vk::DescriptorSetLayoutBinding {
                     binding              : #binding_index,
-                    stage_flags          : <#ty as #CRATE::argument::DescriptorBinding>::SHADER_STAGES,
-                    descriptor_type      : <#ty as #CRATE::argument::DescriptorBinding>::DESCRIPTOR_TYPE,
-                    descriptor_count     : <#ty as #CRATE::argument::DescriptorBinding>::DESCRIPTOR_COUNT,
+                    stage_flags          : <#ty as #CRATE::Argument>::SHADER_STAGES,
+                    descriptor_type      : <#ty as #CRATE::Argument>::DESCRIPTOR_TYPE,
+                    descriptor_count     : <#ty as #CRATE::Argument>::DESCRIPTOR_COUNT,
                     p_immutable_samplers : ::std::ptr::null()
                 },
             });
-            argument_infos.push(quote! {
-                #CRATE::argument::Argument::argument_info(&self.#member, #binding_index);
-            });
+            argument_infos.push(quote!(#CRATE::Argument::argument_description(&self.#member, #binding_index)));
         } else {
             let ty = &f.ty;
             let data_member_name = data_member_name(i, &f.ident);
@@ -128,6 +126,7 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
     // statements to visit inline data in Arguments::visit
     let return_inline_data;
     let inline_data_struct;
+    let inline_data_struct_ty;
 
     if !inline_data_members.is_empty() {
         if has_binding_zero {
@@ -137,7 +136,8 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
             ));
         }
 
-        let inline_data_struct_name = quote::format_ident!("__{}_InlineData", derive_input.ident);
+        // FIXME: generics
+        inline_data_struct_ty = quote::format_ident!("__{}_InlineData", derive_input.ident).to_token_stream();
 
         // Add binding 0 entry to set layout
         bindings.insert(
@@ -147,7 +147,7 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
                     binding              : 0,
                     stage_flags          : #CRATE::vk::ShaderStageFlags::ALL,
                     descriptor_type      : #CRATE::vk::DescriptorType::INLINE_UNIFORM_BLOCK,
-                    descriptor_count     : ::std::mem::size_of::<#inline_data_struct_name>() as u32,
+                    descriptor_count     : ::std::mem::size_of::<#inline_data_struct_ty>() as u32,
                     p_immutable_samplers : ::std::ptr::null()
                 },
             },
@@ -165,19 +165,20 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
         inline_data_struct = quote! {
             #[repr(C)]
             #[derive(Copy,Clone)]
-            struct #inline_data_struct_name<#(#inline_data_type_params,)*> {
+            struct #inline_data_struct_ty<#(#inline_data_type_params,)*> {
                 #(#inline_data_members)*
             }
         };
 
         return_inline_data = quote! {
-            let inline_data = #inline_data_struct_name {
+            let inline_data = #inline_data_struct_ty {
                 #(#inline_data_member_init)*
             };
-            inline_data
+            ::std::borrow::Cow::Owned(inline_data)
         };
     } else {
-        inline_data_struct = quote! { () };
+        inline_data_struct = quote! {};
+        inline_data_struct_ty = quote! { () };
         return_inline_data = quote! {
             ::std::borrow::Cow::Borrowed(&())
         };
@@ -199,28 +200,21 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
     Ok(quote! {
         #inline_data_struct
 
-        impl #impl_generics #CRATE::argument::StaticArguments for #struct_name #ty_generics #where_clause {
-            const LAYOUT: #CRATE::argument::ArgumentsLayout<'static> = #CRATE::argument::ArgumentsLayout {
+        impl #impl_generics #CRATE::StaticArguments for #struct_name #ty_generics #where_clause {
+            const LAYOUT: #CRATE::ArgumentsLayout<'static> = #CRATE::ArgumentsLayout {
                 bindings: ::std::borrow::Cow::Borrowed(&[
                     #(#bindings)*
                 ]),
             };
-
-            fn create_descriptor_set_layout(device: &#CRATE::device::Device) -> #CRATE::vk::DescriptorSetLayout {
-                static CACHED: ::std::sync::OnceLock<#CRATE::vk::DescriptorSetLayout> = ::std::sync::OnceLock::new();
-                CACHED.get_or_init(move || {
-                    #CRATE::argument::create_descriptor_set_layout(device, &Self::LAYOUT)
-                }).clone()
-            }
         }
 
-        impl #impl_generics #CRATE::argument::Arguments for #struct_name #ty_generics #where_clause {
+        impl #impl_generics #CRATE::Arguments for #struct_name #ty_generics #where_clause {
 
             /// The type of inline data for this argument.
-            type InlineData = #inline_data_struct;
+            type InlineData = #inline_data_struct_ty;
 
             /// Returns an iterator over all descriptors contained in this object.
-            fn arguments(&self) -> impl Iterator<Item = ArgumentInfo> + '_ {
+            fn arguments(&self) -> impl Iterator<Item = #CRATE::ArgumentDescription> + '_ {
                 let mut index = 0;
                 std::iter::from_fn(move || {
                     let r = match index {
@@ -233,7 +227,7 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
             }
 
             /// Returns the inline data for this argument.
-            fn inline_data(&self) -> Cow<Self::InlineData> {
+            fn inline_data(&self) -> ::std::borrow::Cow<Self::InlineData> {
                 #return_inline_data
             }
         }

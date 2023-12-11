@@ -1,49 +1,7 @@
-use crate::{device::Device, sampler::Sampler, vk};
-use graal::{
-    device::{BufferHandle, ImageHandle},
-    queue::{ResourceState, Submission},
-};
-use std::{borrow::Cow, ffi::c_void, mem, ptr};
+use crate::{resource_state::ResourceState, vk, BufferAny, ImageAny, ImageView, Sampler};
+use std::borrow::Cow;
 
-pub use mlr_macros::{Arguments, PushConstants};
-
-/*
-pub trait ArgumentVisitor {
-    /// Image resource + descriptor.
-    fn visit_image(
-        &mut self,
-        binding: u32,
-        image: ImageHandle,
-        image_view: vk::ImageView,
-        descriptor_type: vk::DescriptorType,
-        access_mask: vk::AccessFlags2,
-        stage_mask: vk::PipelineStageFlags2,
-        layout: vk::ImageLayout,
-    );
-
-    /// Buffer resource + descriptor.
-    fn visit_buffer(
-        &mut self,
-        binding: u32,
-        buffer: BufferHandle,
-        descriptor_type: vk::DescriptorType,
-        access_mask: vk::AccessFlags,
-        stage_mask: vk::PipelineStageFlags,
-    );
-
-    /// Sampler descriptor.
-    fn visit_sampler(&mut self, binding: u32, sampler: Sampler);
-
-    /// Inline data.
-    ///
-    /// # Safety
-    ///
-    /// `data` must be a valid pointer to a block of memory of size `byte_size`.
-    ///
-    // NOTE: I tried to make it a `&[u8]` instead of `*const c_void`+size but this requires bytemuck and I couldn't make
-    // the bytemuck derives work inside the `#[derive(Arguments)]` macro (https://github.com/Lokathor/bytemuck/issues/159).
-    unsafe fn visit_inline_uniform_block(&mut self, binding: u32, byte_size: usize, data: *const c_void);
-}*/
+pub use graal_macros::{Arguments, PushConstants};
 
 #[derive(Debug, Clone)]
 pub struct ArgumentsLayout<'a> {
@@ -60,25 +18,27 @@ pub trait StaticArguments: Arguments {
 }
 
 /// Description of one argument in an argument block.
-pub struct ArgumentDescription {
+pub struct ArgumentDescription<'a> {
     pub binding: u32,
     pub descriptor_type: vk::DescriptorType,
-    pub kind: ArgumentKind,
+    pub kind: ArgumentKind<'a>,
 }
 
 /// Kind of argument.
 #[derive(Debug, Clone)]
-pub enum ArgumentKind {
+pub enum ArgumentKind<'a> {
     Image {
-        image: ImageHandle,
-        image_view: vk::ImageView,
+        image_view: &'a ImageView,
         resource_state: ResourceState,
     },
     Buffer {
-        buffer: BufferHandle,
+        buffer: &'a BufferAny,
         resource_state: ResourceState,
         offset: usize,
         size: usize,
+    },
+    Sampler {
+        sampler: &'a Sampler,
     },
 }
 
@@ -136,16 +96,13 @@ where
     }
 }
 
-//--------------------------------------------------------------------------------------------------
-
 /// Sampled image descriptor.
 #[derive(Debug)]
-pub struct SampledImage {
-    pub(crate) image: ImageHandle,
-    pub(crate) view: vk::ImageView,
+pub struct SampledImage<'a> {
+    pub image_view: &'a ImageView,
 }
 
-unsafe impl Argument for SampledImage {
+unsafe impl<'a> Argument for SampledImage<'a> {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::SAMPLED_IMAGE;
     const DESCRIPTOR_COUNT: u32 = 1;
     const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
@@ -155,8 +112,7 @@ unsafe impl Argument for SampledImage {
             binding,
             descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
             kind: ArgumentKind::Image {
-                image: self.image,
-                image_view: self.view,
+                image_view: self.image_view,
                 resource_state: ResourceState {
                     layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                     access: vk::AccessFlags2::SHADER_READ,
@@ -167,79 +123,33 @@ unsafe impl Argument for SampledImage {
     }
 }
 
-//--------------------------------------------------------------------------------------------------
-
-/*
-/// Combined image/sampler descriptor.
-#[derive(Debug)]
-pub struct CombinedImageSampler2D<S: Sampler> {
-    pub image: ImageHandle,
-    pub sampler: S,
-    pub(crate) descriptor: vk::DescriptorImageInfo,
-}
-
-unsafe impl<'a, S: SamplerType> DescriptorBinding for CombinedImageSampler2D<'a, S> {
-    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::COMBINED_IMAGE_SAMPLER;
+unsafe impl<'a> Argument for &'a Sampler {
+    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::SAMPLER;
     const DESCRIPTOR_COUNT: u32 = 1;
     const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
-    const UPDATE_OFFSET: usize = Self::layout().descriptor.offset;
-    const UPDATE_STRIDE: usize = Self::layout().descriptor.size;
 
-    fn prepare_descriptors(&mut self, frame: &mut FrameResources) {
-        // SAFETY: TODO
-        let image_view = unsafe {
-            let create_info = vk::ImageViewCreateInfo {
-                flags: vk::ImageViewCreateFlags::empty(),
-                image: self.image.handle(),
-                view_type: vk::ImageViewType::TYPE_2D,
-                format: self.image.format(),
-                components: vk::ComponentMapping::default(),
-                subresource_range: vk::ImageSubresourceRange {
-                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                },
-                ..Default::default()
-            };
-            /// FIXME: this should probably be cached into the image
-            frame.create_transient_image_view(&create_info)
-        };
-
-        let sampler = self.sampler.to_sampler(frame.vulkan_device());
-        self.descriptor = vk::DescriptorImageInfo {
-            sampler,
-            image_view,
-            image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
+            binding,
+            descriptor_type: vk::DescriptorType::SAMPLER,
+            kind: ArgumentKind::Sampler { sampler: self },
         }
     }
-
-    fn visit(&self, visitor: &mut dyn ResourceVisitor) {
-        visitor.visit_image(
-            self.image,
-            vk::AccessFlags::SHADER_READ,
-            vk::PipelineStageFlags::ALL_COMMANDS,
-            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        );
-    }
 }
-*/
 
-//--------------------------------------------------------------------------------------------------
-
+/// Uniform buffer descriptor.
 #[derive(Copy, Clone, Debug)]
-pub struct UniformBuffer<T> {
-    pub buffer: BufferHandle,
+pub struct UniformBuffer<'a, T> {
+    pub buffer: &'a BufferAny,
     pub offset: vk::DeviceSize,
     pub range: vk::DeviceSize,
     _phantom: std::marker::PhantomData<fn() -> T>,
 }
 
-unsafe impl<T> Argument for UniformBuffer<T> {
+unsafe impl<'a, T> Argument for UniformBuffer<'a, T> {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::UNIFORM_BUFFER;
     const DESCRIPTOR_COUNT: u32 = 1;
-    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL_COMMANDS;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
 
     fn argument_description(&self, binding: u32) -> ArgumentDescription {
         ArgumentDescription {
@@ -259,11 +169,10 @@ unsafe impl<T> Argument for UniformBuffer<T> {
     }
 }
 
-//--------------------------------------------------------------------------------------------------
-
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 // Implementation details of `#[derive(Arguments)]`
 
+/*
 #[doc(hidden)]
 pub fn create_descriptor_set_layout(device: &Device, layout: &ArgumentsLayout<'_>) -> vk::DescriptorSetLayout {
     let create_info = vk::DescriptorSetLayoutCreateInfo {
@@ -288,6 +197,6 @@ fn test<P, const N: usize>(pipeline: &P, args: P::Arguments)
 where
     P: ArgumentSet<{ N }>,
 {
-}
+}*/
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

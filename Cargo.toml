@@ -1,15 +1,13 @@
 [workspace]
 members = [
     "graal",         # graphics resource abstraction layer
-    "mlr",           # "mid-level rendering"
-    "mlr-macros",           # "mid-level rendering"
+    "graal-macros",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 graal = { path = "graal" }
-mlr = { path = "mlr" }
-mlr-macros = { path = "mlr-macros" }
+graal-macros = { path = "graal-macros" }
 
 [profile.release]
 debug = true

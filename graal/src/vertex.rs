@@ -1,9 +1,9 @@
 //! Vertex-related types
-use crate::vk;
 use std::{borrow::Cow, marker::PhantomData};
 
-use crate::buffer::{BufferAny, BufferRangeAny};
-pub use mlr_macros::Vertex;
+pub use graal_macros::Vertex;
+
+use crate::{buffer::BufferRangeAny, vk};
 
 /// Trait implemented by types that represent vertex data in a vertex buffer.
 pub unsafe trait Vertex: Copy + 'static {
@@ -54,23 +54,6 @@ macro_rules! impl_vertex_attr {
         }
     };
 }
-
-/*
-macro_rules! impl_vertex_attrib_ {
-    ($t:ty, $fmt:ident) => {
-        unsafe impl VertexAttribute for $t {
-            const FORMAT: vk::Format = vk::Format::$fmt;
-        }
-    };
-}
-
-macro_rules! impl_attrib_vector_type {
-    ([$t:ty; $len:expr], $fmt:ident) => {
-        unsafe impl VertexAttribute for [$t; $len] {
-            const FORMAT: vk::Format = vk::Format::$fmt;
-        }
-    };
-}*/
 
 // F32
 impl_vertex_attr!(f32, R32_SFLOAT);
@@ -223,46 +206,6 @@ pub trait VertexInput {
     /// Returns an iterator over the vertex buffers referenced in this object.
     fn vertex_buffers(&self) -> impl Iterator<Item = VertexBufferDescriptor<'_>>;
 }
-
-/*
-pub trait VertexBindingInterface {
-    const ATTRIBUTES: &'static [VertexAttributeDescriptor];
-    const STRIDE: usize;
-}
-
-impl<T: VertexData> VertexBindingInterface for VertexBufferView<T> {
-    const ATTRIBUTES: &'static [VertexAttribute] = T::ATTRIBUTES;
-    const STRIDE: usize = mem::size_of::<T>();
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
-pub struct VertexInputBindingAttributes<'a> {
-    pub base_location: u32,
-    pub attributes: &'a [VertexAttribute],
-}
-
-pub trait VertexInputInterface {
-    const BINDINGS: &'static [vk::VertexInputBindingDescription];
-    const ATTRIBUTES: &'static [vk::VertexInputAttributeDescription];
-}
-
-/// Extension trait for VertexInputInterface
-pub trait VertexInputInterfaceExt: VertexInputInterface {
-    /// Helper function to get a `vk::PipelineVertexInputStateCreateInfo` from this vertex input struct.
-    fn get_pipeline_vertex_input_state_create_info() -> vk::PipelineVertexInputStateCreateInfo;
-}
-
-impl<T: VertexInputInterface> VertexInputInterfaceExt for T {
-    fn get_pipeline_vertex_input_state_create_info() -> vk::PipelineVertexInputStateCreateInfo {
-        vk::PipelineVertexInputStateCreateInfo {
-            vertex_binding_description_count: Self::BINDINGS.len() as u32,
-            p_vertex_binding_descriptions: Self::BINDINGS.as_ptr(),
-            vertex_attribute_description_count: Self::ATTRIBUTES.len() as u32,
-            p_vertex_attribute_descriptions: Self::ATTRIBUTES.as_ptr(),
-            ..Default::default()
-        }
-    }
-}*/
 
 #[doc(hidden)]
 pub const fn append_attributes<const N: usize>(
