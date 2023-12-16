@@ -1,3 +1,9 @@
+mod device;
+mod queue;
+
+pub use device::*;
+pub use queue::QueueExt;
+
 /*
 pub unsafe fn blit_images(
     queue: &mut Queue,

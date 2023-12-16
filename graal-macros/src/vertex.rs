@@ -41,7 +41,7 @@ pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<Token
             None => {
                 let index = syn::Index::from(i);
                 attribute_descs.push(quote! {
-                    #CRATE::VertexAttributeDescriptor {
+                    #CRATE::VertexAttributeDescription {
                         format: #format,
                         offset: #CRATE::__offset_of_tuple!(#struct_name, #index) as u32,
                     }
@@ -49,7 +49,7 @@ pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<Token
             }
             Some(ref ident) => {
                 attribute_descs.push(quote! {
-                    #CRATE::VertexAttributeDescriptor {
+                    #CRATE::VertexAttributeDescription {
                         format: #format,
                         offset: #CRATE::__offset_of!(#struct_name, #ident) as u32,
                     }
@@ -62,7 +62,7 @@ pub(crate) fn derive_vertex(input: proc_macro::TokenStream) -> syn::Result<Token
 
     Ok(quote! {
         unsafe impl #impl_generics #CRATE::Vertex for #struct_name #ty_generics #where_clause {
-            const ATTRIBUTES: &'static [#CRATE::VertexAttributeDescriptor] = {
+            const ATTRIBUTES: &'static [#CRATE::VertexAttributeDescription] = {
                 &[#(#attribute_descs,)*]
             };
         }

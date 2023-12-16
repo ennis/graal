@@ -1,17 +1,15 @@
+use drop_bomb::DropBomb;
 use std::{
     ffi::c_void,
     mem,
-    ops::{Deref, DerefMut},
+    ops::{Deref, DerefMut, Range},
     ptr,
 };
 
 use crate::{
-    argument::{ArgumentKind, Arguments},
-    device::Device,
-    pipeline::GraphicsPipeline,
-    resource_state::ResourceState,
-    vertex::{VertexBufferDescriptor, VertexInput},
-    vk, BufferAny, CommandBuffer, ImageAny, ImageSubresourceLayers, Rect3D,
+    vk, ArgumentKind, Arguments, BufferRangeAny, ClearColorValue, ColorBlendEquation, CommandBuffer, Device,
+    GraphicsPipeline, Image, ImageCopyBuffer, ImageCopyView, ImageSubresourceLayers, IndexType, PipelineBindPoint,
+    PrimitiveTopology, Rect2D, Rect3D, ResourceState, VertexBufferDescriptor, VertexInput,
 };
 
 /// Common
@@ -32,6 +30,9 @@ impl<'a> Encoder<'a> {
 /// This is used in `RenderPass::bind_pipeline`.
 pub struct RenderEncoder<'a> {
     base: Encoder<'a>,
+    width: u32,
+    height: u32,
+    bomb: DropBomb,
 }
 
 impl<'a> Deref for RenderEncoder<'a> {
@@ -195,13 +196,16 @@ impl<'a> Encoder<'a> {
 }
 
 impl<'a> RenderEncoder<'a> {
-    pub(super) fn new(command_buffer: &'a mut CommandBuffer) -> Self {
+    pub(super) fn new(command_buffer: &'a mut CommandBuffer, width: u32, height: u32) -> Self {
         Self {
             base: Encoder {
                 command_buffer,
                 pipeline_layout: vk::PipelineLayout::null(),
                 bind_point: vk::PipelineBindPoint::GRAPHICS,
             },
+            width,
+            height,
+            bomb: DropBomb::new("RenderEncoder should be finished with `.finish()`"),
         }
     }
 
@@ -212,6 +216,7 @@ impl<'a> RenderEncoder<'a> {
             vk::PipelineBindPoint::GRAPHICS,
             pipeline.pipeline(),
         );
+        self.pipeline_layout = pipeline.pipeline_layout;
     }
 
     /// Binds vertex buffers to the pipeline.
@@ -219,16 +224,16 @@ impl<'a> RenderEncoder<'a> {
         let buffer_count = vertex_input.vertex_buffers().count();
         let mut buffers = Vec::with_capacity(buffer_count);
         let mut offsets = Vec::with_capacity(buffer_count);
-        let mut sizes = Vec::with_capacity(buffer_count);
-        let mut strides = Vec::with_capacity(buffer_count);
+        //let mut sizes = Vec::with_capacity(buffer_count);
+        //let mut strides = Vec::with_capacity(buffer_count);
 
         for vertex_buffer in vertex_input.vertex_buffers() {
             self.command_buffer
                 .use_buffer(vertex_buffer.buffer_range.buffer, ResourceState::VERTEX_BUFFER);
             buffers.push(vertex_buffer.buffer_range.buffer.handle());
             offsets.push(vertex_buffer.buffer_range.offset as vk::DeviceSize);
-            sizes.push(vertex_buffer.buffer_range.size as vk::DeviceSize);
-            strides.push(vertex_buffer.stride as vk::DeviceSize);
+            //sizes.push(vertex_buffer.buffer_range.size as vk::DeviceSize);
+            //strides.push(vertex_buffer.stride as vk::DeviceSize);
         }
 
         self.command_buffer.flush_barriers();
@@ -238,13 +243,15 @@ impl<'a> RenderEncoder<'a> {
                 0,
                 &buffers,
                 &offsets,
-                Some(&sizes),
-                Some(&strides),
+                None,
+                None,
             );
         }
     }
 
     /// Binds a vertex buffer.
+    ///
+    /// FIXME: we shouldn't be able to set the stride here, it should be part of the pipeline state.
     pub fn bind_vertex_buffer(&mut self, vertex_buffer: &VertexBufferDescriptor) {
         self.command_buffer
             .use_buffer(vertex_buffer.buffer_range.buffer, ResourceState::VERTEX_BUFFER);
@@ -255,8 +262,22 @@ impl<'a> RenderEncoder<'a> {
                 vertex_buffer.binding,
                 &[vertex_buffer.buffer_range.buffer.handle()],
                 &[vertex_buffer.buffer_range.offset as vk::DeviceSize],
-                Some(&[vertex_buffer.buffer_range.size as vk::DeviceSize]),
-                Some(&[vertex_buffer.stride as vk::DeviceSize]),
+                None,
+                None,
+            );
+        }
+    }
+
+    pub fn bind_index_buffer(&mut self, index_type: IndexType, index_buffer: BufferRangeAny) {
+        self.command_buffer
+            .use_buffer(index_buffer.buffer, ResourceState::INDEX_BUFFER);
+        self.command_buffer.flush_barriers();
+        unsafe {
+            self.command_buffer.device().cmd_bind_index_buffer(
+                self.command_buffer.command_buffer,
+                index_buffer.buffer.handle(),
+                index_buffer.offset as vk::DeviceSize,
+                index_type.into(),
             );
         }
     }
@@ -264,7 +285,19 @@ impl<'a> RenderEncoder<'a> {
     /// Binds push constants.
     ///
     /// Usually this is called through a type-safe wrapper.
-    pub unsafe fn bind_push_constants(&mut self, stages: vk::ShaderStageFlags, size: usize, data: *const c_void) {
+    pub unsafe fn bind_push_constants_raw(&mut self, bind_point: PipelineBindPoint, size: usize, data: *const c_void) {
+        // Minimum push constant size guaranteed by Vulkan is 128 bytes.
+        assert!(size <= 128, "push constant size must be <= 128 bytes");
+        assert!(size % 4 == 0, "push constant size must be a multiple of 4 bytes");
+
+        // None of the relevant drivers on desktop care about the actual stages,
+        // only if it's graphics, compute, or ray tracing.
+        let stages = match bind_point {
+            PipelineBindPoint::Graphics => vk::ShaderStageFlags::ALL_GRAPHICS,
+            PipelineBindPoint::Compute => vk::ShaderStageFlags::COMPUTE,
+            //_ => panic!("unsupported bind point"),
+        };
+
         // Use the raw function pointer because the wrapper takes a &[u8] slice which we can't
         // get from a &[T] slice (unless we depend on `bytemuck` and require T: Pod, which is more trouble than its worth).
         (self.command_buffer.device().deref().fp_v1_0().cmd_push_constants)(
@@ -276,35 +309,183 @@ impl<'a> RenderEncoder<'a> {
             data,
         );
     }
+
+    /// Binds push constants.
+    pub fn bind_push_constants<P>(&mut self, bind_point: PipelineBindPoint, data: &P)
+    where
+        P: Copy + ?Sized,
+    {
+        unsafe {
+            self.bind_push_constants_raw(bind_point, mem::size_of_val(data), data as *const _ as *const c_void);
+        }
+    }
+
+    pub fn set_primitive_topology(&mut self, topology: PrimitiveTopology) {
+        unsafe {
+            self.command_buffer
+                .device()
+                .cmd_set_primitive_topology(self.command_buffer.command_buffer, topology.into());
+        }
+    }
+
+    pub fn set_viewport(&mut self, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
+        unsafe {
+            self.command_buffer.device().cmd_set_viewport(
+                self.command_buffer.command_buffer,
+                0,
+                &[vk::Viewport {
+                    x,
+                    y,
+                    width,
+                    height,
+                    min_depth,
+                    max_depth,
+                }],
+            );
+        }
+    }
+
+    pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
+        unsafe {
+            self.command_buffer.device().cmd_set_scissor(
+                self.command_buffer.command_buffer,
+                0,
+                &[vk::Rect2D {
+                    offset: vk::Offset2D { x, y },
+                    extent: vk::Extent2D { width, height },
+                }],
+            );
+        }
+    }
+
+    pub fn set_color_blend_enable(&mut self, color_attachment: usize, enable: bool) {
+        unsafe {
+            let cb = self.command_buffer.command_buffer;
+            let pfn = self.command_buffer.device().ext_extended_dynamic_state3();
+            pfn.cmd_set_color_blend_enable(cb, color_attachment as u32, &[enable.into()]);
+        }
+    }
+
+    pub fn set_color_blend_equation(&mut self, color_attachment: usize, color_blend_equation: &ColorBlendEquation) {
+        unsafe {
+            let cb = self.command_buffer.command_buffer;
+            let pfn = self.command_buffer.device().ext_extended_dynamic_state3();
+            let i = color_attachment as u32;
+            pfn.cmd_set_color_blend_equation(
+                cb,
+                i,
+                &[vk::ColorBlendEquationEXT {
+                    src_color_blend_factor: color_blend_equation.src_color_blend_factor.to_vk_blend_factor(),
+                    dst_color_blend_factor: color_blend_equation.dst_color_blend_factor.to_vk_blend_factor(),
+                    color_blend_op: color_blend_equation.color_blend_op.to_vk_blend_op(),
+                    src_alpha_blend_factor: color_blend_equation.src_alpha_blend_factor.to_vk_blend_factor(),
+                    dst_alpha_blend_factor: color_blend_equation.dst_alpha_blend_factor.to_vk_blend_factor(),
+                    alpha_blend_op: color_blend_equation.alpha_blend_op.to_vk_blend_op(),
+                }],
+            );
+        }
+    }
+
+    pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        unsafe {
+            self.command_buffer.device().cmd_draw(
+                self.command_buffer.command_buffer,
+                vertices.len() as u32,
+                instances.len() as u32,
+                vertices.start,
+                instances.start,
+            );
+        }
+    }
+
+    pub fn clear_color(&mut self, attachment: u32, color: ClearColorValue) {
+        self.clear_color_rect(attachment, color, Rect2D::from_xywh(0, 0, self.width, self.height));
+    }
+
+    pub fn clear_depth(&mut self, depth: f32) {
+        self.clear_depth_rect(depth, Rect2D::from_xywh(0, 0, self.width, self.height));
+    }
+
+    pub fn clear_color_rect(&mut self, attachment: u32, color: ClearColorValue, rect: Rect2D) {
+        unsafe {
+            self.command_buffer.device().cmd_clear_attachments(
+                self.command_buffer.command_buffer,
+                &[vk::ClearAttachment {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    color_attachment: attachment,
+                    clear_value: vk::ClearValue { color: color.into() },
+                }],
+                &[vk::ClearRect {
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: rect.min.x,
+                            y: rect.min.y,
+                        },
+                        extent: vk::Extent2D {
+                            width: rect.width(),
+                            height: rect.height(),
+                        },
+                    },
+                }],
+            );
+        }
+    }
+
+    pub fn clear_depth_rect(&mut self, depth: f32, rect: Rect2D) {
+        unsafe {
+            self.command_buffer.device().cmd_clear_attachments(
+                self.command_buffer.command_buffer,
+                &[vk::ClearAttachment {
+                    aspect_mask: vk::ImageAspectFlags::DEPTH,
+                    color_attachment: 0,
+                    clear_value: vk::ClearValue {
+                        depth_stencil: vk::ClearDepthStencilValue { depth, stencil: 0 },
+                    },
+                }],
+                &[vk::ClearRect {
+                    base_array_layer: 0,
+                    layer_count: 1,
+                    rect: vk::Rect2D {
+                        offset: vk::Offset2D {
+                            x: rect.min.x,
+                            y: rect.min.y,
+                        },
+                        extent: vk::Extent2D {
+                            width: rect.width(),
+                            height: rect.height(),
+                        },
+                    },
+                }],
+            );
+        }
+    }
+
+    pub fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
+        unsafe {
+            self.command_buffer.device().cmd_draw_indexed(
+                self.command_buffer.command_buffer,
+                indices.len() as u32,
+                instances.len() as u32,
+                indices.start,
+                base_vertex,
+                instances.start,
+            );
+        }
+    }
+
+    pub fn finish(mut self) {
+        self.bomb.defuse();
+        self.command_buffer.end_rendering();
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#[derive(Copy, Clone, Debug)]
-pub struct ImageCopyBuffer<'a> {
-    pub buffer: &'a BufferAny,
-    pub layout: ImageDataLayout,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct ImageDataLayout {
-    pub offset: u64,
-    /// In texels.
-    pub row_length: Option<u32>,
-    /// In lines.
-    pub image_height: Option<u32>,
-}
-
-#[derive(Copy, Clone, Debug)]
-pub struct ImageCopyView<'a> {
-    pub image: &'a ImageAny,
-    pub mip_level: u32,
-    pub origin: vk::Offset3D,
-    pub aspect: vk::ImageAspectFlags,
-}
-
 pub struct BlitCommandEncoder<'a> {
     base: Encoder<'a>,
+    bomb: DropBomb,
 }
 
 impl<'a> BlitCommandEncoder<'a> {
@@ -315,6 +496,7 @@ impl<'a> BlitCommandEncoder<'a> {
                 pipeline_layout: vk::PipelineLayout::null(),
                 bind_point: vk::PipelineBindPoint::COMPUTE,
             },
+            bomb: DropBomb::new("BlitCommandEncoder should be finished with `.finish()`"),
         }
     }
 
@@ -405,10 +587,10 @@ impl<'a> BlitCommandEncoder<'a> {
 
     pub fn blit_image(
         &mut self,
-        src: &ImageAny,
+        src: &Image,
         src_subresource: ImageSubresourceLayers,
         src_region: Rect3D,
-        dst: &ImageAny,
+        dst: &Image,
         dst_subresource: ImageSubresourceLayers,
         dst_region: Rect3D,
         filter: vk::Filter,
@@ -468,5 +650,9 @@ impl<'a> BlitCommandEncoder<'a> {
                 filter,
             );
         }
+    }
+
+    pub fn finish(mut self) {
+        self.bomb.defuse()
     }
 }

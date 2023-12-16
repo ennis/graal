@@ -6,12 +6,10 @@ use tracing::debug;
 
 use crate::{
     device::{
-        ensure_memory_dependency, Device, GroupId, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder, RefCount,
-        RefCounted, ResourceAllocation, ResourceHandle, ResourceId, ResourceKind, ResourceRegistrationInfo, Swapchain,
-        SwapchainImage,
+        ensure_memory_dependency, Device, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder,
+        ResourceAllocation, ResourceHandle, ResourceKind, ResourceRegistrationInfo, Swapchain, SwapchainImage,
     },
-    resource_state::ResourceState,
-    vk, CommandBuffer, ImageAny,
+    vk, CommandBuffer, Image, ImageType, ImageUsage, ResourceState, Size3D,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -19,7 +17,7 @@ use crate::{
 /// Wrapper around a Vulkan queue that tracks the use of resources.
 pub struct Queue {
     device: Device,
-    pub(super) global_index: usize,
+    global_index: usize,
     family_index: u32,
     queue: vk::Queue,
     timeline: vk::Semaphore,
@@ -31,14 +29,14 @@ pub struct Queue {
     semaphores: Vec<UnsignaledSemaphore>,
     // ------ in flight resources ------
     /// Resources of frames that are currently executing on the GPU.
-    pub(super) current: InFlightResources,
+    current: InFlightResources,
     submitted: VecDeque<InFlightResources>,
 }
 
 /// In-flight resources.
 #[derive(Debug)]
-pub(super) struct InFlightResources {
-    pub(super) timestamp: u64,
+struct InFlightResources {
+    timestamp: u64,
     /// Command pool
     cb_alloc: CommandBufferAllocator,
 }
@@ -219,19 +217,19 @@ impl Queue {
 
         Ok(SwapchainImage {
             swapchain: swapchain.handle,
-            image: ImageAny::new(
-                self.device.clone(),
+            image: Image {
+                device: self.device.clone(),
                 id,
                 handle,
-                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::COLOR_ATTACHMENT,
-                vk::ImageType::TYPE_2D,
-                swapchain.format.format,
-                vk::Extent3D {
+                usage: ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT,
+                type_: ImageType::Image2D,
+                format: swapchain.format.format,
+                size: Size3D {
                     width: swapchain.width,
                     height: swapchain.height,
-                    depth: 0,
+                    depth: 1,
                 },
-            ),
+            },
             index: image_index,
         })
     }

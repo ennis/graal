@@ -1,24 +1,4 @@
 //! Abstractions over a vulkan device & queues.
-mod command_buffer;
-mod encoder;
-mod init;
-mod queue;
-mod resource;
-
-use crate::{
-    argument::ArgumentsLayout,
-    device::resource::ResourceGroup,
-    error::Error,
-    instance::{vk_khr_debug_utils, vk_khr_surface},
-    is_write_access,
-    pipeline::{GraphicsPipeline, GraphicsShaders, PipelineInterfaceDescriptor, ShaderCode, ShaderKind, ShaderSource},
-    platform_impl,
-    sampler::{Sampler, SamplerCreateInfo},
-    ImageAny, ResourceState,
-};
-use ash::vk;
-use fxhash::FxHashMap;
-use slotmap::{Key, SlotMap};
 use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
@@ -33,8 +13,28 @@ use std::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-pub use encoder::{Encoder, ImageCopyBuffer, ImageCopyView, ImageDataLayout, RenderEncoder};
-pub use queue::{Queue, SemaphoreSignal, SemaphoreWait, SemaphoreWaitKind, SignaledSemaphore, UnsignaledSemaphore};
+use ash::vk;
+use fxhash::FxHashMap;
+use shaderc::{EnvVersion, SpirvVersion, TargetEnv};
+use slotmap::{Key, SlotMap};
+
+pub use encoder::*;
+pub use queue::*;
+
+use crate::{
+    aspects_for_format,
+    device::resource::ResourceGroup,
+    instance::{vk_khr_debug_utils, vk_khr_surface},
+    is_write_access, platform_impl, ArgumentsLayout, BufferRangeAny, BufferUsage, CompareOp, Error, Format,
+    GraphicsPipelineCreateInfo, ImageSubresourceRange, ImageType, ImageUsage, ImageViewInfo, PreRasterizationShaders,
+    ResourceState, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D,
+};
+
+mod command_buffer;
+mod encoder;
+mod init;
+mod queue;
+mod resource;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -44,10 +44,22 @@ pub struct Device {
     pub(crate) inner: Rc<DeviceInner>,
 }
 
+impl fmt::Debug for Device {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Device").finish_non_exhaustive()
+    }
+}
+
 /// Weak reference to a device
 #[derive(Clone)]
 pub struct WeakDevice {
     pub(crate) inner: Weak<DeviceInner>,
+}
+
+impl fmt::Debug for WeakDevice {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("WeakDevice").finish_non_exhaustive()
+    }
 }
 
 pub(crate) struct DeviceInner {
@@ -63,6 +75,7 @@ pub(crate) struct DeviceInner {
     vk_khr_swapchain: ash::extensions::khr::Swapchain,
     vk_ext_shader_object: ash::extensions::ext::ShaderObject,
     vk_khr_push_descriptor: ash::extensions::khr::PushDescriptor,
+    vk_ext_extended_dynamic_state3: ash::extensions::ext::ExtendedDynamicState3,
     resources: RefCell<ResourceMap>,
     resource_groups: RefCell<ResourceGroupMap>,
     deletion_lists: RefCell<Vec<DeferredDeletionList>>,
@@ -76,6 +89,7 @@ pub enum DeviceCreateError {
     Vulkan(#[from] vk::Result),
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct QueueFamilyConfig {
     pub family_index: u32,
     pub count: u32,
@@ -142,26 +156,318 @@ impl From<BufferId> for ResourceId {
     }
 }
 
-/// Holds information about a buffer resource.
-#[derive(Copy, Clone, Debug)]
-pub struct BufferHandle {
-    /// ID of the buffer resource.
-    pub id: BufferId,
-    /// Vulkan handle of the buffer.
-    pub vk: vk::Buffer,
-    /// If the buffer is mapped in client memory, holds a pointer to the mapped range. Null otherwise.
-    pub mapped_ptr: Option<NonNull<c_void>>,
+/// Command buffers
+pub struct CommandBuffer {
+    device: Device,
+    /// Keeps referenced resources alive.
+    refs: Vec<RefCounted<ResourceId>>,
+    command_buffer: vk::CommandBuffer,
+    initial_uses: FxHashMap<ResourceId, ResourceUse>,
+    final_states: FxHashMap<ResourceId, DependencyState>,
+    barrier_builder: PipelineBarrierBuilder,
+    group_uses: Vec<GroupId>,
 }
 
-/// Holds information about an image resource.
-#[derive(Copy, Clone, Debug)]
-pub struct ImageHandle {
-    /// ID of the image resource.
-    pub id: ImageId,
-    /// Vulkan handle of the image.
-    pub vk: vk::Image,
+/// Graphics pipelines.
+pub struct GraphicsPipeline {
+    device: Device,
+    pipeline: vk::Pipeline,
+    pipeline_layout: vk::PipelineLayout,
 }
 
+impl GraphicsPipeline {
+    pub(super) fn new(device: Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout) -> Self {
+        Self {
+            device,
+            pipeline,
+            pipeline_layout,
+        }
+    }
+
+    pub fn pipeline(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+}
+
+/// Samplers
+#[derive(Clone, Debug)]
+pub struct Sampler {
+    // A weak ref is sufficient, the device already owns samplers in its cache
+    device: WeakDevice,
+    sampler: vk::Sampler,
+}
+
+impl Sampler {
+    pub(super) fn new(device: &Device, sampler: vk::Sampler) -> Sampler {
+        Sampler {
+            device: device.weak(),
+            sampler,
+        }
+    }
+
+    pub fn handle(&self) -> vk::Sampler {
+        // FIXME: check if the device is still alive, otherwise the sampler isn't valid anymore
+        //assert!(self.device.strong_count() > 0);
+        self.sampler
+    }
+}
+
+/// Wrapper around a Vulkan buffer.
+#[derive(Debug)]
+pub struct Buffer {
+    device: Device,
+    id: RefCounted<BufferId>,
+    handle: vk::Buffer,
+    size: u64,
+    usage: BufferUsage,
+    mapped_ptr: Option<NonNull<c_void>>,
+}
+
+impl Buffer {
+    /*fn new(
+        device: Device,
+        id: RefCounted<BufferId>,
+        handle: vk::Buffer,
+        size: usize,
+        usage: vk::BufferUsageFlags,
+        mapped_ptr: Option<NonNull<c_void>>,
+    ) -> Self {
+        Self {
+            device,
+            id,
+            handle,
+            size,
+            usage,
+            mapped_ptr,
+        }
+    }*/
+
+    pub fn id(&self) -> RefCounted<BufferId> {
+        self.id.clone()
+    }
+
+    /// Returns the size of the buffer in bytes.
+    pub fn byte_size(&self) -> u64 {
+        self.size
+    }
+
+    /// Returns the usage flags of the buffer.
+    pub fn usage(&self) -> BufferUsage {
+        self.usage
+    }
+
+    /// Returns the buffer handle.
+    pub fn handle(&self) -> vk::Buffer {
+        self.handle
+    }
+
+    /// Returns the device on which the buffer was created.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
+    pub fn mapped_data(&self) -> Option<*mut u8> {
+        self.mapped_ptr.map(|ptr| ptr.as_ptr() as *mut u8)
+    }
+}
+
+/// Wrapper around a Vulkan image.
+#[derive(Debug)]
+pub struct Image {
+    device: Device,
+    id: RefCounted<ImageId>,
+    handle: vk::Image,
+    usage: ImageUsage,
+    type_: ImageType,
+    format: Format,
+    size: Size3D,
+}
+
+impl Image {
+    /*pub(super) fn new(
+        device: Device,
+        id: RefCounted<ImageId>,
+        handle: vk::Image,
+        usage: vk::ImageUsageFlags,
+        type_: vk::ImageType,
+        format: vk::Format,
+        extent: vk::Extent3D,
+    ) -> Self {
+        Image {
+            device,
+            id,
+            handle,
+            usage,
+            type_,
+            format,
+            extent,
+        }
+    }*/
+
+    /// Returns the `vk::ImageType` of the image.
+    pub fn image_type(&self) -> ImageType {
+        self.type_
+    }
+
+    /// Returns the `vk::Format` of the image.
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// Returns the `vk::Extent3D` of the image.
+    pub fn size(&self) -> Size3D {
+        self.size
+    }
+
+    pub fn width(&self) -> u32 {
+        self.size.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.size.height
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.size.depth
+    }
+
+    /// Returns the usage flags of the image.
+    pub fn usage(&self) -> ImageUsage {
+        self.usage
+    }
+
+    pub fn id(&self) -> RefCounted<ImageId> {
+        self.id.clone()
+    }
+
+    /// Returns the image handle.
+    pub fn handle(&self) -> vk::Image {
+        self.handle
+    }
+
+    /// Creates an image view for the base mip level of this image,
+    /// suitable for use as a rendering attachment.
+    pub fn create_top_level_view(&self) -> ImageView {
+        self.create_view(&ImageViewInfo {
+            view_type: match self.image_type() {
+                ImageType::Image2D => vk::ImageViewType::TYPE_2D,
+                _ => panic!("unsupported image type for attachment"),
+            },
+            format: self.format(),
+            subresource_range: ImageSubresourceRange {
+                aspect_mask: aspects_for_format(self.format()),
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            component_mapping: [
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ComponentSwizzle::IDENTITY,
+            ],
+        })
+    }
+
+    /// Creates an `ImageView` object.
+    fn create_view(&self, info: &ImageViewInfo) -> ImageView {
+        // TODO: check that format is compatible
+
+        // FIXME: support non-zero base mip level
+        if info.subresource_range.base_mip_level != 0 {
+            unimplemented!("non-zero base mip level");
+        }
+
+        let create_info = vk::ImageViewCreateInfo {
+            flags: vk::ImageViewCreateFlags::empty(),
+            image: self.handle,
+            view_type: info.view_type,
+            format: info.format,
+            components: vk::ComponentMapping {
+                r: info.component_mapping[0],
+                g: info.component_mapping[1],
+                b: info.component_mapping[2],
+                a: info.component_mapping[3],
+            },
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: info.subresource_range.aspect_mask,
+                base_mip_level: info.subresource_range.base_mip_level,
+                level_count: info.subresource_range.level_count,
+                base_array_layer: info.subresource_range.base_array_layer,
+                layer_count: info.subresource_range.layer_count,
+            },
+            ..Default::default()
+        };
+
+        // SAFETY: the device is valid, the create info is valid
+        let handle = unsafe {
+            self.device
+                .create_image_view(&create_info, None)
+                .expect("failed to create image view")
+        };
+
+        ImageView {
+            device: self.device.clone(),
+            parent_image: self.id.clone(),
+            handle,
+            image_handle: self.handle,
+            format: info.format,
+            original_format: self.format,
+            // TODO: size of mip level
+            size: self.size,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ImageView {
+    device: Device,
+    parent_image: RefCounted<ImageId>,
+    image_handle: vk::Image,
+    handle: vk::ImageView,
+    format: Format,
+    original_format: Format,
+    size: Size3D,
+}
+
+impl ImageView {
+    /// Returns the format of the image view.
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
+
+    pub fn size(&self) -> Size3D {
+        self.size
+    }
+
+    pub fn handle(&self) -> vk::ImageView {
+        self.handle
+    }
+
+    fn image_handle(&self) -> vk::Image {
+        self.image_handle
+    }
+
+    fn original_format(&self) -> vk::Format {
+        self.original_format
+    }
+
+    fn parent_id(&self) -> RefCounted<ImageId> {
+        self.parent_image.clone()
+    }
+}
+
+impl Drop for ImageView {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.delete_later(self.handle);
+        }
+    }
+}
+
+// TODO: move this to a separate module?
 #[derive(Debug)]
 pub struct ResourceRegistrationInfo<'a> {
     pub name: &'a str,
@@ -200,41 +506,7 @@ pub struct SwapchainImage {
     pub swapchain: vk::SwapchainKHR,
     /// Index of the image in the swap chain.
     pub index: u32,
-    pub image: ImageAny,
-}
-
-/// Information passed to `Context::create_image` to describe the image to be created.
-#[derive(Copy, Clone, Debug)]
-pub struct ImageResourceCreateInfo {
-    /// Dimensionality of the image.
-    pub type_: vk::ImageType,
-    /// Image usage flags. Must include all intended uses of the image.
-    pub usage: vk::ImageUsageFlags,
-    /// Format of the image.
-    pub format: vk::Format,
-    /// Size of the image.
-    pub extent: vk::Extent3D,
-    /// Number of mipmap levels. Note that the mipmaps contents must still be generated manually. Default is 1. 0 is *not* a valid value.
-    pub mip_levels: u32,
-    /// Number of array layers. Default is `1`. `0` is *not* a valid value.
-    pub array_layers: u32,
-    /// Number of samples. Default is `1`. `0` is *not* a valid value.
-    pub samples: u32,
-    /// Tiling.
-    pub tiling: vk::ImageTiling,
-}
-
-/// Information passed to `Context::create_buffer` to describe the buffer to be created.
-#[derive(Copy, Clone, Debug)]
-pub struct BufferResourceCreateInfo {
-    /// Usage flags. Must include all intended uses of the buffer.
-    pub usage: vk::BufferUsageFlags,
-    /// Size of the buffer in bytes.
-    pub byte_size: u64,
-    /// Whether the memory for the resource should be mapped for host access immediately.
-    /// If this flag is set, `create_buffer` will also return a pointer to the mapped buffer.
-    /// This flag is ignored for resources that can't be mapped.
-    pub map_on_create: bool,
+    pub image: Image,
 }
 
 /// Describes how a resource got its memory.
@@ -261,7 +533,7 @@ pub enum ResourceAllocation {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 #[derive(Debug)]
-pub enum DeferredDeletionObject {
+enum DeferredDeletionObject {
     ImageView(vk::ImageView),
     Sampler(vk::Sampler),
     DescriptorSetLayout(vk::DescriptorSetLayout),
@@ -307,23 +579,6 @@ impl From<vk::ShaderEXT> for DeferredDeletionObject {
     }
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-impl fmt::Debug for Device {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Device").finish_non_exhaustive()
-    }
-}
-
-impl fmt::Debug for WeakDevice {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("WeakDevice").finish_non_exhaustive()
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-// SWAPCHAIN STUFF
-
 /// Chooses a swapchain surface format among a list of supported formats.
 ///
 /// TODO there's only one supported format right now...
@@ -340,7 +595,351 @@ fn get_preferred_swapchain_surface_format(surface_formats: &[vk::SurfaceFormatKH
         .expect("no suitable surface format available")
 }
 
+pub unsafe fn create_device_and_queue(
+    present_surface: Option<vk::SurfaceKHR>,
+) -> Result<(Device, Queue), DeviceCreateError> {
+    let device = Device::new(present_surface)?;
+    let queue = device.get_queue_by_global_index(0);
+    Ok((device, queue))
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct DeferredDeletionList {
+    // Timestamp that we should wait for on each queue before deleting the objects.
+    timestamps: Vec<u64>,
+    // Objects to delete.
+    objects: Vec<DeferredDeletionObject>,
+}
+
+struct QueueData {
+    /// Family index.
+    family_index: u32,
+    /// Index within queues of the same family (see vkGetDeviceQueue).
+    index: u32,
+    queue: vk::Queue,
+    timeline: vk::Semaphore,
+    next_submission_timestamp: Cell<u64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ImageResource {
+    handle: vk::Image,
+    format: vk::Format,
+    all_aspects: vk::ImageAspectFlags,
+}
+
+#[derive(Debug)]
+pub(crate) struct BufferResource {
+    handle: vk::Buffer,
+}
+/// Describes how the resource is access by different queues.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub(crate) enum OwnerQueue {
+    None,
+    Exclusive(usize),
+    Concurrent(u16),
+}
+
+#[derive(Debug)]
+pub struct RefCount(NonNull<AtomicUsize>);
+
+unsafe impl Send for RefCount {}
+unsafe impl Sync for RefCount {}
+
+impl RefCount {
+    const MAX: usize = 1 << 24;
+
+    /// Construct a new `RefCount`, with an initial count of 1.
+    fn new() -> RefCount {
+        let bx = Box::new(AtomicUsize::new(1));
+        Self(unsafe { NonNull::new_unchecked(Box::into_raw(bx)) })
+    }
+
+    fn load(&self) -> usize {
+        unsafe { self.0.as_ref() }.load(Ordering::Acquire)
+    }
+
+    fn is_unique(&self) -> bool {
+        self.load() == 1
+    }
+}
+
+impl Clone for RefCount {
+    fn clone(&self) -> Self {
+        let old_size = unsafe { self.0.as_ref() }.fetch_add(1, Ordering::AcqRel);
+        assert!(old_size < Self::MAX);
+        Self(self.0)
+    }
+}
+
+impl Drop for RefCount {
+    fn drop(&mut self) {
+        unsafe {
+            if self.0.as_ref().fetch_sub(1, Ordering::AcqRel) == 1 {
+                drop(Box::from_raw(self.0.as_ptr()));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct RefCounted<T> {
+    pub ref_count: RefCount,
+    pub value: T,
+}
+
+impl<T> RefCounted<T> {
+    pub fn new(value: T, initial_count: RefCount) -> Self {
+        Self {
+            ref_count: initial_count,
+            value,
+        }
+    }
+
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> RefCounted<U> {
+        RefCounted {
+            ref_count: self.ref_count,
+            value: f(self.value),
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ResourceKind {
+    Buffer(BufferResource),
+    Image(ImageResource),
+}
+
+#[derive(Debug)]
+pub(crate) struct Resource {
+    name: String,
+    // Could be usize, or a pointer to an atomic usize variable. With the pointer,
+    // there's no need to hold a reference to the device for Samplers, etc, or to manually call
+    // `device.drop_resource(id)`. But that's one more allocation.
+    ref_count: RefCount,
+    allocation: ResourceAllocation,
+    kind: ResourceKind,
+    group: Option<GroupId>,
+    owner: OwnerQueue,
+    wait_semaphore: Option<SignaledSemaphore>,
+    dep_state: DependencyState,
+    /// Timestamp of the last submission that accessed the resource on its owner queue.
+    ///
+    /// It's a value of the timeline semaphore of the queue.
+    ///
+    /// TODO: it's only used for deferred deletion, to ensure that no queue is still using the resource.
+    /// We could replace that by a set of semaphore waits in order to support waiting on a resource
+    /// used concurrently by multiple queues.
+    timestamp: u64,
+}
+
+impl Resource {
+    pub(crate) fn as_image(&self) -> &ImageResource {
+        match &self.kind {
+            ResourceKind::Image(r) => r,
+            _ => panic!("expected an image resource"),
+        }
+    }
+
+    pub(crate) fn as_buffer(&self) -> &BufferResource {
+        match &self.kind {
+            ResourceKind::Buffer(r) => r,
+            _ => panic!("expected a buffer resource"),
+        }
+    }
+}
+
+type ResourceMap = SlotMap<ResourceId, Resource>;
+type ResourceGroupMap = SlotMap<GroupId, ResourceGroup>;
+
+#[derive(Copy, Clone, Debug, Default)]
+struct DependencyState {
+    stages: vk::PipelineStageFlags2,
+    flush_mask: vk::AccessFlags2,
+    visible: vk::AccessFlags2,
+    layout: vk::ImageLayout,
+}
+
+#[derive(Copy, Clone)]
+struct ResourceUse {
+    aspect: vk::ImageAspectFlags,
+    state: ResourceState,
+}
+
+/// Helper to build a pipeline barrier.
+#[derive(Default)]
+pub(super) struct PipelineBarrierBuilder {
+    image_barriers: Vec<vk::ImageMemoryBarrier2>,
+    buffer_barriers: Vec<vk::BufferMemoryBarrier2>,
+}
+
+impl PipelineBarrierBuilder {
+    fn get_or_create_image_barrier(&mut self, image: vk::Image) -> &mut vk::ImageMemoryBarrier2 {
+        let index = self.image_barriers.iter().position(|barrier| barrier.image == image);
+        if let Some(index) = index {
+            &mut self.image_barriers[index]
+        } else {
+            let barrier = vk::ImageMemoryBarrier2::default();
+            self.image_barriers.push(barrier);
+            self.image_barriers.last_mut().unwrap()
+        }
+    }
+
+    fn get_or_create_buffer_barrier(&mut self, buffer: vk::Buffer) -> &mut vk::BufferMemoryBarrier2 {
+        let index = self.buffer_barriers.iter().position(|barrier| barrier.buffer == buffer);
+        if let Some(index) = index {
+            &mut self.buffer_barriers[index]
+        } else {
+            let barrier = vk::BufferMemoryBarrier2::default();
+            self.buffer_barriers.push(barrier);
+            self.buffer_barriers.last_mut().unwrap()
+        }
+    }
+
+    fn clear(&mut self) {
+        self.buffer_barriers.clear();
+        self.image_barriers.clear();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buffer_barriers.is_empty() && self.image_barriers.is_empty()
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ResourceHandle {
+    Buffer(vk::Buffer),
+    Image(vk::Image),
+}
+
+impl From<vk::Buffer> for ResourceHandle {
+    fn from(buffer: vk::Buffer) -> Self {
+        Self::Buffer(buffer)
+    }
+}
+
+impl From<vk::Image> for ResourceHandle {
+    fn from(image: vk::Image) -> Self {
+        Self::Image(image)
+    }
+}
+
+fn ensure_memory_dependency(
+    barriers: &mut PipelineBarrierBuilder,
+    handle: ResourceHandle,
+    dep_state: &mut DependencyState,
+    use_: &ResourceUse,
+) {
+    // We need to insert a memory dependency if:
+    // - the image needs a layout transition
+    // - the resource has writes that are not visible to the target access
+    //
+    // We need to insert an execution dependency if:
+    // - we're writing to the resource (write-after-read hazard, write-after-write hazard)
+    if !(dep_state.visible.contains(use_.state.access) || dep_state.visible.contains(vk::AccessFlags2::MEMORY_READ))
+        || dep_state.layout != use_.state.layout
+        || is_write_access(use_.state.access)
+    {
+        match handle {
+            ResourceHandle::Buffer(buffer) => {
+                let barrier = barriers.get_or_create_buffer_barrier(buffer);
+                barrier.buffer = buffer;
+                barrier.src_stage_mask |= dep_state.stages;
+                barrier.dst_stage_mask |= use_.state.stages;
+                barrier.src_access_mask |= dep_state.flush_mask;
+                barrier.dst_access_mask |= use_.state.access;
+                barrier.offset = 0;
+                barrier.size = vk::WHOLE_SIZE;
+            }
+            ResourceHandle::Image(image) => {
+                let barrier = barriers.get_or_create_image_barrier(image);
+                barrier.image = image;
+                barrier.src_stage_mask |= dep_state.stages;
+                barrier.dst_stage_mask |= use_.state.stages;
+                barrier.src_access_mask |= dep_state.flush_mask;
+                barrier.dst_access_mask |= use_.state.access;
+                barrier.old_layout = dep_state.layout;
+                barrier.new_layout = use_.state.layout;
+                barrier.subresource_range = vk::ImageSubresourceRange {
+                    aspect_mask: use_.aspect,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                    ..Default::default()
+                };
+                dep_state.layout = use_.state.layout;
+            }
+        }
+    }
+
+    if is_write_access(use_.state.access) {
+        // we're writing to the resource, so reset visibility...
+        dep_state.visible = vk::AccessFlags2::empty();
+        // ... but signal that there is data to flush.
+        dep_state.flush_mask |= use_.state.access;
+    } else {
+        // This memory dependency makes all writes on the resource available, and
+        // visible to the types specified in `access.access_mask`.
+        // There's no write, so we don't need to flush anything.
+        dep_state.flush_mask = vk::AccessFlags2::empty();
+        dep_state.visible |= use_.state.access;
+    }
+
+    // Update the resource stage mask
+    dep_state.stages = use_.state.stages;
+}
+
 impl Device {
+    pub fn weak(&self) -> WeakDevice {
+        WeakDevice {
+            inner: Rc::downgrade(&self.inner),
+        }
+    }
+
+    pub fn raw(&self) -> &ash::Device {
+        &self.inner.device
+    }
+
+    /// Function pointers for VK_KHR_swapchain.
+    pub fn khr_swapchain(&self) -> &ash::extensions::khr::Swapchain {
+        &self.inner.vk_khr_swapchain
+    }
+
+    /// Function pointers for VK_KHR_push_descriptor.
+    pub fn khr_push_descriptor(&self) -> &ash::extensions::khr::PushDescriptor {
+        &self.inner.vk_khr_push_descriptor
+    }
+
+    pub fn ext_extended_dynamic_state3(&self) -> &ash::extensions::ext::ExtendedDynamicState3 {
+        &self.inner.vk_ext_extended_dynamic_state3
+    }
+
+    /// Helper function to associate a debug name to a vulkan handle.
+    fn set_debug_object_name(&self, object_type: vk::ObjectType, object_handle: u64, name: &str, serial: Option<u64>) {
+        unsafe {
+            let name = if let Some(serial) = serial {
+                format!("{}@{}", name, serial)
+            } else {
+                name.to_string()
+            };
+            let object_name = CString::new(name.as_str()).unwrap();
+
+            vk_khr_debug_utils()
+                .set_debug_utils_object_name(
+                    self.inner.device.handle(),
+                    &vk::DebugUtilsObjectNameInfoEXT {
+                        object_type,
+                        object_handle,
+                        p_object_name: object_name.as_ptr(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+    }
+
     /// Creates a swapchain object.
     pub unsafe fn create_swapchain(
         &self,
@@ -428,365 +1027,13 @@ impl Device {
         }
 
         swapchain.handle = new_handle;
+        swapchain.width = width;
+        swapchain.height = height;
         swapchain.images = self
             .inner
             .vk_khr_swapchain
             .get_swapchain_images(swapchain.handle)
             .unwrap();
-    }
-}
-
-pub unsafe fn create_device_and_queue(
-    present_surface: Option<vk::SurfaceKHR>,
-) -> Result<(Device, Queue), DeviceCreateError> {
-    let device = Device::new(present_surface)?;
-    let queue = device.get_queue_by_global_index(0);
-    Ok((device, queue))
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-struct DeferredDeletionList {
-    // Timestamp that we should wait for on each queue before deleting the objects.
-    timestamps: Vec<u64>,
-    // Objects to delete.
-    objects: Vec<DeferredDeletionObject>,
-}
-
-struct QueueData {
-    /// Family index.
-    family_index: u32,
-    /// Index within queues of the same family (see vkGetDeviceQueue).
-    index: u32,
-    queue: vk::Queue,
-    timeline: vk::Semaphore,
-    next_submission_timestamp: Cell<u64>,
-}
-
-#[derive(Debug)]
-pub(crate) struct ImageResource {
-    handle: vk::Image,
-    format: vk::Format,
-    all_aspects: vk::ImageAspectFlags,
-}
-
-#[derive(Debug)]
-pub(crate) struct BufferResource {
-    handle: vk::Buffer,
-}
-/// Describes how the resource is access by different queues.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum OwnerQueue {
-    None,
-    Exclusive(usize),
-    Concurrent(u16),
-}
-
-#[derive(Debug)]
-struct RefCount(NonNull<AtomicUsize>);
-
-unsafe impl Send for RefCount {}
-unsafe impl Sync for RefCount {}
-
-impl RefCount {
-    const MAX: usize = 1 << 24;
-
-    /// Construct a new `RefCount`, with an initial count of 1.
-    fn new() -> RefCount {
-        let bx = Box::new(AtomicUsize::new(1));
-        Self(unsafe { NonNull::new_unchecked(Box::into_raw(bx)) })
-    }
-
-    fn load(&self) -> usize {
-        unsafe { self.0.as_ref() }.load(Ordering::Acquire)
-    }
-
-    fn is_unique(&self) -> bool {
-        self.load() == 1
-    }
-}
-
-impl Clone for RefCount {
-    fn clone(&self) -> Self {
-        let old_size = unsafe { self.0.as_ref() }.fetch_add(1, Ordering::AcqRel);
-        assert!(old_size < Self::MAX);
-        Self(self.0)
-    }
-}
-
-impl Drop for RefCount {
-    fn drop(&mut self) {
-        unsafe {
-            if self.0.as_ref().fetch_sub(1, Ordering::AcqRel) == 1 {
-                drop(Box::from_raw(self.0.as_ptr()));
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub(super) struct RefCounted<T> {
-    pub ref_count: RefCount,
-    pub value: T,
-}
-
-impl<T> RefCounted<T> {
-    pub fn new(value: T, initial_count: RefCount) -> Self {
-        Self {
-            ref_count: initial_count,
-            value,
-        }
-    }
-
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> RefCounted<U> {
-        RefCounted {
-            ref_count: self.ref_count,
-            value: f(self.value),
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(crate) enum ResourceKind {
-    Buffer(BufferResource),
-    Image(ImageResource),
-}
-
-#[derive(Debug)]
-pub(crate) struct Resource {
-    name: String,
-    // Could be usize, or a pointer to an atomic usize variable. With the pointer,
-    // there's no need to hold a reference to the device for Samplers, etc, or to manually call
-    // `device.drop_resource(id)`. But that's one more allocation.
-    ref_count: RefCount,
-    allocation: ResourceAllocation,
-    kind: ResourceKind,
-    group: Option<GroupId>,
-    owner: OwnerQueue,
-    wait_semaphore: Option<SignaledSemaphore>,
-    dep_state: DependencyState,
-
-    /// Timestamp of the last submission that accessed the resource on its owner queue.
-    ///
-    /// It's a value of the timeline semaphore of the queue.
-    ///
-    /// TODO: it's only used for deferred deletion, to ensure that no queue is still using the resource.
-    /// We could replace that by a set of semaphore waits in order to support waiting on a resource
-    /// used concurrently by multiple queues.
-    timestamp: u64,
-}
-
-#[derive(Copy, Clone, Debug, Default)]
-struct DependencyState {
-    stages: vk::PipelineStageFlags2,
-    flush_mask: vk::AccessFlags2,
-    visible: vk::AccessFlags2,
-    layout: vk::ImageLayout,
-}
-
-#[derive(Copy, Clone)]
-struct ResourceUse {
-    aspect: vk::ImageAspectFlags,
-    state: ResourceState,
-}
-
-/// Helper to build a pipeline barrier.
-#[derive(Default)]
-pub(super) struct PipelineBarrierBuilder {
-    image_barriers: Vec<vk::ImageMemoryBarrier2>,
-    buffer_barriers: Vec<vk::BufferMemoryBarrier2>,
-}
-
-impl PipelineBarrierBuilder {
-    fn get_or_create_image_barrier(&mut self, image: vk::Image) -> &mut vk::ImageMemoryBarrier2 {
-        let index = self.image_barriers.iter().position(|barrier| barrier.image == image);
-        if let Some(index) = index {
-            &mut self.image_barriers[index]
-        } else {
-            let barrier = vk::ImageMemoryBarrier2::default();
-            self.image_barriers.push(barrier);
-            self.image_barriers.last_mut().unwrap()
-        }
-    }
-
-    fn get_or_create_buffer_barrier(&mut self, buffer: vk::Buffer) -> &mut vk::BufferMemoryBarrier2 {
-        let index = self.buffer_barriers.iter().position(|barrier| barrier.buffer == buffer);
-        if let Some(index) = index {
-            &mut self.buffer_barriers[index]
-        } else {
-            let barrier = vk::BufferMemoryBarrier2::default();
-            self.buffer_barriers.push(barrier);
-            self.buffer_barriers.last_mut().unwrap()
-        }
-    }
-
-    fn clear(&mut self) {
-        self.buffer_barriers.clear();
-        self.image_barriers.clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.buffer_barriers.is_empty() && self.image_barriers.is_empty()
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub(super) enum ResourceHandle {
-    Buffer(vk::Buffer),
-    Image(vk::Image),
-}
-
-impl From<vk::Buffer> for ResourceHandle {
-    fn from(buffer: vk::Buffer) -> Self {
-        Self::Buffer(buffer)
-    }
-}
-
-impl From<vk::Image> for ResourceHandle {
-    fn from(image: vk::Image) -> Self {
-        Self::Image(image)
-    }
-}
-
-fn ensure_memory_dependency(
-    barriers: &mut PipelineBarrierBuilder,
-    handle: ResourceHandle,
-    dep_state: &mut DependencyState,
-    use_: &ResourceUse,
-) {
-    // We need to insert a memory dependency if:
-    // - the image needs a layout transition
-    // - the resource has writes that are not visible to the target access
-    //
-    // We need to insert an execution dependency if:
-    // - we're writing to the resource (write-after-read hazard, write-after-write hazard)
-    if !(dep_state.visible.contains(use_.state.access) || dep_state.visible.contains(vk::AccessFlags2::MEMORY_READ))
-        || dep_state.layout != use_.state.layout
-        || is_write_access(use_.state.access)
-    {
-        match handle {
-            ResourceHandle::Buffer(buffer) => {
-                let barrier = barriers.get_or_create_buffer_barrier(buffer);
-                barrier.buffer = buffer;
-                barrier.src_stage_mask |= dep_state.stages;
-                barrier.dst_stage_mask |= use_.state.stages;
-                barrier.src_access_mask |= dep_state.flush_mask;
-                barrier.dst_access_mask |= use_.state.access;
-                barrier.offset = 0;
-                barrier.size = vk::WHOLE_SIZE;
-            }
-            ResourceHandle::Image(image) => {
-                let barrier = barriers.get_or_create_image_barrier(image);
-                barrier.image = image;
-                barrier.src_stage_mask |= dep_state.stages;
-                barrier.dst_stage_mask |= use_.state.stages;
-                barrier.src_access_mask |= dep_state.flush_mask;
-                barrier.dst_access_mask |= use_.state.access;
-                barrier.old_layout = dep_state.layout;
-                barrier.new_layout = use_.state.layout;
-                barrier.subresource_range = vk::ImageSubresourceRange {
-                    aspect_mask: use_.aspect,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    ..Default::default()
-                };
-                dep_state.layout = use_.state.layout;
-            }
-        }
-    }
-
-    if is_write_access(use_.state.access) {
-        // we're writing to the resource, so reset visibility...
-        dep_state.visible = vk::AccessFlags2::empty();
-        // ... but signal that there is data to flush.
-        dep_state.flush_mask |= use_.state.access;
-    } else {
-        // This memory dependency makes all writes on the resource available, and
-        // visible to the types specified in `access.access_mask`.
-        // There's no write, so we don't need to flush anything.
-        dep_state.flush_mask = vk::AccessFlags2::empty();
-        dep_state.visible |= use_.state.access;
-    }
-
-    // Update the resource stage mask
-    dep_state.stages = use_.state.stages;
-}
-
-pub struct CommandBuffer {
-    device: Device,
-    /// Keeps referenced resources alive.
-    refs: Vec<RefCounted<ResourceId>>,
-    command_buffer: vk::CommandBuffer,
-    initial_uses: FxHashMap<ResourceId, ResourceUse>,
-    final_states: FxHashMap<ResourceId, DependencyState>,
-    barrier_builder: PipelineBarrierBuilder,
-    group_uses: Vec<GroupId>,
-}
-
-impl Resource {
-    pub(crate) fn as_image(&self) -> &ImageResource {
-        match &self.kind {
-            ResourceKind::Image(r) => r,
-            _ => panic!("expected an image resource"),
-        }
-    }
-
-    pub(crate) fn as_buffer(&self) -> &BufferResource {
-        match &self.kind {
-            ResourceKind::Buffer(r) => r,
-            _ => panic!("expected a buffer resource"),
-        }
-    }
-}
-
-pub(crate) type ResourceMap = SlotMap<ResourceId, Resource>;
-pub(crate) type ResourceGroupMap = SlotMap<GroupId, ResourceGroup>;
-
-impl Device {
-    /// Helper function to associate a debug name to a vulkan handle.
-    fn set_debug_object_name(&self, object_type: vk::ObjectType, object_handle: u64, name: &str, serial: Option<u64>) {
-        unsafe {
-            let name = if let Some(serial) = serial {
-                format!("{}@{}", name, serial)
-            } else {
-                name.to_string()
-            };
-            let object_name = CString::new(name.as_str()).unwrap();
-
-            vk_khr_debug_utils()
-                .set_debug_utils_object_name(
-                    self.inner.device.handle(),
-                    &vk::DebugUtilsObjectNameInfoEXT {
-                        object_type,
-                        object_handle,
-                        p_object_name: object_name.as_ptr(),
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-        }
-    }
-
-    pub fn weak(&self) -> WeakDevice {
-        WeakDevice {
-            inner: Rc::downgrade(&self.inner),
-        }
-    }
-
-    pub fn raw(&self) -> &ash::Device {
-        &self.inner.device
-    }
-
-    /// Function pointers for VK_KHR_swapchain.
-    pub fn khr_swapchain(&self) -> &ash::extensions::khr::Swapchain {
-        &self.inner.vk_khr_swapchain
-    }
-
-    /// Function pointers for VK_KHR_push_descriptor.
-    pub fn khr_push_descriptor(&self) -> &ash::extensions::khr::PushDescriptor {
-        &self.inner.vk_khr_push_descriptor
     }
 
     pub fn create_sampler(&self, info: &SamplerCreateInfo) -> Sampler {
@@ -828,6 +1075,7 @@ impl Device {
     }
 
     /// Compiles a shader
+    // TODO: this could be moved outside of device?
     fn compile_shader(&self, kind: ShaderKind, source: ShaderSource, entry_point: &str) -> Result<Vec<u32>, Error> {
         let input_file_name = match source {
             ShaderSource::Content(_) => "<embedded shader>",
@@ -877,6 +1125,8 @@ impl Device {
                 content,
             })
         });
+        compile_options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_3 as u32);
+        compile_options.set_target_spirv(SpirvVersion::V1_5);
 
         let compilation_artifact = self.inner.compiler.compile_into_spirv(
             source_content,
@@ -914,13 +1164,14 @@ impl Device {
     /// Creates a pipeline layout object.
     fn create_pipeline_layout(
         &self,
+        bind_point: vk::PipelineBindPoint,
         arg_layouts: &[ArgumentsLayout],
-        push_constant_ranges: &[vk::PushConstantRange],
+        push_constants_size: usize,
     ) -> (Vec<vk::DescriptorSetLayout>, vk::PipelineLayout) {
         let mut set_layouts = Vec::with_capacity(arg_layouts.len());
         for layout in arg_layouts.iter() {
             let create_info = vk::DescriptorSetLayoutCreateInfo {
-                flags: vk::DescriptorSetLayoutCreateFlags::empty(),
+                flags: vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR,
                 binding_count: layout.bindings.len() as u32,
                 p_bindings: layout.bindings.as_ptr(),
                 ..Default::default()
@@ -934,11 +1185,25 @@ impl Device {
             set_layouts.push(sl);
         }
 
+        let pc_range = match bind_point {
+            vk::PipelineBindPoint::GRAPHICS => vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS,
+                offset: 0,
+                size: push_constants_size as u32,
+            },
+            vk::PipelineBindPoint::COMPUTE => vk::PushConstantRange {
+                stage_flags: vk::ShaderStageFlags::COMPUTE,
+                offset: 0,
+                size: push_constants_size as u32,
+            },
+            _ => unimplemented!(),
+        };
+
         let create_info = vk::PipelineLayoutCreateInfo {
             set_layout_count: set_layouts.len() as u32,
             p_set_layouts: set_layouts.as_ptr(),
-            push_constant_range_count: push_constant_ranges.len() as u32,
-            p_push_constant_ranges: push_constant_ranges.as_ptr(),
+            push_constant_range_count: 1,
+            p_push_constant_ranges: &pc_range,
             ..Default::default()
         };
 
@@ -953,14 +1218,13 @@ impl Device {
     }
 
     /// Creates a graphics pipeline.
-    pub fn create_graphics_pipeline(
-        &self,
-        interface: &PipelineInterfaceDescriptor,
-        shaders: &GraphicsShaders,
-    ) -> Result<GraphicsPipeline, Error> {
+    pub fn create_graphics_pipeline(&self, create_info: GraphicsPipelineCreateInfo) -> Result<GraphicsPipeline, Error> {
         // ------ create pipeline layout from statically known information ------
-        let (descriptor_set_layouts, pipeline_layout) =
-            self.create_pipeline_layout(interface.arguments.as_ref(), interface.push_constants.as_ref());
+        let (descriptor_set_layouts, pipeline_layout) = self.create_pipeline_layout(
+            vk::PipelineBindPoint::GRAPHICS,
+            create_info.layout.arguments.as_ref(),
+            create_info.layout.push_constants_size,
+        );
 
         // FIXME: delete descriptor_set_layouts
 
@@ -971,43 +1235,43 @@ impl Device {
         let dynamic_states = [
             vk::DynamicState::VIEWPORT,
             vk::DynamicState::SCISSOR,
-            vk::DynamicState::STENCIL_COMPARE_MASK,
-            vk::DynamicState::STENCIL_WRITE_MASK,
-            vk::DynamicState::STENCIL_REFERENCE,
+            //vk::DynamicState::STENCIL_COMPARE_MASK,
+            //vk::DynamicState::STENCIL_WRITE_MASK,
+            //vk::DynamicState::STENCIL_REFERENCE,
             // pInputAssemblyState
-            vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
+            //vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
             vk::DynamicState::PRIMITIVE_TOPOLOGY,
             // pTessellationState
-            vk::DynamicState::PATCH_CONTROL_POINTS_EXT,
+            //vk::DynamicState::PATCH_CONTROL_POINTS_EXT,
             // pRasterizationState
-            vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT,
-            vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
-            vk::DynamicState::POLYGON_MODE_EXT,
-            vk::DynamicState::CULL_MODE,
-            vk::DynamicState::FRONT_FACE,
-            vk::DynamicState::DEPTH_BIAS_ENABLE,
-            vk::DynamicState::DEPTH_BIAS,
-            vk::DynamicState::LINE_WIDTH,
+            //vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT,
+            //vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
+            //vk::DynamicState::POLYGON_MODE_EXT,
+            //vk::DynamicState::CULL_MODE,
+            //vk::DynamicState::FRONT_FACE,
+            //vk::DynamicState::DEPTH_BIAS_ENABLE,
+            //vk::DynamicState::DEPTH_BIAS,
+            //vk::DynamicState::LINE_WIDTH,
             // pMultisampleState
-            vk::DynamicState::RASTERIZATION_SAMPLES_EXT,
-            vk::DynamicState::SAMPLE_MASK_EXT,
-            vk::DynamicState::ALPHA_TO_COVERAGE_ENABLE_EXT,
-            vk::DynamicState::ALPHA_TO_ONE_ENABLE_EXT,
+            //vk::DynamicState::RASTERIZATION_SAMPLES_EXT,
+            //vk::DynamicState::SAMPLE_MASK_EXT,
+            //vk::DynamicState::ALPHA_TO_COVERAGE_ENABLE_EXT,
+            //vk::DynamicState::ALPHA_TO_ONE_ENABLE_EXT,
             // pDepthStencilState
-            vk::DynamicState::DEPTH_TEST_ENABLE,
-            vk::DynamicState::DEPTH_WRITE_ENABLE,
-            vk::DynamicState::DEPTH_COMPARE_OP,
-            vk::DynamicState::DEPTH_BOUNDS_TEST_ENABLE,
-            vk::DynamicState::STENCIL_TEST_ENABLE,
-            vk::DynamicState::STENCIL_OP,
-            vk::DynamicState::DEPTH_BOUNDS,
+            //vk::DynamicState::DEPTH_TEST_ENABLE,
+            //vk::DynamicState::DEPTH_WRITE_ENABLE,
+            //vk::DynamicState::DEPTH_COMPARE_OP,
+            //vk::DynamicState::DEPTH_BOUNDS_TEST_ENABLE,
+            //vk::DynamicState::STENCIL_TEST_ENABLE,
+            //vk::DynamicState::STENCIL_OP,
+            //vk::DynamicState::DEPTH_BOUNDS,
             // pColorBlendState
-            vk::DynamicState::LOGIC_OP_ENABLE_EXT,
-            vk::DynamicState::LOGIC_OP_EXT,
-            vk::DynamicState::COLOR_BLEND_ENABLE_EXT,
-            vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
-            vk::DynamicState::COLOR_WRITE_MASK_EXT,
-            vk::DynamicState::BLEND_CONSTANTS,
+            //vk::DynamicState::LOGIC_OP_ENABLE_EXT,
+            //vk::DynamicState::LOGIC_OP_EXT,
+            //vk::DynamicState::COLOR_BLEND_ENABLE_EXT,
+            //vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
+            //vk::DynamicState::COLOR_WRITE_MASK_EXT,
+            //vk::DynamicState::BLEND_CONSTANTS,
         ];
 
         let dynamic_state_create_info = vk::PipelineDynamicStateCreateInfo {
@@ -1017,13 +1281,13 @@ impl Device {
         };
 
         // ------ Vertex state ------
-        let vertex_attribute_count = interface.vertex_attributes.len();
-        let vertex_buffer_count = interface.vertex_buffers.len();
+        let vertex_attribute_count = create_info.vertex_input.attributes.len();
+        let vertex_buffer_count = create_info.vertex_input.buffers.len();
 
         let mut vertex_attribute_descriptions = Vec::with_capacity(vertex_attribute_count);
         let mut vertex_binding_descriptions = Vec::with_capacity(vertex_buffer_count);
 
-        for attribute in interface.vertex_attributes.iter() {
+        for attribute in create_info.vertex_input.attributes.iter() {
             vertex_attribute_descriptions.push(vk::VertexInputAttributeDescription {
                 location: attribute.location,
                 binding: attribute.binding,
@@ -1032,11 +1296,11 @@ impl Device {
             });
         }
 
-        for desc in interface.vertex_buffers.iter() {
+        for desc in create_info.vertex_input.buffers.iter() {
             vertex_binding_descriptions.push(vk::VertexInputBindingDescription {
                 binding: desc.binding,
                 stride: desc.stride,
-                input_rate: desc.input_rate,
+                input_rate: desc.input_rate.into(),
             });
         }
 
@@ -1048,15 +1312,20 @@ impl Device {
             ..Default::default()
         };
 
+        let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo {
+            topology: create_info.vertex_input.topology.into(),
+            primitive_restart_enable: vk::FALSE,
+            ..Default::default()
+        };
+
         // ------ Shader stages ------
         let mut stages = Vec::new();
-        match shaders {
-            GraphicsShaders::PrimitiveShading {
+        match create_info.pre_rasterization_shaders {
+            PreRasterizationShaders::PrimitiveShading {
                 vertex,
                 tess_control,
                 tess_evaluation,
                 geometry,
-                fragment,
             } => {
                 let vertex = self.create_shader_module(ShaderKind::Vertex, &vertex.code, vertex.entry_point)?;
                 let tess_control = tess_control
@@ -1071,7 +1340,6 @@ impl Device {
                     .as_ref()
                     .map(|t| self.create_shader_module(ShaderKind::Geometry, &t.code, t.entry_point))
                     .transpose()?;
-                let fragment = self.create_shader_module(ShaderKind::Fragment, &fragment.code, fragment.entry_point)?;
 
                 stages.push(vk::PipelineShaderStageCreateInfo {
                     flags: Default::default(),
@@ -1111,32 +1379,135 @@ impl Device {
                         ..Default::default()
                     });
                 }
-                stages.push(vk::PipelineShaderStageCreateInfo {
-                    flags: Default::default(),
-                    stage: vk::ShaderStageFlags::FRAGMENT,
-                    module: fragment,
-                    p_name: b"main\0".as_ptr() as *const c_char, // TODO
-                    p_specialization_info: ptr::null(),
-                    ..Default::default()
-                });
             }
-            GraphicsShaders::MeshShading { .. } => {
+            PreRasterizationShaders::MeshShading { .. } => {
                 todo!("mesh shading")
             }
         };
 
+        let fragment = self.create_shader_module(
+            ShaderKind::Fragment,
+            &create_info.fragment_shader.code,
+            create_info.fragment_shader.entry_point,
+        )?;
+        stages.push(vk::PipelineShaderStageCreateInfo {
+            flags: Default::default(),
+            stage: vk::ShaderStageFlags::FRAGMENT,
+            module: fragment,
+            p_name: b"main\0".as_ptr() as *const c_char, // TODO
+            p_specialization_info: ptr::null(),
+            ..Default::default()
+        });
+
+        let attachment_states: Vec<_> = create_info
+            .fragment_output
+            .color_targets
+            .iter()
+            .map(|target| match target.blend_equation {
+                None => vk::PipelineColorBlendAttachmentState {
+                    blend_enable: vk::FALSE,
+                    color_write_mask: target.color_write_mask.into(),
+                    ..Default::default()
+                },
+                Some(blend_equation) => vk::PipelineColorBlendAttachmentState {
+                    blend_enable: vk::TRUE,
+                    src_color_blend_factor: blend_equation.src_color_blend_factor.into(),
+                    dst_color_blend_factor: blend_equation.dst_color_blend_factor.into(),
+                    color_blend_op: blend_equation.color_blend_op.into(),
+                    src_alpha_blend_factor: blend_equation.src_alpha_blend_factor.into(),
+                    dst_alpha_blend_factor: blend_equation.dst_alpha_blend_factor.into(),
+                    alpha_blend_op: blend_equation.alpha_blend_op.into(),
+                    color_write_mask: target.color_write_mask.into(),
+                },
+            })
+            .collect();
+
+        let line_rasterization_state = vk::PipelineRasterizationLineStateCreateInfoEXT {
+            line_rasterization_mode: create_info.rasterization.line_rasterization.mode.into(),
+            stippled_line_enable: vk::FALSE,
+            line_stipple_factor: 0,
+            line_stipple_pattern: 0,
+            ..Default::default()
+        };
+
+        let rasterization_state = vk::PipelineRasterizationStateCreateInfo {
+            p_next: &line_rasterization_state as *const _ as *const _,
+            depth_clamp_enable: 0,
+            rasterizer_discard_enable: 0,
+            polygon_mode: create_info.rasterization.polygon_mode.into(),
+            cull_mode: create_info.rasterization.cull_mode.into(),
+            front_face: create_info.rasterization.front_face.into(),
+            depth_bias_enable: vk::FALSE,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+            ..Default::default()
+        };
+
+        let multisample_state = vk::PipelineMultisampleStateCreateInfo {
+            rasterization_samples: vk::SampleCountFlags::TYPE_1,
+            sample_shading_enable: vk::FALSE,
+            min_sample_shading: 0.0,
+            p_sample_mask: ptr::null(),
+            alpha_to_coverage_enable: create_info.fragment_output.multisample.alpha_to_coverage_enabled.into(),
+            alpha_to_one_enable: vk::FALSE,
+            ..Default::default()
+        };
+
+        let color_blend_state = vk::PipelineColorBlendStateCreateInfo {
+            flags: Default::default(),
+            logic_op_enable: vk::FALSE,
+            logic_op: Default::default(),
+            attachment_count: attachment_states.len() as u32,
+            p_attachments: attachment_states.as_ptr(),
+            blend_constants: create_info.fragment_output.blend_constants,
+            ..Default::default()
+        };
+
+        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
+            flags: Default::default(),
+            depth_test_enable: (create_info.depth_stencil.depth_compare_op != CompareOp::Always).into(),
+            depth_write_enable: create_info.depth_stencil.depth_write_enable.into(),
+            depth_compare_op: create_info.depth_stencil.depth_compare_op.into(),
+            stencil_test_enable: create_info.depth_stencil.stencil_state.is_enabled().into(),
+            front: create_info.depth_stencil.stencil_state.front.into(),
+            back: create_info.depth_stencil.stencil_state.back.into(),
+            depth_bounds_test_enable: vk::FALSE,
+            min_depth_bounds: 0.0,
+            max_depth_bounds: 0.0,
+            ..Default::default()
+        };
+
+        let rendering_info = vk::PipelineRenderingCreateInfo {
+            view_mask: 0,
+            color_attachment_count: create_info.fragment_output.color_attachment_formats.len() as u32,
+            p_color_attachment_formats: create_info.fragment_output.color_attachment_formats.as_ptr(),
+            depth_attachment_format: create_info.fragment_output.depth_attachment_format.unwrap_or_default(),
+            stencil_attachment_format: create_info
+                .fragment_output
+                .stencil_attachment_format
+                .unwrap_or_default(),
+            ..Default::default()
+        };
+
         let pipeline_create_info = vk::GraphicsPipelineCreateInfo {
+            p_next: &rendering_info as *const _ as *const _,
             flags: Default::default(),
             stage_count: stages.len() as u32,
             p_stages: stages.as_ptr(),
             p_vertex_input_state: &vertex_input_state,
-            p_input_assembly_state: ptr::null(),
-            p_tessellation_state: ptr::null(),
-            p_viewport_state: ptr::null(),
-            p_rasterization_state: ptr::null(),
-            p_multisample_state: ptr::null(),
-            p_depth_stencil_state: ptr::null(),
-            p_color_blend_state: ptr::null(),
+            p_input_assembly_state: &input_assembly_state,
+            p_tessellation_state: &Default::default(),
+            p_viewport_state: &vk::PipelineViewportStateCreateInfo {
+                viewport_count: 1,
+                scissor_count: 1,
+                ..Default::default()
+            },
+            p_rasterization_state: &rasterization_state,
+            p_multisample_state: &multisample_state,
+            p_depth_stencil_state: &depth_stencil_state,
+            p_color_blend_state: &color_blend_state,
             p_dynamic_state: &dynamic_state_create_info,
             layout: pipeline_layout,
             render_pass: Default::default(),

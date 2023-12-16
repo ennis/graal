@@ -9,7 +9,8 @@ use crate::{
         encoder::{BlitCommandEncoder, RenderEncoder},
         ensure_memory_dependency, DependencyState, PipelineBarrierBuilder, RefCounted, ResourceHandle, ResourceUse,
     },
-    vk, Attachments, BufferAny, CommandBuffer, Device, GroupId, ImageAny, ImageView, ResourceId, ResourceState,
+    is_write_access, vk, Attachments, Buffer, CommandBuffer, Device, GroupId, Image, ImageView, ResourceId,
+    ResourceState,
 };
 
 impl CommandBuffer {
@@ -43,19 +44,24 @@ impl CommandBuffer {
                 resource.value,
                 DependencyState {
                     stages: use_.state.stages,
-                    flush_mask: use_.state.access,
-                    visible: vk::AccessFlags2::empty(),
+                    flush_mask: if is_write_access(use_.state.access) {
+                        use_.state.access
+                    } else {
+                        vk::AccessFlags2::empty()
+                    },
+                    visible: use_.state.access,
                     layout: use_.state.layout,
                 },
             );
         } else {
+            // TODO: if subsequent uses are also reads, the barrier should be combined with the initial use
             let dep_state = self.final_states.get_mut(&resource.value).unwrap();
             ensure_memory_dependency(&mut self.barrier_builder, handle, dep_state, &use_);
         }
         self.refs.push(resource);
     }
 
-    pub fn use_buffer(&mut self, buffer: &BufferAny, state: ResourceState) {
+    pub fn use_buffer(&mut self, buffer: &Buffer, state: ResourceState) {
         self.use_resource(
             buffer.id().map(Into::into),
             buffer.handle().into(),
@@ -77,7 +83,7 @@ impl CommandBuffer {
         );
     }
 
-    pub fn use_image(&mut self, image: &ImageAny, state: ResourceState) {
+    pub fn use_image(&mut self, image: &Image, state: ResourceState) {
         self.use_resource(
             image.id().map(Into::into),
             image.handle().into(),
@@ -115,9 +121,8 @@ impl CommandBuffer {
     }
 
     /// Encode a blit operation
-    pub fn encode_blit(&mut self, encode_fn: impl FnOnce(&mut BlitCommandEncoder)) {
-        let mut encoder = BlitCommandEncoder::new(self);
-        encode_fn(&mut encoder);
+    pub fn begin_blit(&mut self) -> BlitCommandEncoder {
+        BlitCommandEncoder::new(self)
     }
 
     /// Start a rendering pass
@@ -126,21 +131,14 @@ impl CommandBuffer {
     ///
     /// * `attachments` - The attachments to use for the render pass
     /// * `render_area` - The area to render to. If `None`, the entire area of the attached images is rendered to.
-    pub fn render<A: Attachments>(
-        &mut self,
-        attachments: &A,
-        render_area: Option<vk::Rect2D>,
-        pass_fn: impl FnOnce(&mut RenderEncoder),
-    ) -> VkResult<()> {
+    pub fn begin_rendering<A: Attachments>(&mut self, attachments: &A) -> RenderEncoder {
         // collect attachments
-        let mut color_attachments: Vec<_> = attachments.color_attachments().collect();
-        let mut depth_attachment = attachments.depth_attachment();
-        let mut stencil_attachment = attachments.stencil_attachment();
+        let color_attachments: Vec<_> = attachments.color_attachments().collect();
+        let depth_attachment = attachments.depth_attachment();
+        let stencil_attachment = attachments.stencil_attachment();
 
         // determine render area
-        let render_area = if let Some(render_area) = render_area {
-            render_area
-        } else {
+        let render_area = {
             // FIXME validate that all attachments have the same size
             // FIXME validate that all images are 2D
             let extent = color_attachments
@@ -241,11 +239,14 @@ impl CommandBuffer {
             self.device
                 .raw()
                 .cmd_begin_rendering(self.command_buffer, &rendering_info);
-            let mut render_encoder = RenderEncoder::new(self);
-            pass_fn(&mut render_encoder);
+        }
+        RenderEncoder::new(self, render_area.extent.width, render_area.extent.height)
+    }
+
+    pub(super) fn end_rendering(&mut self) {
+        unsafe {
             self.device.raw().cmd_end_rendering(self.command_buffer);
         }
-        Ok(())
     }
 }
 

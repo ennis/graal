@@ -1,10 +1,11 @@
-use ash::vk;
 use core::ptr;
-use once_cell::sync::Lazy;
 use std::{
     ffi::{c_void, CStr, CString},
     os::raw::c_char,
 };
+
+use ash::vk;
+use once_cell::sync::Lazy;
 
 /// Returns the global `ash::Entry` object.
 pub fn get_vulkan_entry() -> &'static ash::Entry {
@@ -32,8 +33,6 @@ pub fn vk_khr_debug_utils() -> &'static ash::extensions::ext::DebugUtils {
 pub fn vk_khr_surface() -> &'static ash::extensions::khr::Surface {
     &VK_KHR_SURFACE
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// List of validation layers to enable
 const VALIDATION_LAYERS: &[&str] = &[/*"VK_LAYER_KHRONOS_validation"*/];

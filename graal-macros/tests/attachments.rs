@@ -1,16 +1,16 @@
-use graal::{vk::Format, Attachments, ImageAny, StaticAttachments};
+use graal::{vk::Format, Attachments, Image, StaticAttachments};
 
 #[derive(Attachments)]
 struct GBuffers<'a> {
     #[attachment(color, format=R16G16B16A16_SFLOAT)]
-    color: &'a ImageAny,
+    color: &'a Image,
     // assume color by default
     #[attachment(format=R16G16_SFLOAT)]
-    normal: &'a ImageAny,
+    normal: &'a Image,
     #[attachment(color, format=R16G16_SFLOAT)]
-    tangent: &'a ImageAny,
+    tangent: &'a Image,
     #[attachment(depth, format=R16G16_SFLOAT)]
-    depth: &'a ImageAny,
+    depth: &'a Image,
 }
 
 /*

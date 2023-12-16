@@ -230,7 +230,7 @@ impl<'a> SceneUploader<'a> {
         let device_vbo = self.frame.context().create_buffer(
             &model.name,
             &graal::ResourceMemoryInfo::DEVICE_LOCAL,
-            &graal::BufferResourceCreateInfo {
+            &graal::BufferCreateInfo {
                 usage: vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 byte_size: vertex_byte_size as u64,
                 map_on_create: false,
@@ -241,7 +241,7 @@ impl<'a> SceneUploader<'a> {
         let device_ibo = self.frame.context().create_buffer(
             &model.name,
             &graal::ResourceMemoryInfo::DEVICE_LOCAL,
-            &graal::BufferResourceCreateInfo {
+            &graal::BufferCreateInfo {
                 usage: vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 byte_size: index_byte_size as u64,
                 map_on_create: false,

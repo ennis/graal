@@ -1,4 +1,4 @@
-use graal::{vk, Arguments, PushConstants, SampledImage, StaticArguments, StaticPushConstants, UniformBuffer};
+use graal::{vk, Arguments, SampledImage, StaticArguments, UniformBuffer};
 use std::mem;
 
 #[repr(C)]
@@ -14,29 +14,29 @@ struct ArgumentsInlineOnly {
 }
 
 #[derive(Arguments)]
-struct ArgumentsNoInline {
+struct ArgumentsNoInline<'a> {
     #[argument(binding = 0)]
-    u0: UniformBuffer<u64>,
+    u0: UniformBuffer<'a, u64>,
     #[argument(binding = 1)]
-    t1: SampledImage,
+    t1: SampledImage<'a>,
 }
 
 #[derive(Arguments)]
-struct ArgumentsNoInlineBindGaps {
+struct ArgumentsNoInlineBindGaps<'a> {
     #[argument(binding = 1)]
-    u0: UniformBuffer<u64>,
+    u0: UniformBuffer<'a, u64>,
     #[argument(binding = 5)]
-    t1: SampledImage,
+    t1: SampledImage<'a>,
 }
 
 #[derive(Arguments)]
-struct ArgumentsMixed {
+struct ArgumentsMixed<'a> {
     u_color: [f32; 4],
     u_matrix: [[f32; 4]; 4],
     #[argument(binding = 1)]
-    u0: UniformBuffer<u64>,
+    u0: UniformBuffer<'a, u64>,
     #[argument(binding = 2)]
-    t1: SampledImage,
+    t1: SampledImage<'a>,
 }
 
 // Should be invalid:
@@ -56,45 +56,18 @@ struct ArgumentsMixedInvalid {
 struct ArgumentsTupleInlineOnly([f32; 4], [[f32; 4]; 4]);
 
 #[derive(Arguments)]
-struct ArgumentsTupleNoInline(
-    #[argument(binding = 1)] UniformBuffer<u64>,
-    #[argument(binding = 2)] SampledImage,
+struct ArgumentsTupleNoInline<'a>(
+    #[argument(binding = 1)] UniformBuffer<'a, u64>,
+    #[argument(binding = 2)] SampledImage<'a>,
 );
 
 #[derive(Arguments)]
-struct ArgumentsTupleMixed(
+struct ArgumentsTupleMixed<'a>(
     [f32; 4],
     [[f32; 4]; 4],
-    #[argument(binding = 1)] UniformBuffer<u64>,
-    #[argument(binding = 2)] SampledImage,
+    #[argument(binding = 1)] UniformBuffer<'a, u64>,
+    #[argument(binding = 2)] SampledImage<'a>,
 );
-
-#[derive(PushConstants)]
-#[repr(C)]
-struct PushCst {
-    #[stages(vertex)]
-    u_matrix: [[f32; 4]; 4],
-    #[stages(fragment)]
-    u_color: [f32; 4],
-    // all stages
-    u_time: f32,
-}
-
-#[test]
-#[rustfmt::skip]
-fn test_push_constants() {
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[0].stage_flags, vk::ShaderStageFlags::VERTEX);
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[0].offset, 0);
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[0].size, 64);
-
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[1].stage_flags, vk::ShaderStageFlags::FRAGMENT);
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[1].offset, 64);
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[1].size, mem::size_of::<[f32; 4]>() as u32);
-
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[2].stage_flags, vk::ShaderStageFlags::ALL);
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[2].offset, mem::size_of::<[[f32; 4]; 4]>() as u32 + mem::size_of::<[f32; 4]>() as u32);
-    assert_eq!(<PushCst as StaticPushConstants>::PUSH_CONSTANT_RANGES[2].size, mem::size_of::<f32>() as u32);
-}
 
 #[test]
 #[rustfmt::skip]

@@ -8,11 +8,11 @@ use winit::{
 };
 
 use graal::{
-    vk, BufferResourceCreateInfo, ImageAny, ImageCopyBuffer, ImageCopyView, ImageDataLayout, ImageResourceCreateInfo,
-    ImageSubresourceLayers, MemoryLocation, Point3D, Queue, Rect3D,
+    vk, BufferCreateInfo, BufferUsage, Image, ImageCopyBuffer, ImageCopyView, ImageCreateInfo, ImageDataLayout,
+    ImageSubresourceLayers, ImageType, ImageUsage, MemoryLocation, Point3D, Queue, Rect3D,
 };
 
-fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFlags, mipmaps: bool) -> ImageAny {
+fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipmaps: bool) -> Image {
     use openimageio::{ImageInput, TypeDesc};
 
     let path = path.as_ref();
@@ -59,20 +59,17 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
     // create the texture
     let image = device.create_image(
         path.to_str().unwrap(),
-        MemoryLocation::GpuOnly,
-        &ImageResourceCreateInfo {
-            type_: vk::ImageType::TYPE_2D,
-            usage: usage | vk::ImageUsageFlags::TRANSFER_DST,
+        &ImageCreateInfo {
+            memory_location: MemoryLocation::GpuOnly,
+            type_: ImageType::Image2D,
+            usage: usage | ImageUsage::TRANSFER_DST,
             format: vk_format,
-            extent: vk::Extent3D {
-                width,
-                height,
-                depth: 1,
-            },
+            width,
+            height,
+            depth: 1,
             mip_levels,
             array_layers: 1,
             samples: 1,
-            tiling: Default::default(),
         },
     );
 
@@ -81,12 +78,9 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
     // create a staging buffer
     let staging_buffer = device.create_buffer(
         "staging",
+        BufferUsage::TRANSFER_SRC,
         MemoryLocation::CpuToGpu,
-        &BufferResourceCreateInfo {
-            usage: vk::BufferUsageFlags::TRANSFER_SRC,
-            byte_size,
-            map_on_create: true,
-        },
+        byte_size,
     );
 
     // read image data
@@ -104,7 +98,8 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
     }
 
     let mut cmd_buf = queue.create_command_buffer();
-    cmd_buf.encode_blit(|encoder| unsafe {
+    let mut encoder = cmd_buf.begin_blit();
+    unsafe {
         encoder.copy_buffer_to_image(
             ImageCopyBuffer {
                 buffer: &staging_buffer,
@@ -126,7 +121,8 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: vk::ImageUsageFl
                 depth: 1,
             },
         );
-    });
+    }
+    encoder.finish();
 
     queue.submit([cmd_buf]).unwrap();
 
@@ -181,7 +177,7 @@ fn main() {
                         let image = load_image(
                             &mut queue,
                             "data/haniyasushin_keiki.jpg",
-                            vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED,
+                            ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
                             false,
                         );
 
@@ -189,7 +185,8 @@ fn main() {
                         let blit_h = image.size().height.min(swapchain_size.1);
 
                         let mut cb = queue.create_command_buffer();
-                        cb.encode_blit(|encoder| {
+                        let mut encoder = cb.begin_blit();
+                        unsafe {
                             encoder.blit_image(
                                 &image,
                                 ImageSubresourceLayers {
@@ -223,7 +220,8 @@ fn main() {
                                 },
                                 vk::Filter::NEAREST,
                             );
-                        });
+                        }
+                        encoder.finish();
 
                         queue.submit([cb]).expect("blit failed");
                         queue.present(&swapchain_image).unwrap();

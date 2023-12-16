@@ -1,16 +1,19 @@
 //! Device initialization helpers
-use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig};
-use crate::{
-    instance::{get_vulkan_entry, get_vulkan_instance, vk_khr_surface},
-    platform_impl, vk,
-};
 use std::{
     cell::{Cell, RefCell},
     ffi::{c_void, CStr, CString},
     ptr,
     rc::Rc,
 };
+
 use tracing::debug;
+
+use crate::{
+    instance::{get_vulkan_entry, get_vulkan_instance, vk_khr_surface},
+    platform_impl, vk,
+};
+
+use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig};
 
 struct PhysicalDeviceAndProperties {
     physical_device: vk::PhysicalDevice,
@@ -126,6 +129,8 @@ const DEVICE_EXTENSIONS: &[&str] = &[
     "VK_KHR_swapchain",
     //"VK_KHR_dynamic_rendering",   // promoted to core in 1.3
     "VK_KHR_push_descriptor",
+    "VK_EXT_extended_dynamic_state3",
+    "VK_EXT_line_rasterization",
 ];
 
 impl Device {
@@ -228,6 +233,7 @@ impl Device {
         let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(instance, &device);
         let vk_ext_shader_object = ash::extensions::ext::ShaderObject::new(instance, &device);
         let vk_khr_push_descriptor = ash::extensions::khr::PushDescriptor::new(instance, &device);
+        let vk_ext_extended_dynamic_state3 = ash::extensions::ext::ExtendedDynamicState3::new(instance, &device);
         let physical_device_memory_properties = instance.get_physical_device_memory_properties(physical_device);
         let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
         let physical_device_properties = instance.get_physical_device_properties(physical_device);
@@ -247,6 +253,7 @@ impl Device {
                 vk_khr_swapchain,
                 vk_ext_shader_object,
                 vk_khr_push_descriptor,
+                vk_ext_extended_dynamic_state3,
                 resources: RefCell::new(Default::default()),
                 resource_groups: RefCell::new(Default::default()),
                 deletion_lists: RefCell::new(vec![]),
@@ -293,9 +300,54 @@ impl Device {
             ..Default::default()
         };
 
-        let mut vk13_features = vk::PhysicalDeviceVulkan13Features {
+        let mut ext_dynamic_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
             p_next: &mut timeline_features as *mut _ as *mut c_void,
+            extended_dynamic_state3_tessellation_domain_origin: vk::TRUE,
+            extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
+            extended_dynamic_state3_polygon_mode: vk::TRUE,
+            extended_dynamic_state3_rasterization_samples: vk::TRUE,
+            extended_dynamic_state3_sample_mask: vk::TRUE,
+            extended_dynamic_state3_alpha_to_coverage_enable: vk::TRUE,
+            extended_dynamic_state3_alpha_to_one_enable: vk::TRUE,
+            extended_dynamic_state3_logic_op_enable: vk::TRUE,
+            extended_dynamic_state3_color_blend_enable: vk::TRUE,
+            extended_dynamic_state3_color_blend_equation: vk::TRUE,
+            extended_dynamic_state3_color_write_mask: vk::TRUE,
+            extended_dynamic_state3_rasterization_stream: vk::TRUE,
+            extended_dynamic_state3_conservative_rasterization_mode: vk::TRUE,
+            extended_dynamic_state3_extra_primitive_overestimation_size: vk::TRUE,
+            extended_dynamic_state3_depth_clip_enable: vk::TRUE,
+            extended_dynamic_state3_sample_locations_enable: vk::TRUE,
+            extended_dynamic_state3_color_blend_advanced: vk::TRUE,
+            extended_dynamic_state3_provoking_vertex_mode: vk::TRUE,
+            extended_dynamic_state3_line_rasterization_mode: vk::TRUE,
+            extended_dynamic_state3_line_stipple_enable: vk::TRUE,
+            extended_dynamic_state3_depth_clip_negative_one_to_one: vk::TRUE,
+            extended_dynamic_state3_viewport_w_scaling_enable: vk::TRUE,
+            extended_dynamic_state3_viewport_swizzle: vk::TRUE,
+            extended_dynamic_state3_coverage_to_color_enable: vk::TRUE,
+            extended_dynamic_state3_coverage_to_color_location: vk::TRUE,
+            extended_dynamic_state3_coverage_modulation_mode: vk::TRUE,
+            extended_dynamic_state3_coverage_modulation_table_enable: vk::TRUE,
+            extended_dynamic_state3_coverage_modulation_table: vk::TRUE,
+            extended_dynamic_state3_coverage_reduction_mode: vk::TRUE,
+            extended_dynamic_state3_representative_fragment_test_enable: vk::TRUE,
+            extended_dynamic_state3_shading_rate_image_enable: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut line_rasterization_features = vk::PhysicalDeviceLineRasterizationFeaturesEXT {
+            p_next: &mut ext_dynamic_state as *mut _ as *mut c_void,
+            bresenham_lines: vk::TRUE,
+            smooth_lines: vk::TRUE,
+            rectangular_lines: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut vk13_features = vk::PhysicalDeviceVulkan13Features {
+            p_next: &mut line_rasterization_features as *mut _ as *mut c_void,
             synchronization2: vk::TRUE,
+            dynamic_rendering: vk::TRUE,
             ..Default::default()
         };
 

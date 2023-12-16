@@ -2,19 +2,18 @@
 use std::{mem, ptr};
 
 use ash::vk::Handle;
-use gpu_allocator::vulkan::AllocationScheme;
+use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 
 use crate::{
     aspects_for_format,
-    buffer::BufferAny,
     device::{BufferId, Device, GroupId, ImageId, ResourceAllocation, ResourceId},
-    is_write_access, vk, ImageAny, MemoryLocation,
+    is_write_access, vk, Buffer, BufferCreateInfo, BufferUsage, Image, ImageCreateInfo, MemoryLocation, Size3D,
+    TypedBuffer,
 };
 
 use super::{
-    BufferRegistrationInfo, BufferResource, BufferResourceCreateInfo, DeferredDeletionList, DeferredDeletionObject,
-    ImageRegistrationInfo, ImageResource, ImageResourceCreateInfo, OwnerQueue, RefCount, RefCounted, Resource,
-    ResourceKind, ResourceRegistrationInfo,
+    BufferRegistrationInfo, BufferResource, DeferredDeletionList, DeferredDeletionObject, ImageRegistrationInfo,
+    ImageResource, OwnerQueue, RefCount, RefCounted, Resource, ResourceKind, ResourceRegistrationInfo,
 };
 
 pub(crate) struct ResourceGroup {
@@ -49,20 +48,20 @@ impl Device {
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
     /// Creates a new buffer resource.
-    ///
-    /// Returns a `BufferInfo` struct containing the buffer resource ID, the vulkan buffer handle,
-    /// and a pointer to the buffer mapped in host memory, if `buffer_create_info.map_on_create == true`.
     pub fn create_buffer(
         &self,
         name: &str,
-        location: MemoryLocation,
-        buffer_create_info: &BufferResourceCreateInfo,
-    ) -> BufferAny {
+        usage: BufferUsage,
+        memory_location: MemoryLocation,
+        byte_size: u64,
+    ) -> Buffer {
+        assert!(byte_size > 0, "buffer size must be greater than zero");
+
         // create the buffer object first
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
-            size: buffer_create_info.byte_size,
-            usage: buffer_create_info.usage,
+            size: byte_size,
+            usage: usage.into(),
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
@@ -78,11 +77,10 @@ impl Device {
         // get its memory requirements
         let mem_req = unsafe { self.inner.device.get_buffer_memory_requirements(handle) };
 
-        // caller requested a mapped pointer, must create and allocate immediately
-        let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        let allocation_create_desc = AllocationCreateDesc {
             name,
             requirements: mem_req,
-            location,
+            location: memory_location,
             linear: true,
             allocation_scheme: AllocationScheme::GpuAllocatorManaged,
         };
@@ -101,14 +99,6 @@ impl Device {
         let mapped_ptr = allocation.mapped_ptr();
         let allocation = ResourceAllocation::Allocation { allocation };
 
-        /*let mapped_ptr = if buffer_create_info.map_on_create {
-            let ptr = allocation.mapped_ptr().expect("failed to map buffer");
-            //assert!(!ptr.is_null(), "failed to map buffer");
-            ptr.as_ptr() as *mut u8
-        } else {
-            ptr::null_mut()
-        };*/
-
         let id = unsafe {
             self.register_buffer_resource(BufferRegistrationInfo {
                 resource: ResourceRegistrationInfo {
@@ -120,14 +110,14 @@ impl Device {
             })
         };
 
-        BufferAny::new(
-            self.clone(),
+        Buffer {
+            device: self.clone(),
             id,
             handle,
-            buffer_create_info.byte_size as usize,
-            buffer_create_info.usage,
+            size: byte_size,
+            usage,
             mapped_ptr,
-        )
+        }
     }
 
     /// Registers an existing buffer resource.
@@ -159,16 +149,20 @@ impl Device {
     ///
     /// # Examples
     ///
-    pub fn create_image(&self, name: &str, location: MemoryLocation, image_info: &ImageResourceCreateInfo) -> ImageAny {
+    pub fn create_image(&self, name: &str, image_info: &ImageCreateInfo) -> Image {
         let create_info = vk::ImageCreateInfo {
-            image_type: image_info.type_,
+            image_type: image_info.type_.into(),
             format: image_info.format,
-            extent: image_info.extent,
+            extent: vk::Extent3D {
+                width: image_info.width,
+                height: image_info.height,
+                depth: image_info.depth,
+            },
             mip_levels: image_info.mip_levels,
             array_layers: image_info.array_layers,
             samples: get_vk_sample_count(image_info.samples),
-            tiling: image_info.tiling,
-            usage: image_info.usage,
+            tiling: vk::ImageTiling::OPTIMAL, // LINEAR tiling not used enough to be exposed
+            usage: image_info.usage.into(),
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
@@ -183,10 +177,10 @@ impl Device {
         let mem_req = unsafe { self.inner.device.get_image_memory_requirements(handle) };
 
         // allocate immediately
-        let allocation_create_desc = gpu_allocator::vulkan::AllocationCreateDesc {
+        let allocation_create_desc = AllocationCreateDesc {
             name,
             requirements: mem_req,
-            location,
+            location: image_info.memory_location,
             linear: true,
             allocation_scheme: AllocationScheme::GpuAllocatorManaged,
         };
@@ -216,15 +210,19 @@ impl Device {
             })
         };
 
-        ImageAny::new(
-            self.clone(),
+        Image {
+            device: self.clone(),
             id,
             handle,
-            create_info.usage,
-            create_info.image_type,
-            create_info.format,
-            create_info.extent,
-        )
+            usage: image_info.usage,
+            type_: image_info.type_,
+            format: image_info.format,
+            size: Size3D {
+                width: image_info.width,
+                height: image_info.height,
+                depth: image_info.depth,
+            },
+        }
     }
 
     /// Registers an existing image resource.
