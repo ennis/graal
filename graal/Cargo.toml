@@ -40,7 +40,7 @@ obj = "0.10.2"
 glam = "0.24.2"
 inline-spirv = "0.1.4"
 openimageio = { path = "../../openimageio-rs" }
-tracing-subscriber = { version = "0.2.17", features = ["fmt"] }
+tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter"] }
 
 [build-dependencies]
 shaderc = "0.8.3"
