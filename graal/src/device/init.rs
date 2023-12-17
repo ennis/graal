@@ -131,6 +131,8 @@ const DEVICE_EXTENSIONS: &[&str] = &[
     "VK_KHR_push_descriptor",
     "VK_EXT_extended_dynamic_state3",
     "VK_EXT_line_rasterization",
+    "VK_EXT_mesh_shader",
+    "VK_EXT_conservative_rasterization",
 ];
 
 impl Device {
@@ -234,6 +236,7 @@ impl Device {
         let vk_ext_shader_object = ash::extensions::ext::ShaderObject::new(instance, &device);
         let vk_khr_push_descriptor = ash::extensions::khr::PushDescriptor::new(instance, &device);
         let vk_ext_extended_dynamic_state3 = ash::extensions::ext::ExtendedDynamicState3::new(instance, &device);
+        let vk_ext_mesh_shader = ash::extensions::ext::MeshShader::new(instance, &device);
         let physical_device_memory_properties = instance.get_physical_device_memory_properties(physical_device);
         let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
         let physical_device_properties = instance.get_physical_device_properties(physical_device);
@@ -253,6 +256,7 @@ impl Device {
                 vk_khr_swapchain,
                 vk_ext_shader_object,
                 vk_khr_push_descriptor,
+                vk_ext_mesh_shader,
                 vk_ext_extended_dynamic_state3,
                 resources: RefCell::new(Default::default()),
                 resource_groups: RefCell::new(Default::default()),
@@ -300,8 +304,15 @@ impl Device {
             ..Default::default()
         };
 
-        let mut ext_dynamic_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+        let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT {
             p_next: &mut timeline_features as *mut _ as *mut c_void,
+            task_shader: vk::TRUE,
+            mesh_shader: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut ext_dynamic_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+            p_next: &mut mesh_shader_features as *mut _ as *mut c_void,
             extended_dynamic_state3_tessellation_domain_origin: vk::TRUE,
             extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
             extended_dynamic_state3_polygon_mode: vk::TRUE,
@@ -358,6 +369,7 @@ impl Device {
                 fill_mode_non_solid: vk::TRUE,
                 sampler_anisotropy: vk::TRUE,
                 shader_storage_image_extended_formats: vk::TRUE,
+                fragment_stores_and_atomics: vk::TRUE,
                 ..Default::default()
             },
             ..Default::default()

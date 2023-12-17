@@ -7,9 +7,10 @@ use std::{
 };
 
 use crate::{
-    vk, ArgumentKind, Arguments, BufferRangeAny, ClearColorValue, ColorBlendEquation, CommandBuffer, Device,
-    GraphicsPipeline, Image, ImageCopyBuffer, ImageCopyView, ImageSubresourceLayers, IndexType, PipelineBindPoint,
-    PrimitiveTopology, Rect2D, Rect3D, ResourceState, VertexBufferDescriptor, VertexInput,
+    vk, ArgumentKind, Arguments, Buffer, BufferRangeAny, ClearColorValue, ColorBlendEquation, CommandBuffer,
+    ConservativeRasterizationMode, Device, GraphicsPipeline, Image, ImageCopyBuffer, ImageCopyView,
+    ImageSubresourceLayers, IndexType, PipelineBindPoint, PrimitiveTopology, Rect2D, Rect3D, ResourceState,
+    VertexBufferDescriptor, VertexInput,
 };
 
 /// Common
@@ -193,6 +194,43 @@ impl<'a> Encoder<'a> {
                 );
         }
     }
+
+    // TODO typed version
+    pub fn fill_buffer(&mut self, buffer: &BufferRangeAny, data: u32) {
+        self.command_buffer
+            .use_buffer(buffer.buffer, ResourceState::TRANSFER_DST);
+        self.command_buffer.flush_barriers();
+        unsafe {
+            self.command_buffer.device().cmd_fill_buffer(
+                self.command_buffer.command_buffer,
+                buffer.buffer.handle(),
+                buffer.offset,
+                buffer.size,
+                data,
+            );
+        }
+    }
+
+    // TODO specify subresources
+    pub fn clear_image(&mut self, image: &Image, clear_color_value: ClearColorValue) {
+        self.command_buffer.use_image(image, ResourceState::TRANSFER_DST);
+        self.command_buffer.flush_barriers();
+        unsafe {
+            self.command_buffer.device().cmd_clear_color_image(
+                self.command_buffer.command_buffer,
+                image.handle(),
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &clear_color_value.into(),
+                &[vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    base_mip_level: 0,
+                    level_count: vk::REMAINING_MIP_LEVELS,
+                    base_array_layer: 0,
+                    layer_count: vk::REMAINING_ARRAY_LAYERS,
+                }],
+            );
+        }
+    }
 }
 
 impl<'a> RenderEncoder<'a> {
@@ -293,7 +331,9 @@ impl<'a> RenderEncoder<'a> {
         // None of the relevant drivers on desktop care about the actual stages,
         // only if it's graphics, compute, or ray tracing.
         let stages = match bind_point {
-            PipelineBindPoint::Graphics => vk::ShaderStageFlags::ALL_GRAPHICS,
+            PipelineBindPoint::Graphics => {
+                vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT
+            }
             PipelineBindPoint::Compute => vk::ShaderStageFlags::COMPUTE,
             //_ => panic!("unsupported bind point"),
         };
@@ -327,6 +367,15 @@ impl<'a> RenderEncoder<'a> {
                 .cmd_set_primitive_topology(self.command_buffer.command_buffer, topology.into());
         }
     }
+
+    /*pub fn set_conservative_rasterization_mode(&mut self, mode: ConservativeRasterizationMode) {
+        unsafe {
+            self.command_buffer
+                .device()
+                .ext_extended_dynamic_state3()
+                .cmd_set_conservative_rasterization_mode(self.command_buffer.command_buffer, mode.into());
+        }
+    }*/
 
     pub fn set_viewport(&mut self, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
         unsafe {
@@ -382,18 +431,6 @@ impl<'a> RenderEncoder<'a> {
                     dst_alpha_blend_factor: color_blend_equation.dst_alpha_blend_factor.to_vk_blend_factor(),
                     alpha_blend_op: color_blend_equation.alpha_blend_op.to_vk_blend_op(),
                 }],
-            );
-        }
-    }
-
-    pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
-        unsafe {
-            self.command_buffer.device().cmd_draw(
-                self.command_buffer.command_buffer,
-                vertices.len() as u32,
-                instances.len() as u32,
-                vertices.start,
-                instances.start,
             );
         }
     }
@@ -462,6 +499,18 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
+    pub fn draw(&mut self, vertices: Range<u32>, instances: Range<u32>) {
+        unsafe {
+            self.command_buffer.device().cmd_draw(
+                self.command_buffer.command_buffer,
+                vertices.len() as u32,
+                instances.len() as u32,
+                vertices.start,
+                instances.start,
+            );
+        }
+    }
+
     pub fn draw_indexed(&mut self, indices: Range<u32>, base_vertex: i32, instances: Range<u32>) {
         unsafe {
             self.command_buffer.device().cmd_draw_indexed(
@@ -471,6 +520,17 @@ impl<'a> RenderEncoder<'a> {
                 indices.start,
                 base_vertex,
                 instances.start,
+            );
+        }
+    }
+
+    pub fn draw_mesh_tasks(&mut self, group_count_x: u32, group_count_y: u32, group_count_z: u32) {
+        unsafe {
+            self.command_buffer.device().ext_mesh_shader().cmd_draw_mesh_tasks(
+                self.command_buffer.command_buffer,
+                group_count_x,
+                group_count_y,
+                group_count_z,
             );
         }
     }
@@ -585,6 +645,7 @@ impl<'a> BlitCommandEncoder<'a> {
         }
     }
 
+    // TODO the call-site verbosity of this method is ridiculous, fix that
     pub fn blit_image(
         &mut self,
         src: &Image,
@@ -654,5 +715,19 @@ impl<'a> BlitCommandEncoder<'a> {
 
     pub fn finish(mut self) {
         self.bomb.defuse()
+    }
+}
+
+impl<'a> Deref for BlitCommandEncoder<'a> {
+    type Target = Encoder<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.base
+    }
+}
+
+impl<'a> DerefMut for BlitCommandEncoder<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.base
     }
 }

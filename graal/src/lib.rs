@@ -32,17 +32,31 @@ mod surface;
 mod types;
 pub mod util;
 
+pub mod prelude {
+    pub use crate::{
+        util::{DeviceExt, QueueExt},
+        vk, Arguments, Attachments, BufferUsage, ClearColorValue, ColorBlendEquation, ColorTargetState, CompareOp,
+        DepthStencilState, Device, Format, FragmentOutputInterfaceDescriptor, FrontFace, GraphicsPipeline,
+        GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageType, ImageUsage, ImageView, IndexType,
+        LineRasterization, LineRasterizationMode, MemoryLocation, PipelineBindPoint, PipelineLayoutDescriptor, Point2D,
+        PolygonMode, PreRasterizationShaders, PrimitiveTopology, Queue, RasterizationState, Rect2D, RenderEncoder,
+        SampledImage, Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StaticArguments,
+        StaticAttachments, StencilState, TypedBuffer, Vertex, VertexBufferDescriptor, VertexBufferLayoutDescription,
+        VertexInputAttributeDescription, VertexInputRate, VertexInputState,
+    };
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("failed to create device")]
     DeviceCreationFailed(#[from] DeviceCreateError),
-    #[error("I/O error")]
+    #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
-    #[error("compilation error")]
+    #[error("compilation error: {0}")]
     Shaderc(#[from] shaderc::Error),
-    #[error("Vulkan error")]
+    #[error("Vulkan error: {0}")]
     Vulkan(#[from] vk::Result),
 }
 
@@ -199,6 +213,97 @@ unsafe impl<'a, T> Argument for UniformBuffer<'a, T> {
     }
 }
 
+/// Storage buffer descriptor.
+#[derive(Copy, Clone, Debug)]
+pub struct ReadOnlyStorageBuffer<'a, T: ?Sized> {
+    pub buffer: &'a Buffer,
+    pub offset: vk::DeviceSize,
+    pub range: vk::DeviceSize,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+unsafe impl<'a, T: ?Sized> Argument for ReadOnlyStorageBuffer<'a, T> {
+    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::STORAGE_BUFFER;
+    const DESCRIPTOR_COUNT: u32 = 1;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
+
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
+            binding,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            kind: ArgumentKind::Buffer {
+                buffer: self.buffer,
+                resource_state: ResourceState {
+                    layout: vk::ImageLayout::UNDEFINED,
+                    access: vk::AccessFlags2::SHADER_STORAGE_READ,
+                    stages: vk::PipelineStageFlags2::ALL_COMMANDS, // FIXME
+                },
+                offset: self.offset as usize,
+                size: self.range as usize,
+            },
+        }
+    }
+}
+
+/// Storage buffer descriptor.
+#[derive(Copy, Clone, Debug)]
+pub struct ReadWriteStorageBuffer<'a, T: ?Sized> {
+    pub buffer: &'a Buffer,
+    pub offset: vk::DeviceSize,
+    pub range: vk::DeviceSize,
+    _phantom: PhantomData<fn() -> T>,
+}
+
+unsafe impl<'a, T: ?Sized> Argument for ReadWriteStorageBuffer<'a, T> {
+    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::STORAGE_BUFFER;
+    const DESCRIPTOR_COUNT: u32 = 1;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
+
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
+            binding,
+            descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+            kind: ArgumentKind::Buffer {
+                buffer: self.buffer,
+                resource_state: ResourceState {
+                    layout: vk::ImageLayout::UNDEFINED,
+                    access: vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    stages: vk::PipelineStageFlags2::ALL_COMMANDS, // FIXME
+                },
+                offset: self.offset as usize,
+                size: self.range as usize,
+            },
+        }
+    }
+}
+
+/// Storage buffer descriptor.
+#[derive(Copy, Clone, Debug)]
+pub struct ReadWriteStorageImage<'a> {
+    pub image_view: &'a ImageView,
+}
+
+unsafe impl<'a> Argument for ReadWriteStorageImage<'a> {
+    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::STORAGE_IMAGE;
+    const DESCRIPTOR_COUNT: u32 = 1;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
+
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
+            binding,
+            descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+            kind: ArgumentKind::Image {
+                image_view: self.image_view,
+                resource_state: ResourceState {
+                    layout: vk::ImageLayout::GENERAL,
+                    access: vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                    stages: vk::PipelineStageFlags2::ALL_COMMANDS,
+                },
+            },
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 impl Buffer {
@@ -262,6 +367,24 @@ impl<T: ?Sized> TypedBuffer<T> {
     pub fn any(&self) -> &Buffer {
         &self.buffer
     }
+
+    pub fn as_read_only_storage_buffer(&self) -> ReadOnlyStorageBuffer<T> {
+        ReadOnlyStorageBuffer {
+            buffer: &self.buffer,
+            offset: 0,
+            range: self.byte_size(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn as_read_write_storage_buffer(&self) -> ReadWriteStorageBuffer<T> {
+        ReadWriteStorageBuffer {
+            buffer: &self.buffer,
+            offset: 0,
+            range: self.byte_size(),
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<T> TypedBuffer<[T]> {
@@ -317,6 +440,15 @@ impl<'a, T> BufferRange<'a, T> {
     // TODO rename this to "untyped" or something
     pub fn any(&self) -> BufferRangeAny<'a> {
         self.any
+    }
+
+    pub fn as_read_only_storage_buffer(&self) -> ReadOnlyStorageBuffer<T> {
+        ReadOnlyStorageBuffer {
+            buffer: self.any.buffer,
+            offset: self.any.offset,
+            range: self.any.size,
+            _phantom: PhantomData,
+        }
     }
 }
 
@@ -496,8 +628,8 @@ pub enum PreRasterizationShaders {
     },
     /// Shaders of the mesh shading pipeline (the new mesh and task shaders).
     MeshShading {
+        task: Option<ShaderEntryPoint<'static>>,
         mesh: ShaderEntryPoint<'static>,
-        task: ShaderEntryPoint<'static>,
     },
 }
 

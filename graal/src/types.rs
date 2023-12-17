@@ -713,6 +713,12 @@ pub enum PolygonMode {
     Point,
 }
 
+impl Default for PolygonMode {
+    fn default() -> Self {
+        Self::Fill
+    }
+}
+
 impl PolygonMode {
     pub const fn to_vk_polygon_mode(self) -> vk::PolygonMode {
         match self {
@@ -767,15 +773,15 @@ impl From<CullMode> for vk::CullModeFlags {
 
 #[derive(Copy, Clone, Debug)]
 pub enum FrontFace {
+    CounterClockwise = 0,
     Clockwise,
-    CounterClockwise,
 }
 
 impl FrontFace {
     pub const fn to_vk_front_face(self) -> vk::FrontFace {
         match self {
-            Self::Clockwise => vk::FrontFace::CLOCKWISE,
             Self::CounterClockwise => vk::FrontFace::COUNTER_CLOCKWISE,
+            Self::Clockwise => vk::FrontFace::CLOCKWISE,
         }
     }
 }
@@ -786,9 +792,15 @@ impl From<FrontFace> for vk::FrontFace {
     }
 }
 
+impl Default for FrontFace {
+    fn default() -> Self {
+        Self::CounterClockwise
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum LineRasterizationMode {
-    Default,
+    Default = 0,
     Rectangular,
     Bresenham,
     RectangularSmooth,
@@ -822,24 +834,25 @@ pub struct LineRasterization {
     pub mode: LineRasterizationMode,
 }
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, Default)]
 pub struct RasterizationState {
     pub polygon_mode: PolygonMode,
     pub cull_mode: CullMode,
     pub front_face: FrontFace,
     pub line_rasterization: LineRasterization,
+    pub conservative_rasterization_mode: ConservativeRasterizationMode,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CompareOp {
-    Never = 1,
-    Less = 2,
-    Equal = 3,
-    LessOrEqual = 4,
-    Greater = 5,
-    NotEqual = 6,
-    GreaterOrEqual = 7,
-    Always = 8,
+    Never = 0,
+    Less,
+    Equal,
+    LessOrEqual,
+    Greater,
+    NotEqual,
+    GreaterOrEqual,
+    Always,
 }
 
 impl Default for CompareOp {
@@ -1014,6 +1027,16 @@ pub struct DepthStencilState {
     pub depth_write_enable: bool,
     pub depth_compare_op: CompareOp,
     pub stencil_state: StencilState,
+}
+
+impl Default for DepthStencilState {
+    fn default() -> Self {
+        Self {
+            depth_write_enable: false,
+            depth_compare_op: CompareOp::Less,
+            stencil_state: Default::default(),
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1265,7 +1288,42 @@ impl From<PrimitiveTopology> for vk::PrimitiveTopology {
     }
 }
 
+impl Default for PrimitiveTopology {
+    fn default() -> Self {
+        Self::TriangleList
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
+pub enum ConservativeRasterizationMode {
+    Disabled,
+    Overestimate,
+    Underestimate,
+}
+
+impl ConservativeRasterizationMode {
+    pub const fn to_vk_conservative_rasterization_mode(self) -> vk::ConservativeRasterizationModeEXT {
+        match self {
+            Self::Disabled => vk::ConservativeRasterizationModeEXT::DISABLED,
+            Self::Overestimate => vk::ConservativeRasterizationModeEXT::OVERESTIMATE,
+            Self::Underestimate => vk::ConservativeRasterizationModeEXT::UNDERESTIMATE,
+        }
+    }
+}
+
+impl From<ConservativeRasterizationMode> for vk::ConservativeRasterizationModeEXT {
+    fn from(mode: ConservativeRasterizationMode) -> Self {
+        mode.to_vk_conservative_rasterization_mode()
+    }
+}
+
+impl Default for ConservativeRasterizationMode {
+    fn default() -> Self {
+        Self::Disabled
+    }
+}
+
+#[derive(Copy, Clone, Debug, Default)]
 pub struct VertexInputState<'a> {
     pub topology: PrimitiveTopology,
     pub buffers: &'a [VertexBufferLayoutDescription],

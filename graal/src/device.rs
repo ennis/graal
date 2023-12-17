@@ -27,7 +27,7 @@ use crate::{
     instance::{vk_khr_debug_utils, vk_khr_surface},
     is_write_access, platform_impl, ArgumentsLayout, BufferRangeAny, BufferUsage, CompareOp, Error, Format,
     GraphicsPipelineCreateInfo, ImageSubresourceRange, ImageType, ImageUsage, ImageViewInfo, PreRasterizationShaders,
-    ResourceState, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D,
+    ReadWriteStorageImage, ResourceState, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D,
 };
 
 mod command_buffer;
@@ -75,6 +75,7 @@ pub(crate) struct DeviceInner {
     vk_khr_swapchain: ash::extensions::khr::Swapchain,
     vk_ext_shader_object: ash::extensions::ext::ShaderObject,
     vk_khr_push_descriptor: ash::extensions::khr::PushDescriptor,
+    vk_ext_mesh_shader: ash::extensions::ext::MeshShader,
     vk_ext_extended_dynamic_state3: ash::extensions::ext::ExtendedDynamicState3,
     resources: RefCell<ResourceMap>,
     resource_groups: RefCell<ResourceGroupMap>,
@@ -442,6 +443,14 @@ impl ImageView {
         self.size
     }
 
+    pub fn width(&self) -> u32 {
+        self.size.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.size.height
+    }
+
     pub fn handle(&self) -> vk::ImageView {
         self.handle
     }
@@ -456,6 +465,10 @@ impl ImageView {
 
     fn parent_id(&self) -> RefCounted<ImageId> {
         self.parent_image.clone()
+    }
+
+    pub fn as_read_write_storage(&self) -> ReadWriteStorageImage {
+        ReadWriteStorageImage { image_view: self }
     }
 }
 
@@ -878,7 +891,7 @@ fn ensure_memory_dependency(
         // we're writing to the resource, so reset visibility...
         dep_state.visible = vk::AccessFlags2::empty();
         // ... but signal that there is data to flush.
-        dep_state.flush_mask |= use_.state.access;
+        dep_state.flush_mask = use_.state.access;
     } else {
         // This memory dependency makes all writes on the resource available, and
         // visible to the types specified in `access.access_mask`.
@@ -914,6 +927,10 @@ impl Device {
 
     pub fn ext_extended_dynamic_state3(&self) -> &ash::extensions::ext::ExtendedDynamicState3 {
         &self.inner.vk_ext_extended_dynamic_state3
+    }
+
+    pub fn ext_mesh_shader(&self) -> &ash::extensions::ext::MeshShader {
+        &self.inner.vk_ext_mesh_shader
     }
 
     /// Helper function to associate a debug name to a vulkan handle.
@@ -1187,7 +1204,9 @@ impl Device {
 
         let pc_range = match bind_point {
             vk::PipelineBindPoint::GRAPHICS => vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS,
+                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS
+                    | vk::ShaderStageFlags::MESH_EXT
+                    | vk::ShaderStageFlags::TASK_EXT,
                 offset: 0,
                 size: push_constants_size as u32,
             },
@@ -1230,49 +1249,15 @@ impl Device {
 
         // ------ Dynamic states ------
 
-        // Make most of the things dynamic
         // TODO: this could be a static property of the pipeline interface
-        let dynamic_states = [
-            vk::DynamicState::VIEWPORT,
-            vk::DynamicState::SCISSOR,
-            //vk::DynamicState::STENCIL_COMPARE_MASK,
-            //vk::DynamicState::STENCIL_WRITE_MASK,
-            //vk::DynamicState::STENCIL_REFERENCE,
-            // pInputAssemblyState
-            //vk::DynamicState::PRIMITIVE_RESTART_ENABLE,
-            vk::DynamicState::PRIMITIVE_TOPOLOGY,
-            // pTessellationState
-            //vk::DynamicState::PATCH_CONTROL_POINTS_EXT,
-            // pRasterizationState
-            //vk::DynamicState::DEPTH_CLAMP_ENABLE_EXT,
-            //vk::DynamicState::RASTERIZER_DISCARD_ENABLE,
-            //vk::DynamicState::POLYGON_MODE_EXT,
-            //vk::DynamicState::CULL_MODE,
-            //vk::DynamicState::FRONT_FACE,
-            //vk::DynamicState::DEPTH_BIAS_ENABLE,
-            //vk::DynamicState::DEPTH_BIAS,
-            //vk::DynamicState::LINE_WIDTH,
-            // pMultisampleState
-            //vk::DynamicState::RASTERIZATION_SAMPLES_EXT,
-            //vk::DynamicState::SAMPLE_MASK_EXT,
-            //vk::DynamicState::ALPHA_TO_COVERAGE_ENABLE_EXT,
-            //vk::DynamicState::ALPHA_TO_ONE_ENABLE_EXT,
-            // pDepthStencilState
-            //vk::DynamicState::DEPTH_TEST_ENABLE,
-            //vk::DynamicState::DEPTH_WRITE_ENABLE,
-            //vk::DynamicState::DEPTH_COMPARE_OP,
-            //vk::DynamicState::DEPTH_BOUNDS_TEST_ENABLE,
-            //vk::DynamicState::STENCIL_TEST_ENABLE,
-            //vk::DynamicState::STENCIL_OP,
-            //vk::DynamicState::DEPTH_BOUNDS,
-            // pColorBlendState
-            //vk::DynamicState::LOGIC_OP_ENABLE_EXT,
-            //vk::DynamicState::LOGIC_OP_EXT,
-            //vk::DynamicState::COLOR_BLEND_ENABLE_EXT,
-            //vk::DynamicState::COLOR_BLEND_EQUATION_EXT,
-            //vk::DynamicState::COLOR_WRITE_MASK_EXT,
-            //vk::DynamicState::BLEND_CONSTANTS,
-        ];
+        let mut dynamic_states = vec![vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+
+        if matches!(
+            create_info.pre_rasterization_shaders,
+            PreRasterizationShaders::PrimitiveShading { .. }
+        ) {
+            dynamic_states.push(vk::DynamicState::PRIMITIVE_TOPOLOGY);
+        }
 
         let dynamic_state_create_info = vk::PipelineDynamicStateCreateInfo {
             dynamic_state_count: dynamic_states.len() as u32,
@@ -1281,13 +1266,15 @@ impl Device {
         };
 
         // ------ Vertex state ------
-        let vertex_attribute_count = create_info.vertex_input.attributes.len();
-        let vertex_buffer_count = create_info.vertex_input.buffers.len();
+
+        let vertex_input = create_info.vertex_input;
+        let vertex_attribute_count = vertex_input.attributes.len();
+        let vertex_buffer_count = vertex_input.buffers.len();
 
         let mut vertex_attribute_descriptions = Vec::with_capacity(vertex_attribute_count);
         let mut vertex_binding_descriptions = Vec::with_capacity(vertex_buffer_count);
 
-        for attribute in create_info.vertex_input.attributes.iter() {
+        for attribute in vertex_input.attributes.iter() {
             vertex_attribute_descriptions.push(vk::VertexInputAttributeDescription {
                 location: attribute.location,
                 binding: attribute.binding,
@@ -1296,7 +1283,7 @@ impl Device {
             });
         }
 
-        for desc in create_info.vertex_input.buffers.iter() {
+        for desc in vertex_input.buffers.iter() {
             vertex_binding_descriptions.push(vk::VertexInputBindingDescription {
                 binding: desc.binding,
                 stride: desc.stride,
@@ -1313,7 +1300,7 @@ impl Device {
         };
 
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo {
-            topology: create_info.vertex_input.topology.into(),
+            topology: vertex_input.topology.into(),
             primitive_restart_enable: vk::FALSE,
             ..Default::default()
         };
@@ -1380,8 +1367,28 @@ impl Device {
                     });
                 }
             }
-            PreRasterizationShaders::MeshShading { .. } => {
-                todo!("mesh shading")
+            PreRasterizationShaders::MeshShading { mesh, task } => {
+                if let Some(task) = task {
+                    let task = self.create_shader_module(ShaderKind::Task, &task.code, task.entry_point)?;
+                    stages.push(vk::PipelineShaderStageCreateInfo {
+                        flags: Default::default(),
+                        stage: vk::ShaderStageFlags::TASK_EXT,
+                        module: task,
+                        p_name: b"main\0".as_ptr() as *const c_char, // TODO
+                        p_specialization_info: ptr::null(),
+                        ..Default::default()
+                    });
+                }
+
+                let mesh = self.create_shader_module(ShaderKind::Mesh, &mesh.code, mesh.entry_point)?;
+                stages.push(vk::PipelineShaderStageCreateInfo {
+                    flags: Default::default(),
+                    stage: vk::ShaderStageFlags::MESH_EXT,
+                    module: mesh,
+                    p_name: b"main\0".as_ptr() as *const c_char, // TODO
+                    p_specialization_info: ptr::null(),
+                    ..Default::default()
+                });
             }
         };
 
@@ -1422,6 +1429,7 @@ impl Device {
             })
             .collect();
 
+        // Rasterization state
         let line_rasterization_state = vk::PipelineRasterizationLineStateCreateInfoEXT {
             line_rasterization_mode: create_info.rasterization.line_rasterization.mode.into(),
             stippled_line_enable: vk::FALSE,
@@ -1430,8 +1438,14 @@ impl Device {
             ..Default::default()
         };
 
-        let rasterization_state = vk::PipelineRasterizationStateCreateInfo {
+        let conservative_rasterization_state = vk::PipelineRasterizationConservativeStateCreateInfoEXT {
             p_next: &line_rasterization_state as *const _ as *const _,
+            conservative_rasterization_mode: create_info.rasterization.conservative_rasterization_mode.into(),
+            ..Default::default()
+        };
+
+        let rasterization_state = vk::PipelineRasterizationStateCreateInfo {
+            p_next: &conservative_rasterization_state as *const _ as *const _,
             depth_clamp_enable: 0,
             rasterizer_discard_enable: 0,
             polygon_mode: create_info.rasterization.polygon_mode.into(),

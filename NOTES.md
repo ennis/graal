@@ -313,3 +313,131 @@ Device API:
 
     // Arc-based
     create_resource() -> Arc<Resource>
+
+
+# Uniform buffers and upload buffers
+
+So far they haven't been a problem: all uniform data so far fits in push constants, the rest are just descriptors.
+It's possible that we might never need them.
+
+# Issue with pipeline barriers:
+
+- blit encoder, layout is TRANSFER_DST
+- same command buffer, draw operation, write to storage image in frag shader: layout should be transferred to GENERAL, but it must be done before entering the render pass
+  - at the moment we enter the render pass, we don't know yet which images are going to be used, and it might not be the first use of the image in the command buffer 
+
+
+We **can't** insert barriers in the middle of a rendering operation and we **can't** retroactively insert barriers before the beginning
+of the rendering operation.
+
+
+Solution?
+- use GENERAL layout if the image can be used in shaders?
+    - not enough: layout transitions are not the only thing that matters, there's also memory visibility
+1. require the user to specify used resources up front, at the beginning of the render pass 
+2. defer recording of command buffers
+  - that's what wgpu does :( 
+3. use different command buffers for render / compute / blit
+
+Solution 1 seems the most in-line with the rest of the API.
+But that's a shame, because the mechanism to track memory accesses in argument buffers works rather well.
+At least we still track resource uses.
+
+We could validate that they're in the correct layout, at least. Or do nothing at all.
+Barriers are flushed on begin_blit, begin_compute, begin_rendering
+
+
+
+Real example:
+
+    // Clear the tile curve count image and the tile buffer
+    {
+        cmdbuf.use(&self.bin_rast_tile_curve_count_image, TransferDst);
+        cmdbuf.use(&self.bin_rast_tile_buffer, TransferDst);
+
+        let mut encoder = cmdbuf.begin_blit();
+        encoder.clear_image(&self.bin_rast_tile_curve_count_image, ClearColorValue::Uint([0, 0, 0, 0]));
+        encoder.fill_buffer(&self.bin_rast_tile_buffer.slice(..).any(), 0);
+    }
+
+    // Render the curves
+    {
+        cmdbuf.use(&self.color_target_view, ColorAttachment);
+        cmdbuf.use(&self.depth_buffer_view, DepthAttachment);
+        cmdbuf.use(&animation.position_buffer, StorageReadOnly);
+        cmdbuf.use(&animation.curve_buffer, StorageReadOnly);
+        cmdbuf.use(&self.bin_rast_tile_curve_count_image, StorageReadWrite);
+        cmdbuf.use(&self.bin_rast_tile_buffer, StorageReadWrite);
+
+        let mut encoder = cmdbuf.begin_rendering(&RenderAttachments {
+            color: &color_target_view,
+            depth: &self.depth_buffer_view,
+        });
+
+        let bin_rast_tile_curve_count_image_view = self.bin_rast_tile_curve_count_image.create_top_level_view();
+        encoder.bind_graphics_pipeline(bin_rast_pipeline);
+        encoder.set_viewport(0.0, 0.0, tile_count_x as f32, tile_count_y as f32, 0.0, 1.0);
+        encoder.set_scissor(0, 0, tile_count_x, tile_count_y);
+        encoder.bind_arguments(
+            0,
+            &BinRastArguments {
+                position_buffer: animation.position_buffer.as_read_only_storage_buffer(),
+                curve_buffer: animation.curve_buffer.as_read_only_storage_buffer(),
+                tiles_curve_count_image: bin_rast_tile_curve_count_image_view.as_read_write_storage(),
+                tiles_buffer: self.bin_rast_tile_buffer.as_read_write_storage_buffer(),
+            },
+        );
+
+        encoder.bind_push_constants(
+            PipelineBindPoint::Graphics,
+            &BinRastPushConstants {
+                view_proj: self.camera_control.camera().view_projection(),
+                base_curve: animation.frames[self.bin_rast_current_frame].curves.start,
+                stroke_width: self.bin_rast_stroke_width,
+                tile_count_x,
+                tile_count_y,
+            },
+        );
+
+        encoder.draw_mesh_tasks(frame.curves.count, 1, 1);
+    }
+
+    {
+        cmdbuf.use_image(&self.bin_rast_tile_curve_count_image, ResourceState::TRANSFER_SRC);
+        cmdbuf.use_image_view(&self.color_target_view, ResourceState::COLOR_ATTACHMENT);
+
+        let mut encoder = cmdbuf.begin_blit();
+        encoder.blit_image(
+            &self.bin_rast_tile_curve_count_image,
+            ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            Rect3D {
+                min: Point3D { x: 0, y: 0, z: 0 },
+                max: Point3D {
+                    x: tile_count_x as i32,
+                    y: tile_count_y as i32,
+                    z: 1,
+                },
+            },
+            &color_target,
+            ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            Rect3D {
+                min: Point3D { x: 0, y: 0, z: 0 },
+                max: Point3D {
+                    x: width as i32,
+                    y: height as i32,
+                    z: 1,
+                },
+            },
+            vk::Filter::NEAREST,
+        );
+    }
