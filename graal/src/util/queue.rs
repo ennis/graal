@@ -18,6 +18,7 @@ impl QueueExt for Queue {
         let height = image.image.size().height;
 
         let mut cmd_buf = self.create_command_buffer();
+
         let mut encoder = cmd_buf.begin_blit();
         unsafe {
             encoder.copy_buffer_to_image(
@@ -37,7 +38,7 @@ impl QueueExt for Queue {
                 },
             );
         }
-        encoder.finish();
+        drop(encoder);
 
         self.submit([cmd_buf]).unwrap();
     }

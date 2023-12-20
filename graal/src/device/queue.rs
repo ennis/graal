@@ -6,10 +6,11 @@ use tracing::debug;
 
 use crate::{
     device::{
-        ensure_memory_dependency, Device, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder,
-        ResourceAllocation, ResourceHandle, ResourceKind, ResourceRegistrationInfo, Swapchain, SwapchainImage,
+        command_buffer::{emit_barriers, CommandBuffer},
+        Barrier, Device, ImageOrBuffer, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder, ResourceAllocation,
+        ResourceHandle, ResourceKind, ResourceRegistrationInfo, Swapchain, SwapchainImage,
     },
-    vk, CommandBuffer, Image, ImageType, ImageUsage, ResourceState, Size3D,
+    vk, Image, ImageType, ImageUsage, ResourceStateOld, ResourceUse, Size3D,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -235,18 +236,37 @@ impl Queue {
     }
 
     pub unsafe fn present(&mut self, swapchain_image: &SwapchainImage) -> VkResult<bool> {
-        let mut cb = self.create_command_buffer();
-        cb.use_image(&swapchain_image.image, ResourceState::PRESENT);
+        let render_finished = self.get_or_create_semaphore().0;
 
-        // FIXME: this pushes two command buffers: one for the PipelineBarrier, and another, empty one
-        // There should be another mechanism for transitioning resources outside of command buffers
-        self.submit([cb])?;
-        let render_finished = self.signal();
+        // submit a command buffer for transition to PRESENT layout and "render finished" semaphore
+        let mut cb = self.create_command_buffer();
+        {
+            let mut usages = self.device.inner.usages.borrow_mut();
+            if let Some(barrier) = usages.insert_or_barrier(
+                swapchain_image.image.id.value.into(),
+                ImageOrBuffer::Image {
+                    image: swapchain_image.image.handle,
+                    format: swapchain_image.image.format,
+                },
+                ResourceUse::PRESENT,
+                None,
+            ) {
+                emit_barriers(&self.device, cb.command_buffer, &[barrier]);
+            }
+        }
+
+        self.submit_raw(
+            [cb],
+            &[],
+            &[SemaphoreSignal::Binary {
+                semaphore: render_finished,
+            }],
+        )?;
 
         // build present info that waits on the batch that was just submitted
         let present_info = vk::PresentInfoKHR {
             wait_semaphore_count: 1,
-            p_wait_semaphores: &render_finished.0,
+            p_wait_semaphores: &render_finished,
             swapchain_count: 1,
             p_swapchains: &swapchain_image.swapchain,
             p_image_indices: &swapchain_image.index,
@@ -255,7 +275,7 @@ impl Queue {
         };
         let result = self.device.khr_swapchain().queue_present(self.queue, &present_info);
         // we signalled and waited on the semaphore, consider it consumed
-        self.semaphores.push(UnsignaledSemaphore(render_finished.0));
+        self.semaphores.push(UnsignaledSemaphore(render_finished));
         result
     }
 
@@ -333,49 +353,39 @@ impl Queue {
     ) -> VkResult<()> {
         // Insert pipeline barriers between command buffers
         let mut resources = self.device.inner.resources.borrow_mut();
+        let mut global_usage_scope = self.device.inner.usages.borrow_mut();
         let mut command_buffers = vec![];
 
         for cb in cmd_bufs.into_iter() {
             let cb: CommandBuffer = cb;
             // finish the command buffer
             self.device.raw().end_command_buffer(cb.command_buffer)?;
-            let mut barrier_builder = PipelineBarrierBuilder::default();
-            for (id, use_) in cb.initial_uses.iter() {
-                let resource = &mut resources[*id];
 
-                // ensure that it can be used on this queue
-                match resource.owner {
-                    OwnerQueue::None => {
-                        resource.owner = OwnerQueue::Exclusive(self.global_index);
-                    }
-                    OwnerQueue::Exclusive(q) => {
-                        assert_eq!(q, self.global_index, "resource is already owned by another queue");
-                    }
-                    _ => {
-                        panic!("concurrent ownership is not supported")
-                    }
-                }
-
-                let handle = match resource.kind {
-                    ResourceKind::Image(ref image) => ResourceHandle::Image(image.handle),
-                    ResourceKind::Buffer(ref buffer) => ResourceHandle::Buffer(buffer.handle),
-                };
-                ensure_memory_dependency(&mut barrier_builder, handle, &mut resource.dep_state, use_);
-            }
-            for (id, final_state) in cb.final_states.iter() {
-                resources[*id].dep_state = *final_state;
-                resources[*id].timestamp = self.current.timestamp;
-            }
-            if !barrier_builder.is_empty() {
+            let barriers = global_usage_scope.merge(&cb.usage_scope);
+            if !barriers.is_empty() {
                 let barrier_cb = self.current.cb_alloc.alloc(&self.device.raw());
-                record_barrier_command_buffer(&self.device, barrier_cb, barrier_builder);
+                unsafe {
+                    self.device
+                        .begin_command_buffer(
+                            barrier_cb,
+                            &vk::CommandBufferBeginInfo {
+                                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    emit_barriers(&self.device, barrier_cb, &barriers);
+                    self.device.end_command_buffer(barrier_cb).unwrap();
+                }
                 command_buffers.push(barrier_cb);
             }
-            command_buffers.push(cb.command_buffer);
 
-            // we can drop refs now, the referenced resources lifetime is extended by setting the timestamp.
-            // NOTE: the call does nothing, but it's clearer to call it explicitly
-            drop(cb.refs);
+            for resource in cb.refs.iter() {
+                let resource = &mut resources[resource.value];
+                resource.timestamp = self.current.timestamp;
+            }
+
+            command_buffers.push(cb.command_buffer);
         }
 
         // Build submission
@@ -669,32 +679,3 @@ impl Submission {
     }
 }
 */
-
-fn record_barrier_command_buffer(device: &Device, command_buffer: vk::CommandBuffer, barriers: PipelineBarrierBuilder) {
-    let device = device.raw();
-    unsafe {
-        device
-            .begin_command_buffer(
-                command_buffer,
-                &vk::CommandBufferBeginInfo {
-                    flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        device.cmd_pipeline_barrier2(
-            command_buffer,
-            &vk::DependencyInfo {
-                dependency_flags: Default::default(),
-                memory_barrier_count: 0,
-                p_memory_barriers: ptr::null(),
-                buffer_memory_barrier_count: barriers.buffer_barriers.len() as u32,
-                p_buffer_memory_barriers: barriers.buffer_barriers.as_ptr(),
-                image_memory_barrier_count: barriers.image_barriers.len() as u32,
-                p_image_memory_barriers: barriers.image_barriers.as_ptr(),
-                ..Default::default()
-            },
-        );
-        device.end_command_buffer(command_buffer).unwrap();
-    }
-}

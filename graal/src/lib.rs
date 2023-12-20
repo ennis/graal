@@ -39,8 +39,8 @@ pub mod prelude {
         DepthStencilState, Device, Format, FragmentOutputInterfaceDescriptor, FrontFace, GraphicsPipeline,
         GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageType, ImageUsage, ImageView, IndexType,
         LineRasterization, LineRasterizationMode, MemoryLocation, PipelineBindPoint, PipelineLayoutDescriptor, Point2D,
-        PolygonMode, PreRasterizationShaders, PrimitiveTopology, Queue, RasterizationState, Rect2D, RenderEncoder,
-        SampledImage, Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StaticArguments,
+        PolygonMode, PreRasterizationShaders, PrimitiveTopology, Queue, RasterizationState, Rect2D, SampledImage,
+        Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StaticArguments,
         StaticAttachments, StencilState, TypedBuffer, Vertex, VertexBufferDescriptor, VertexBufferLayoutDescription,
         VertexInputAttributeDescription, VertexInputRate, VertexInputState,
     };
@@ -96,13 +96,13 @@ pub struct ArgumentDescription<'a> {
 pub enum ArgumentKind<'a> {
     Image {
         image_view: &'a ImageView,
-        resource_state: ResourceState,
+        use_: ResourceUse,
     },
     Buffer {
         buffer: &'a Buffer,
-        resource_state: ResourceState,
-        offset: usize,
-        size: usize,
+        use_: ResourceUse,
+        offset: u64,
+        size: u64,
     },
     Sampler {
         sampler: &'a Sampler,
@@ -157,11 +157,7 @@ unsafe impl<'a> Argument for SampledImage<'a> {
             descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
             kind: ArgumentKind::Image {
                 image_view: self.image_view,
-                resource_state: ResourceState {
-                    layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-                    access: vk::AccessFlags2::SHADER_READ,
-                    stages: vk::PipelineStageFlags2::ALL_COMMANDS,
-                },
+                use_: ResourceUse::SAMPLED_READ,
             },
         }
     }
@@ -201,13 +197,9 @@ unsafe impl<'a, T> Argument for UniformBuffer<'a, T> {
             descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
             kind: ArgumentKind::Buffer {
                 buffer: self.buffer,
-                resource_state: ResourceState {
-                    layout: vk::ImageLayout::UNDEFINED,
-                    access: vk::AccessFlags2::UNIFORM_READ,
-                    stages: vk::PipelineStageFlags2::ALL_COMMANDS,
-                },
-                offset: self.offset as usize,
-                size: self.range as usize,
+                use_: ResourceUse::UNIFORM,
+                offset: self.offset,
+                size: self.range,
             },
         }
     }
@@ -233,13 +225,9 @@ unsafe impl<'a, T: ?Sized> Argument for ReadOnlyStorageBuffer<'a, T> {
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
             kind: ArgumentKind::Buffer {
                 buffer: self.buffer,
-                resource_state: ResourceState {
-                    layout: vk::ImageLayout::UNDEFINED,
-                    access: vk::AccessFlags2::SHADER_STORAGE_READ,
-                    stages: vk::PipelineStageFlags2::ALL_COMMANDS, // FIXME
-                },
-                offset: self.offset as usize,
-                size: self.range as usize,
+                use_: ResourceUse::STORAGE_READ,
+                offset: self.offset,
+                size: self.range,
             },
         }
     }
@@ -265,13 +253,9 @@ unsafe impl<'a, T: ?Sized> Argument for ReadWriteStorageBuffer<'a, T> {
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
             kind: ArgumentKind::Buffer {
                 buffer: self.buffer,
-                resource_state: ResourceState {
-                    layout: vk::ImageLayout::UNDEFINED,
-                    access: vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                    stages: vk::PipelineStageFlags2::ALL_COMMANDS, // FIXME
-                },
-                offset: self.offset as usize,
-                size: self.range as usize,
+                use_: ResourceUse::STORAGE_READ_WRITE,
+                offset: self.offset,
+                size: self.range,
             },
         }
     }
@@ -294,11 +278,7 @@ unsafe impl<'a> Argument for ReadWriteStorageImage<'a> {
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
             kind: ArgumentKind::Image {
                 image_view: self.image_view,
-                resource_state: ResourceState {
-                    layout: vk::ImageLayout::GENERAL,
-                    access: vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                    stages: vk::PipelineStageFlags2::ALL_COMMANDS,
-                },
+                use_: ResourceUse::IMAGE_READ_WRITE,
             },
         }
     }

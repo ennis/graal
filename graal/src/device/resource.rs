@@ -420,9 +420,6 @@ impl Device {
                 .borrow_mut()
                 .free(allocation)
                 .expect("failed to free memory"),
-            ResourceAllocation::Transient { .. } => {
-                todo!("destroy transient resources")
-            }
             ResourceAllocation::DeviceMemory { device_memory } => {
                 self.inner.device.free_memory(device_memory, None);
             }
@@ -445,11 +442,10 @@ impl Device {
             kind,
             allocation: info.allocation,
             group: None,
-            dep_state: Default::default(),
             owner: OwnerQueue::None,
-            wait_semaphore: None,
             timestamp: 0,
         });
+        //self.inner.usages.borrow_mut().uses.insert(id, Default::default());
         self.set_debug_object_name(object_type, object_handle, info.name, None);
         RefCounted::new(id, ref_count)
     }

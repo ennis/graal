@@ -122,7 +122,7 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipm
             },
         );
     }
-    encoder.finish();
+    drop(encoder);
 
     queue.submit([cmd_buf]).unwrap();
 
@@ -221,7 +221,7 @@ fn main() {
                                 vk::Filter::NEAREST,
                             );
                         }
-                        encoder.finish();
+                        drop(encoder);
 
                         queue.submit([cb]).expect("blit failed");
                         queue.present(&swapchain_image).unwrap();

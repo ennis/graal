@@ -13,7 +13,7 @@ use crate::{
     platform_impl, vk,
 };
 
-use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig};
+use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig, UsageScope};
 
 struct PhysicalDeviceAndProperties {
     physical_device: vk::PhysicalDevice,
@@ -259,6 +259,7 @@ impl Device {
                 vk_ext_mesh_shader,
                 vk_ext_extended_dynamic_state3,
                 resources: RefCell::new(Default::default()),
+                usages: RefCell::new(UsageScope::new()),
                 resource_groups: RefCell::new(Default::default()),
                 deletion_lists: RefCell::new(vec![]),
                 sampler_cache: RefCell::new(Default::default()),

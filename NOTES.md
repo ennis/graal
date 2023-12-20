@@ -337,7 +337,7 @@ Solution?
 1. require the user to specify used resources up front, at the beginning of the render pass 
 2. defer recording of command buffers
   - that's what wgpu does :( 
-3. use different command buffers for render / compute / blit
+3. use different command buffers for render / compute / blit, insert fixup command buffers
 
 Solution 1 seems the most in-line with the rest of the API.
 But that's a shame, because the mechanism to track memory accesses in argument buffers works rather well.
@@ -441,3 +441,19 @@ Real example:
             vk::Filter::NEAREST,
         );
     }
+
+
+# Refactor
+
+Two arrays:
+- state: holds current resource states + vulkan handles (all data necessary to build barriers)
+
+
+Modules:
+- device.rs: device, queues 
+  - init.rs: device initialization
+- command.rs: command buffers 
+  - render.rs: render commands & RenderEncoder
+  - blit.rs: blit commands & BlitEncoder
+- track.rs: use trackers
+- pipeline.rs: pipeline creation (Device::create_graphics_pipeline & GraphicsPipeline & shader compilation)

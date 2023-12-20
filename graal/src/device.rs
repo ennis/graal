@@ -16,9 +16,8 @@ use std::{
 use ash::vk;
 use fxhash::FxHashMap;
 use shaderc::{EnvVersion, SpirvVersion, TargetEnv};
-use slotmap::{Key, SlotMap};
+use slotmap::{Key, SecondaryMap, SlotMap};
 
-pub use encoder::*;
 pub use queue::*;
 
 use crate::{
@@ -27,11 +26,11 @@ use crate::{
     instance::{vk_khr_debug_utils, vk_khr_surface},
     is_write_access, platform_impl, ArgumentsLayout, BufferRangeAny, BufferUsage, CompareOp, Error, Format,
     GraphicsPipelineCreateInfo, ImageSubresourceRange, ImageType, ImageUsage, ImageViewInfo, PreRasterizationShaders,
-    ReadWriteStorageImage, ResourceState, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D,
+    ReadWriteStorageImage, ResourceStateOld, ResourceUse, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource,
+    Size3D,
 };
 
 mod command_buffer;
-mod encoder;
 mod init;
 mod queue;
 mod resource;
@@ -78,7 +77,9 @@ pub(crate) struct DeviceInner {
     vk_ext_mesh_shader: ash::extensions::ext::MeshShader,
     vk_ext_extended_dynamic_state3: ash::extensions::ext::ExtendedDynamicState3,
     resources: RefCell<ResourceMap>,
+    usages: RefCell<UsageScope>,
     resource_groups: RefCell<ResourceGroupMap>,
+
     deletion_lists: RefCell<Vec<DeferredDeletionList>>,
     sampler_cache: RefCell<HashMap<SamplerCreateInfo, Sampler>>,
     compiler: shaderc::Compiler,
@@ -155,18 +156,6 @@ impl From<BufferId> for ResourceId {
     fn from(value: BufferId) -> Self {
         value.0
     }
-}
-
-/// Command buffers
-pub struct CommandBuffer {
-    device: Device,
-    /// Keeps referenced resources alive.
-    refs: Vec<RefCounted<ResourceId>>,
-    command_buffer: vk::CommandBuffer,
-    initial_uses: FxHashMap<ResourceId, ResourceUse>,
-    final_states: FxHashMap<ResourceId, DependencyState>,
-    barrier_builder: PipelineBarrierBuilder,
-    group_uses: Vec<GroupId>,
 }
 
 /// Graphics pipelines.
@@ -529,14 +518,6 @@ pub enum ResourceAllocation {
     Allocation {
         allocation: gpu_allocator::vulkan::Allocation,
     },
-
-    /// Memory aliasing: allocate a block of memory for the resource, which can possibly be shared
-    /// with other aliasable resources if their lifetimes do not overlap.
-    Transient {
-        device_memory: vk::DeviceMemory,
-        offset: vk::DeviceSize,
-    },
-
     /// The memory for this resource was imported or exported from/to an external handle.
     DeviceMemory { device_memory: vk::DeviceMemory },
 
@@ -618,6 +599,128 @@ pub unsafe fn create_device_and_queue(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#[derive(Debug, thiserror::Error)]
+enum UsageConflict {
+    #[error("resource {resource:?} is used as {first_use:?} and {second_use:?} in the same scope")]
+    IncompatibleUses {
+        resource: ResourceId,
+        first_use: ResourceUse,
+        second_use: ResourceUse,
+    },
+}
+
+#[derive(Copy, Clone)]
+enum ImageOrBuffer {
+    Image { image: vk::Image, format: vk::Format },
+    Buffer(vk::Buffer),
+}
+
+struct Barrier {
+    resource: ImageOrBuffer,
+    src: ResourceUse,
+    dst: ResourceUse,
+}
+
+struct Uses {
+    id: ResourceId,
+    handle: ImageOrBuffer,
+    initial_use: ResourceUse,
+    final_use: ResourceUse,
+}
+
+struct UsageScope {
+    uses: SecondaryMap<ResourceId, Uses>,
+}
+
+impl UsageScope {
+    fn new() -> Self {
+        Self {
+            uses: SecondaryMap::default(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.uses.clear();
+    }
+
+    /// Tracks the use of a resource in this scope and inserts a barrier if necessary.
+    fn insert_or_barrier(
+        &mut self,
+        resource: ResourceId,
+        handle: ImageOrBuffer,
+        use_: ResourceUse,
+        final_use: Option<ResourceUse>,
+    ) -> Option<Barrier> {
+        // No barrier necessary if it's the first use
+        if !self.uses.contains_key(resource) {
+            self.uses.insert(
+                resource,
+                Uses {
+                    id: resource,
+                    handle,
+                    initial_use: use_,
+                    final_use: final_use.unwrap_or(use_),
+                },
+            );
+            None
+        } else {
+            let src = self.uses[resource].final_use;
+            let dst = use_;
+            if src == dst && src.all_ordered() {
+                return None;
+            }
+            self.uses[resource].final_use = final_use.unwrap_or(dst);
+            Some(Barrier {
+                resource: handle,
+                src,
+                dst,
+            })
+        }
+    }
+
+    /// Tracks the use of a resource in this scope, but fails if the use cannot be merged with existing uses without a barrier.
+    fn insert_or_merge(
+        &mut self,
+        resource: ResourceId,
+        handle: ImageOrBuffer,
+        use_: ResourceUse,
+    ) -> Result<(), UsageConflict> {
+        if self.uses.contains_key(resource) {
+            let current_use = self.uses[resource].final_use;
+            if current_use != use_ || !use_.all_ordered() {
+                return Err(UsageConflict::IncompatibleUses {
+                    resource,
+                    first_use: current_use,
+                    second_use: use_,
+                });
+            }
+        } else {
+            self.uses.insert(
+                resource,
+                Uses {
+                    id: resource,
+                    handle,
+                    initial_use: use_,
+                    final_use: use_,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn merge(&mut self, other: &Self) -> Vec<Barrier> {
+        let mut barriers = Vec::new();
+        for (resource, uses) in &other.uses {
+            if let Some(barrier) = self.insert_or_barrier(resource, uses.handle, uses.initial_use, Some(uses.final_use))
+            {
+                barriers.push(barrier);
+            }
+        }
+        barriers
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
 struct DeferredDeletionList {
     // Timestamp that we should wait for on each queue before deleting the objects.
     timestamps: Vec<u64>,
@@ -735,8 +838,6 @@ pub(crate) struct Resource {
     kind: ResourceKind,
     group: Option<GroupId>,
     owner: OwnerQueue,
-    wait_semaphore: Option<SignaledSemaphore>,
-    dep_state: DependencyState,
     /// Timestamp of the last submission that accessed the resource on its owner queue.
     ///
     /// It's a value of the timeline semaphore of the queue.
@@ -774,11 +875,12 @@ struct DependencyState {
     layout: vk::ImageLayout,
 }
 
+/*
 #[derive(Copy, Clone)]
 struct ResourceUse {
     aspect: vk::ImageAspectFlags,
-    state: ResourceState,
-}
+    state: ResourceStateOld,
+}*/
 
 /// Helper to build a pipeline barrier.
 #[derive(Default)]
@@ -838,6 +940,7 @@ impl From<vk::Image> for ResourceHandle {
     }
 }
 
+/*
 fn ensure_memory_dependency(
     barriers: &mut PipelineBarrierBuilder,
     handle: ResourceHandle,
@@ -903,6 +1006,8 @@ fn ensure_memory_dependency(
     // Update the resource stage mask
     dep_state.stages = use_.state.stages;
 }
+
+*/
 
 impl Device {
     pub fn weak(&self) -> WeakDevice {

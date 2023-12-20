@@ -57,8 +57,126 @@ pub struct ImageViewInfo {
     pub component_mapping: [vk::ComponentSwizzle; 4],
 }
 
+bitflags! {
+    #[derive(Copy,Clone,Debug,PartialEq,Eq,Hash)]
+    pub struct ResourceUse: u32 {
+        /// The resource is in an unknown state.
+        const UNINITIALIZED = 1 << 0;
+
+        // Common uses
+
+        /// The source of a hardware copy.
+        const COPY_SRC = 1 << 1;
+        /// The destination of a hardware copy.
+        const COPY_DST = 1 << 2;
+        // Buffer-only uses
+
+        /// The index buffer used for drawing.
+        const INDEX = 1 << 3;
+        /// A vertex buffer used for drawing.
+        const VERTEX = 1 << 4;
+        /// A uniform buffer bound in a bind group.
+        const UNIFORM = 1 << 5;
+        /// The indirect or count buffer in a indirect draw or dispatch.
+        const INDIRECT = 1 << 6;
+        /// The argument to a read-only mapping.
+        const MAP_READ = 1 << 7;
+        /// The argument to a write-only mapping.
+        const MAP_WRITE = 1 << 8;
+        /// Read-only storage buffer usage. Corresponds to a UAV in d3d, so is exclusive, despite being read only.
+        const STORAGE_READ = 1 << 9;
+        /// Read-write or write-only storage buffer usage.
+        const STORAGE_READ_WRITE = 1 << 10;
+
+
+        /// Valid use bits for buffers.
+        const BUFFER_VALID =
+            Self::COPY_SRC.bits()
+            | Self::COPY_DST.bits()
+            | Self::INDEX.bits()
+            | Self::VERTEX.bits()
+            | Self::UNIFORM.bits()
+            | Self::INDIRECT.bits()
+            | Self::MAP_READ.bits()
+            | Self::MAP_WRITE.bits()
+            | Self::STORAGE_READ.bits()
+            | Self::STORAGE_READ_WRITE.bits();
+
+        // Image-only uses
+
+        /// Read-only sampled or fetched resource.
+        const SAMPLED_READ = 1 << 11;
+        /// The color target of a renderpass.
+        const COLOR_TARGET = 1 << 12;
+        /// Read-only depth stencil usage.
+        const DEPTH_STENCIL_READ = 1 << 13;
+        /// Read-write depth stencil usage
+        const DEPTH_STENCIL_WRITE = 1 << 14;
+        /// Storage image read.
+        const IMAGE_READ = 1 << 15;
+        /// Storage image write.
+        const IMAGE_READ_WRITE = 1 << 16;
+        /// Ready to present image to the surface.
+        const PRESENT = 1 << 17;
+
+        /// Valid use bits for images.
+        const IMAGE_VALID =
+            Self::COPY_SRC.bits()
+            | Self::COPY_DST.bits()
+            | Self::SAMPLED_READ.bits()
+            | Self::COLOR_TARGET.bits()
+            | Self::DEPTH_STENCIL_READ.bits()
+            | Self::DEPTH_STENCIL_WRITE.bits()
+            | Self::IMAGE_READ.bits()
+            | Self::IMAGE_READ_WRITE.bits()
+            | Self::PRESENT.bits();
+
+
+        /// The combination of states that a resource may be in _at the same time_.
+        const INCLUSIVE =
+            Self::COPY_SRC.bits()
+            | Self::SAMPLED_READ.bits()
+            | Self::DEPTH_STENCIL_READ.bits()
+            | Self::INDEX.bits()
+            | Self::VERTEX.bits()
+            | Self::UNIFORM.bits()
+            | Self::STORAGE_READ.bits()
+            | Self::INDIRECT.bits();
+
+        /// The combination of states that a texture must exclusively be in.
+        const EXCLUSIVE =
+            Self::COPY_DST.bits()
+            | Self::COLOR_TARGET.bits()
+            | Self::DEPTH_STENCIL_WRITE.bits()
+            | Self::STORAGE_READ.bits()
+            | Self::STORAGE_READ_WRITE.bits()
+            | Self::PRESENT.bits();
+
+        /// The combination of all usages that the are guaranteed to be be ordered by the hardware.
+        /// If a usage is ordered, then if the texture state doesn't change between draw calls, there
+        /// are no barriers needed for synchronization.
+        const ORDERED =
+            Self::INCLUSIVE.bits()
+            | Self::COLOR_TARGET.bits()
+            | Self::DEPTH_STENCIL_WRITE.bits()
+            | Self::STORAGE_READ.bits()
+            | Self::MAP_WRITE.bits();
+
+
+        /// Flag used by the wgpu-core texture tracker to say that the tracker does not know the state of the sub-resource.
+        /// This is different from UNINITIALIZED as that says the tracker does know, but the texture has not been initialized.
+        const UNKNOWN = 1 << 18;
+    }
+}
+
+impl ResourceUse {
+    pub fn all_ordered(self) -> bool {
+        Self::ORDERED.contains(self)
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
-pub struct ResourceState {
+pub struct ResourceStateOld {
     /// Stages that will access the resource.
     pub stages: vk::PipelineStageFlags2,
     /// Access flags for the resource.
@@ -67,28 +185,28 @@ pub struct ResourceState {
     pub layout: vk::ImageLayout,
 }
 
-impl ResourceState {
-    pub const TRANSFER_SRC: ResourceState = ResourceState {
+impl ResourceStateOld {
+    pub const TRANSFER_SRC: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::TRANSFER,
         access: vk::AccessFlags2::TRANSFER_READ,
         layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
     };
-    pub const TRANSFER_DST: ResourceState = ResourceState {
+    pub const TRANSFER_DST: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::TRANSFER,
         access: vk::AccessFlags2::TRANSFER_WRITE,
         layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
     };
-    pub const SHADER_READ: ResourceState = ResourceState {
+    pub const SHADER_READ: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::ALL_GRAPHICS,
         access: vk::AccessFlags2::SHADER_READ,
         layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
     };
-    pub const COLOR_ATTACHMENT_OUTPUT: ResourceState = ResourceState {
+    pub const COLOR_ATTACHMENT_OUTPUT: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
         access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
     };
-    pub const DEPTH_STENCIL_ATTACHMENT: ResourceState = ResourceState {
+    pub const DEPTH_STENCIL_ATTACHMENT: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::from_raw(
             vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
                 | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
@@ -96,17 +214,17 @@ impl ResourceState {
         access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
         layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
     };
-    pub const VERTEX_BUFFER: ResourceState = ResourceState {
+    pub const VERTEX_BUFFER: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::VERTEX_INPUT,
         access: vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
         layout: vk::ImageLayout::UNDEFINED,
     };
-    pub const INDEX_BUFFER: ResourceState = ResourceState {
+    pub const INDEX_BUFFER: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::VERTEX_INPUT,
         access: vk::AccessFlags2::INDEX_READ,
         layout: vk::ImageLayout::UNDEFINED,
     };
-    pub const PRESENT: ResourceState = ResourceState {
+    pub const PRESENT: ResourceStateOld = ResourceStateOld {
         stages: vk::PipelineStageFlags2::NONE,
         access: vk::AccessFlags2::NONE,
         layout: vk::ImageLayout::PRESENT_SRC_KHR,
