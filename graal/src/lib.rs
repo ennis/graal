@@ -5,6 +5,8 @@ use std::{
     mem,
     ops::{Bound, RangeBounds},
 };
+use std::os::raw::c_void;
+use std::ptr::NonNull;
 
 // reexports
 pub use ash::{self, vk};
@@ -23,6 +25,7 @@ pub use instance::*;
 //pub use platform::*;
 pub use surface::*;
 pub use types::*;
+pub use command::*;
 
 mod device;
 mod instance;
@@ -31,6 +34,8 @@ mod platform_impl;
 mod surface;
 mod types;
 pub mod util;
+mod command;
+mod tracker;
 
 pub mod prelude {
     pub use crate::{
@@ -42,8 +47,344 @@ pub mod prelude {
         PolygonMode, PreRasterizationShaders, PrimitiveTopology, Queue, RasterizationState, Rect2D, SampledImage,
         Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StaticArguments,
         StaticAttachments, StencilState, TypedBuffer, Vertex, VertexBufferDescriptor, VertexBufferLayoutDescription,
-        VertexInputAttributeDescription, VertexInputRate, VertexInputState,
+        VertexInputAttributeDescription, VertexInputRate, VertexInputState, RenderEncoder
     };
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+/// Represents a swap chain.
+#[derive(Debug)]
+pub struct Swapchain {
+    pub handle: vk::SwapchainKHR,
+    pub surface: vk::SurfaceKHR,
+    pub format: vk::SurfaceFormatKHR,
+    pub width: u32,
+    pub height: u32,
+    pub images: Vec<vk::Image>,
+}
+
+/// Contains information about an image in a swapchain.
+#[derive(Debug)]
+pub struct SwapchainImage {
+    /// Handle of the swapchain that owns this image.
+    pub swapchain: vk::SwapchainKHR,
+    /// Index of the image in the swap chain.
+    pub index: u32,
+    pub image: Image,
+}
+
+
+/// Graphics pipelines.
+pub struct GraphicsPipeline {
+    pub(crate) device: Device,
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) pipeline_layout: vk::PipelineLayout,
+}
+
+impl GraphicsPipeline {
+    pub(crate) fn new(device: Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout) -> Self {
+        Self {
+            device,
+            pipeline,
+            pipeline_layout,
+        }
+    }
+
+    pub fn pipeline(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+}
+
+/// Samplers
+#[derive(Clone, Debug)]
+pub struct Sampler {
+    // A weak ref is sufficient, the device already owns samplers in its cache
+    device: WeakDevice,
+    sampler: vk::Sampler,
+}
+
+impl Sampler {
+    pub(crate) fn new(device: &Device, sampler: vk::Sampler) -> Sampler {
+        Sampler {
+            device: device.weak(),
+            sampler,
+        }
+    }
+
+    pub fn handle(&self) -> vk::Sampler {
+        // FIXME: check if the device is still alive, otherwise the sampler isn't valid anymore
+        //assert!(self.device.strong_count() > 0);
+        self.sampler
+    }
+}
+
+/// Wrapper around a Vulkan buffer.
+#[derive(Debug)]
+pub struct Buffer {
+    device: Device,
+    id: RefCounted<BufferId>,
+    handle: vk::Buffer,
+    size: u64,
+    usage: BufferUsage,
+    mapped_ptr: Option<NonNull<c_void>>,
+}
+
+impl Buffer {
+    /*fn new(
+        device: Device,
+        id: RefCounted<BufferId>,
+        handle: vk::Buffer,
+        size: usize,
+        usage: vk::BufferUsageFlags,
+        mapped_ptr: Option<NonNull<c_void>>,
+    ) -> Self {
+        Self {
+            device,
+            id,
+            handle,
+            size,
+            usage,
+            mapped_ptr,
+        }
+    }*/
+
+    pub fn id(&self) -> RefCounted<BufferId> {
+        self.id.clone()
+    }
+
+    /// Returns the size of the buffer in bytes.
+    pub fn byte_size(&self) -> u64 {
+        self.size
+    }
+
+    /// Returns the usage flags of the buffer.
+    pub fn usage(&self) -> BufferUsage {
+        self.usage
+    }
+
+    /// Returns the buffer handle.
+    pub fn handle(&self) -> vk::Buffer {
+        self.handle
+    }
+
+    /// Returns the device on which the buffer was created.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
+    pub fn mapped_data(&self) -> Option<*mut u8> {
+        self.mapped_ptr.map(|ptr| ptr.as_ptr() as *mut u8)
+    }
+}
+
+/// Wrapper around a Vulkan image.
+#[derive(Debug)]
+pub struct Image {
+    device: Device,
+    id: RefCounted<ImageId>,
+    handle: vk::Image,
+    usage: ImageUsage,
+    type_: ImageType,
+    format: Format,
+    size: Size3D,
+}
+
+impl Image {
+    /*pub(super) fn new(
+        device: Device,
+        id: RefCounted<ImageId>,
+        handle: vk::Image,
+        usage: vk::ImageUsageFlags,
+        type_: vk::ImageType,
+        format: vk::Format,
+        extent: vk::Extent3D,
+    ) -> Self {
+        Image {
+            device,
+            id,
+            handle,
+            usage,
+            type_,
+            format,
+            extent,
+        }
+    }*/
+
+    /// Returns the `vk::ImageType` of the image.
+    pub fn image_type(&self) -> ImageType {
+        self.type_
+    }
+
+    /// Returns the `vk::Format` of the image.
+    pub fn format(&self) -> Format {
+        self.format
+    }
+
+    /// Returns the `vk::Extent3D` of the image.
+    pub fn size(&self) -> Size3D {
+        self.size
+    }
+
+    pub fn width(&self) -> u32 {
+        self.size.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.size.height
+    }
+
+    pub fn depth(&self) -> u32 {
+        self.size.depth
+    }
+
+    /// Returns the usage flags of the image.
+    pub fn usage(&self) -> ImageUsage {
+        self.usage
+    }
+
+    pub fn id(&self) -> RefCounted<ImageId> {
+        self.id.clone()
+    }
+
+    /// Returns the image handle.
+    pub fn handle(&self) -> vk::Image {
+        self.handle
+    }
+
+    /// Creates an image view for the base mip level of this image,
+    /// suitable for use as a rendering attachment.
+    pub fn create_top_level_view(&self) -> ImageView {
+        self.create_view(&ImageViewInfo {
+            view_type: match self.image_type() {
+                ImageType::Image2D => vk::ImageViewType::TYPE_2D,
+                _ => panic!("unsupported image type for attachment"),
+            },
+            format: self.format(),
+            subresource_range: ImageSubresourceRange {
+                aspect_mask: aspects_for_format(self.format()),
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            component_mapping: [
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ComponentSwizzle::IDENTITY,
+                vk::ComponentSwizzle::IDENTITY,
+            ],
+        })
+    }
+
+    /// Creates an `ImageView` object.
+    fn create_view(&self, info: &ImageViewInfo) -> ImageView {
+        // TODO: check that format is compatible
+
+        // FIXME: support non-zero base mip level
+        if info.subresource_range.base_mip_level != 0 {
+            unimplemented!("non-zero base mip level");
+        }
+
+        let create_info = vk::ImageViewCreateInfo {
+            flags: vk::ImageViewCreateFlags::empty(),
+            image: self.handle,
+            view_type: info.view_type,
+            format: info.format,
+            components: vk::ComponentMapping {
+                r: info.component_mapping[0],
+                g: info.component_mapping[1],
+                b: info.component_mapping[2],
+                a: info.component_mapping[3],
+            },
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: info.subresource_range.aspect_mask,
+                base_mip_level: info.subresource_range.base_mip_level,
+                level_count: info.subresource_range.level_count,
+                base_array_layer: info.subresource_range.base_array_layer,
+                layer_count: info.subresource_range.layer_count,
+            },
+            ..Default::default()
+        };
+
+        // SAFETY: the device is valid, the create info is valid
+        let handle = unsafe {
+            self.device
+                .create_image_view(&create_info, None)
+                .expect("failed to create image view")
+        };
+
+        ImageView {
+            device: self.device.clone(),
+            parent_image: self.id.clone(),
+            handle,
+            image_handle: self.handle,
+            format: info.format,
+            original_format: self.format,
+            // TODO: size of mip level
+            size: self.size,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct ImageView {
+    device: Device,
+    parent_image: RefCounted<ImageId>,
+    image_handle: vk::Image,
+    handle: vk::ImageView,
+    format: Format,
+    original_format: Format,
+    size: Size3D,
+}
+
+impl ImageView {
+    /// Returns the format of the image view.
+    pub fn format(&self) -> vk::Format {
+        self.format
+    }
+
+    pub fn size(&self) -> Size3D {
+        self.size
+    }
+
+    pub fn width(&self) -> u32 {
+        self.size.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.size.height
+    }
+
+    pub fn handle(&self) -> vk::ImageView {
+        self.handle
+    }
+
+    fn image_handle(&self) -> vk::Image {
+        self.image_handle
+    }
+
+    fn original_format(&self) -> vk::Format {
+        self.original_format
+    }
+
+    fn parent_id(&self) -> RefCounted<ImageId> {
+        self.parent_image.clone()
+    }
+
+    pub fn as_read_write_storage(&self) -> ReadWriteStorageImage {
+        ReadWriteStorageImage { image_view: self }
+    }
+}
+
+impl Drop for ImageView {
+    fn drop(&mut self) {
+        unsafe {
+            self.device.delete_later(self.handle);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -505,10 +846,7 @@ pub trait Attachments {
     fn color_attachments(&self) -> impl Iterator<Item = Attachment<'_>> + '_;
 
     /// Returns the depth attachment.
-    fn depth_attachment(&self) -> Option<Attachment>;
-
-    /// Returns the stencil attachment.
-    fn stencil_attachment(&self) -> Option<Attachment>;
+    fn depth_stencil_attachment(&self) -> Option<Attachment>;
 }
 
 /// Types that describe a color, depth, or stencil attachment to a rendering operation.
@@ -754,6 +1092,125 @@ pub fn aspects_for_format(fmt: vk::Format) -> vk::ImageAspectFlags {
         vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
     } else {
         vk::ImageAspectFlags::COLOR
+    }
+}
+
+fn map_buffer_use_to_barrier(usage: ResourceUse) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    let mut stages = vk::PipelineStageFlags2::empty();
+    let mut access = vk::AccessFlags2::empty();
+    let shader_stages = vk::PipelineStageFlags2::VERTEX_SHADER
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER
+        | vk::PipelineStageFlags2::COMPUTE_SHADER;
+
+    if usage.contains(ResourceUse::MAP_READ) {
+        stages |= vk::PipelineStageFlags2::HOST;
+        access |= vk::AccessFlags2::HOST_READ;
+    }
+    if usage.contains(ResourceUse::MAP_WRITE) {
+        stages |= vk::PipelineStageFlags2::HOST;
+        access |= vk::AccessFlags2::HOST_WRITE;
+    }
+    if usage.contains(ResourceUse::COPY_SRC) {
+        stages |= vk::PipelineStageFlags2::TRANSFER;
+        access |= vk::AccessFlags2::TRANSFER_READ;
+    }
+    if usage.contains(ResourceUse::COPY_DST) {
+        stages |= vk::PipelineStageFlags2::TRANSFER;
+        access |= vk::AccessFlags2::TRANSFER_WRITE;
+    }
+    if usage.contains(ResourceUse::UNIFORM) {
+        stages |= shader_stages;
+        access |= vk::AccessFlags2::UNIFORM_READ;
+    }
+    if usage.intersects(ResourceUse::STORAGE_READ) {
+        stages |= shader_stages;
+        access |= vk::AccessFlags2::SHADER_READ;
+    }
+    if usage.intersects(ResourceUse::STORAGE_READ_WRITE) {
+        stages |= shader_stages;
+        access |= vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
+    }
+    if usage.contains(ResourceUse::INDEX) {
+        stages |= vk::PipelineStageFlags2::VERTEX_INPUT;
+        access |= vk::AccessFlags2::INDEX_READ;
+    }
+    if usage.contains(ResourceUse::VERTEX) {
+        stages |= vk::PipelineStageFlags2::VERTEX_INPUT;
+        access |= vk::AccessFlags2::VERTEX_ATTRIBUTE_READ;
+    }
+    if usage.contains(ResourceUse::INDIRECT) {
+        stages |= vk::PipelineStageFlags2::DRAW_INDIRECT;
+        access |= vk::AccessFlags2::INDIRECT_COMMAND_READ;
+    }
+
+    (stages, access)
+}
+
+fn map_texture_usage_to_barrier(usage: ResourceUse) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+    let mut stages = vk::PipelineStageFlags2::empty();
+    let mut access = vk::AccessFlags2::empty();
+    let shader_stages = vk::PipelineStageFlags2::VERTEX_SHADER
+        | vk::PipelineStageFlags2::FRAGMENT_SHADER
+        | vk::PipelineStageFlags2::COMPUTE_SHADER;
+
+    if usage.contains(ResourceUse::COPY_SRC) {
+        stages |= vk::PipelineStageFlags2::TRANSFER;
+        access |= vk::AccessFlags2::TRANSFER_READ;
+    }
+    if usage.contains(ResourceUse::COPY_DST) {
+        stages |= vk::PipelineStageFlags2::TRANSFER;
+        access |= vk::AccessFlags2::TRANSFER_WRITE;
+    }
+    if usage.contains(ResourceUse::SAMPLED_READ) {
+        stages |= shader_stages;
+        access |= vk::AccessFlags2::SHADER_READ;
+    }
+    if usage.contains(ResourceUse::COLOR_TARGET) {
+        stages |= vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+        access |= vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
+    }
+    if usage.intersects(ResourceUse::DEPTH_STENCIL_READ) {
+        stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+        access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ;
+    }
+    if usage.intersects(ResourceUse::DEPTH_STENCIL_WRITE) {
+        stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+        access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+    }
+    if usage.contains(ResourceUse::STORAGE_READ) {
+        stages |= shader_stages;
+        access |= vk::AccessFlags2::SHADER_READ;
+    }
+    if usage.contains(ResourceUse::STORAGE_READ_WRITE) {
+        stages |= shader_stages;
+        access |= vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
+    }
+
+    if usage == ResourceUse::UNINITIALIZED || usage == ResourceUse::PRESENT {
+        (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty())
+    } else {
+        (stages, access)
+    }
+}
+
+fn map_texture_usage_to_layout(usage: ResourceUse, format: Format) -> vk::ImageLayout {
+    let is_color = aspects_for_format(format).contains(vk::ImageAspectFlags::COLOR);
+    match usage {
+        ResourceUse::UNINITIALIZED => vk::ImageLayout::UNDEFINED,
+        ResourceUse::COPY_SRC => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ResourceUse::COPY_DST => vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ResourceUse::SAMPLED_READ if is_color => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ResourceUse::COLOR_TARGET => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ResourceUse::DEPTH_STENCIL_WRITE => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+        _ => {
+            if usage == ResourceUse::PRESENT {
+                vk::ImageLayout::PRESENT_SRC_KHR
+            } else if is_color {
+                vk::ImageLayout::GENERAL
+            } else {
+                vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            }
+        }
     }
 }
 

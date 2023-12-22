@@ -413,10 +413,8 @@ impl From<PipelineBindPoint> for vk::PipelineBindPoint {
 pub trait StaticAttachments {
     /// Color attachment formats.
     const COLOR: &'static [vk::Format];
-    /// Depth attachment format.
-    const DEPTH: Option<vk::Format>;
-    /// Stencil attachment format.
-    const STENCIL: Option<vk::Format>;
+    /// Depth stencil attachment format.
+    const DEPTH_STENCIL: Option<vk::Format>;
 }
 
 #[derive(Clone, Copy, Debug)]

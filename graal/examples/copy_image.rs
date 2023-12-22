@@ -1,4 +1,5 @@
-use std::{path::Path, time::Duration};
+use std::{path::Path, ptr, time::Duration};
+use image::DynamicImage;
 
 use raw_window_handle::HasRawWindowHandle;
 use winit::{
@@ -13,46 +14,22 @@ use graal::{
 };
 
 fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipmaps: bool) -> Image {
-    use openimageio::{ImageInput, TypeDesc};
 
     let path = path.as_ref();
     let device = queue.device().clone();
 
-    let image_input = ImageInput::open(path).expect("could not open image file");
-    let spec = image_input.spec();
+    let dyn_image = image::open(path).expect("could not open image file");
 
-    let nchannels = spec.num_channels();
-    let format_typedesc = spec.format();
-    let width = spec.width();
-    let height = spec.height();
-
-    if nchannels > 4 {
-        panic!("unsupported number of channels: {}", nchannels);
-    }
-
-    let (vk_format, bpp) = match (format_typedesc, nchannels) {
-        (TypeDesc::U8, 1) => (vk::Format::R8_UNORM, 1usize),
-        (TypeDesc::U8, 2) => (vk::Format::R8G8_UNORM, 2usize),
-        (TypeDesc::U8, 3) => (vk::Format::R8G8B8A8_UNORM, 4usize), // RGB8 not very well supported
-        (TypeDesc::U8, 4) => (vk::Format::R8G8B8A8_UNORM, 4usize),
-        (TypeDesc::U16, 1) => (vk::Format::R16_UNORM, 2usize),
-        (TypeDesc::U16, 2) => (vk::Format::R16G16_UNORM, 4usize),
-        (TypeDesc::U16, 3) => (vk::Format::R16G16B16A16_UNORM, 8usize),
-        (TypeDesc::U16, 4) => (vk::Format::R16G16B16A16_UNORM, 8usize),
-        (TypeDesc::U32, 1) => (vk::Format::R32_UINT, 4usize),
-        (TypeDesc::U32, 2) => (vk::Format::R32G32_UINT, 8usize),
-        (TypeDesc::U32, 3) => (vk::Format::R32G32B32A32_UINT, 16usize),
-        (TypeDesc::U32, 4) => (vk::Format::R32G32B32A32_UINT, 16usize),
-        (TypeDesc::HALF, 1) => (vk::Format::R16_SFLOAT, 2usize),
-        (TypeDesc::HALF, 2) => (vk::Format::R16G16_SFLOAT, 4usize),
-        (TypeDesc::HALF, 3) => (vk::Format::R16G16B16A16_SFLOAT, 8usize),
-        (TypeDesc::HALF, 4) => (vk::Format::R16G16B16A16_SFLOAT, 8usize),
-        (TypeDesc::FLOAT, 1) => (vk::Format::R32_SFLOAT, 4usize),
-        (TypeDesc::FLOAT, 2) => (vk::Format::R32G32_SFLOAT, 8usize),
-        (TypeDesc::FLOAT, 3) => (vk::Format::R32G32B32A32_SFLOAT, 16usize),
-        (TypeDesc::FLOAT, 4) => (vk::Format::R32G32B32A32_SFLOAT, 16usize),
-        _ => panic!("unsupported image format"),
+    let (vk_format, bpp) = match dyn_image {
+        DynamicImage::ImageLuma8(_) => (vk::Format::R8_UNORM, 1usize),
+        DynamicImage::ImageLumaA8(_) => (vk::Format::R8G8_UNORM, 2usize),
+        DynamicImage::ImageRgb8(_) => (vk::Format::R8G8B8_SRGB, 3usize),
+        DynamicImage::ImageRgba8(_) => (vk::Format::R8G8B8A8_SRGB, 4usize),
+        _ => unimplemented!()
     };
+
+    let width = dyn_image.width();
+    let height = dyn_image.height();
 
     let mip_levels = graal::mip_level_count(width, height);
 
@@ -85,16 +62,7 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipm
 
     // read image data
     unsafe {
-        image_input
-            .read_unchecked(
-                0,
-                0,
-                0..nchannels,
-                format_typedesc,
-                staging_buffer.mapped_data().unwrap(),
-                bpp,
-            )
-            .expect("failed to read image");
+        ptr::copy_nonoverlapping(dyn_image.as_bytes().as_ptr(), staging_buffer.mapped_data().unwrap(), byte_size as usize);
     }
 
     let mut cmd_buf = queue.create_command_buffer();
@@ -176,7 +144,7 @@ fn main() {
 
                         let image = load_image(
                             &mut queue,
-                            "data/haniyasushin_keiki.jpg",
+                            "data/yukari.png",
                             ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
                             false,
                         );

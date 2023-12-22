@@ -4,14 +4,12 @@ use std::{collections::VecDeque, ffi::c_void, mem, ptr, time::Duration};
 use ash::prelude::VkResult;
 use tracing::debug;
 
-use crate::{
-    device::{
-        command_buffer::{emit_barriers, CommandBuffer},
-        Barrier, Device, ImageOrBuffer, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder, ResourceAllocation,
-        ResourceHandle, ResourceKind, ResourceRegistrationInfo, Swapchain, SwapchainImage,
-    },
-    vk, Image, ImageType, ImageUsage, ResourceStateOld, ResourceUse, Size3D,
-};
+use crate::{device::{
+    Device, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder, ResourceAllocation,
+    ResourceHandle, ResourceKind, ResourceRegistrationInfo, Swapchain,
+}, vk, Image, ImageType, ImageUsage, ResourceStateOld, ResourceUse, Size3D, SwapchainImage};
+use crate::command::CommandBuffer;
+use crate::tracker::{emit_pipeline_barrier, Tracker};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -240,20 +238,7 @@ impl Queue {
 
         // submit a command buffer for transition to PRESENT layout and "render finished" semaphore
         let mut cb = self.create_command_buffer();
-        {
-            let mut usages = self.device.inner.usages.borrow_mut();
-            if let Some(barrier) = usages.insert_or_barrier(
-                swapchain_image.image.id.value.into(),
-                ImageOrBuffer::Image {
-                    image: swapchain_image.image.handle,
-                    format: swapchain_image.image.format,
-                },
-                ResourceUse::PRESENT,
-                None,
-            ) {
-                emit_barriers(&self.device, cb.command_buffer, &[barrier]);
-            }
-        }
+        cb.tracker.use_image(&swapchain_image.image, ResourceUse::PRESENT, true).unwrap();
 
         self.submit_raw(
             [cb],
@@ -263,7 +248,6 @@ impl Queue {
             }],
         )?;
 
-        // build present info that waits on the batch that was just submitted
         let present_info = vk::PresentInfoKHR {
             wait_semaphore_count: 1,
             p_wait_semaphores: &render_finished,
@@ -351,18 +335,21 @@ impl Queue {
         waits: &[SemaphoreWait],
         signals: &[SemaphoreSignal],
     ) -> VkResult<()> {
-        // Insert pipeline barriers between command buffers
         let mut resources = self.device.inner.resources.borrow_mut();
-        let mut global_usage_scope = self.device.inner.usages.borrow_mut();
+        let mut global_tracker = self.device.inner.tracker.borrow_mut();
         let mut command_buffers = vec![];
 
         for cb in cmd_bufs.into_iter() {
-            let cb: CommandBuffer = cb;
+            let cb: CommandBuffer = cb; // intellisense workaround
+
             // finish the command buffer
             self.device.raw().end_command_buffer(cb.command_buffer)?;
 
-            let barriers = global_usage_scope.merge(&cb.usage_scope);
-            if !barriers.is_empty() {
+            // update the global resource tracker with the new states
+            let pipeline_barrier = global_tracker.merge(&cb.tracker);
+
+            // if necessary, insert a fixup command buffer to emit necessary barriers before the cb
+            if !pipeline_barrier.is_empty() {
                 let barrier_cb = self.current.cb_alloc.alloc(&self.device.raw());
                 unsafe {
                     self.device
@@ -374,15 +361,18 @@ impl Queue {
                             },
                         )
                         .unwrap();
-                    emit_barriers(&self.device, barrier_cb, &barriers);
+                    emit_pipeline_barrier(&self.device, barrier_cb, &pipeline_barrier);
                     self.device.end_command_buffer(barrier_cb).unwrap();
                 }
                 command_buffers.push(barrier_cb);
             }
 
+            // update timestamp of used resources
             for resource in cb.refs.iter() {
                 let resource = &mut resources[resource.value];
                 resource.timestamp = self.current.timestamp;
+                // TODO ownership transfer
+                resource.owner = OwnerQueue::Exclusive(self.global_index);
             }
 
             command_buffers.push(cb.command_buffer);

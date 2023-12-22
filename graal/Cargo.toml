@@ -39,7 +39,7 @@ winit = "0.29.4"
 obj = "0.10.2"
 glam = "0.24.2"
 inline-spirv = "0.1.4"
-openimageio = { path = "../../openimageio-rs" }
+image = "0.24.7"
 tracing-subscriber = { version = "0.3.18", features = ["fmt", "env-filter"] }
 
 [build-dependencies]

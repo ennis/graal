@@ -12,8 +12,9 @@ use crate::{
     instance::{get_vulkan_entry, get_vulkan_instance, vk_khr_surface},
     platform_impl, vk,
 };
+use crate::tracker::Tracker;
 
-use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig, UsageScope};
+use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig};
 
 struct PhysicalDeviceAndProperties {
     physical_device: vk::PhysicalDevice,
@@ -259,7 +260,7 @@ impl Device {
                 vk_ext_mesh_shader,
                 vk_ext_extended_dynamic_state3,
                 resources: RefCell::new(Default::default()),
-                usages: RefCell::new(UsageScope::new()),
+                tracker: RefCell::new(Tracker::new()),
                 resource_groups: RefCell::new(Default::default()),
                 deletion_lists: RefCell::new(vec![]),
                 sampler_cache: RefCell::new(Default::default()),

@@ -3,12 +3,13 @@ use std::{mem, ptr};
 
 use ash::vk::Handle;
 use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
+use tracing::debug;
 
 use crate::{
     aspects_for_format,
     device::{BufferId, Device, GroupId, ImageId, ResourceAllocation, ResourceId},
-    is_write_access, vk, Buffer, BufferCreateInfo, BufferUsage, Image, ImageCreateInfo, MemoryLocation, Size3D,
-    TypedBuffer,
+    is_write_access, vk, Buffer, BufferCreateInfo, BufferUsage, Image, ImageCreateInfo, MemoryLocation, ResourceUse,
+    Size3D, TypedBuffer,
 };
 
 use super::{
@@ -122,11 +123,24 @@ impl Device {
 
     /// Registers an existing buffer resource.
     pub unsafe fn register_buffer_resource(&self, info: BufferRegistrationInfo) -> RefCounted<BufferId> {
-        self.register_resource(
-            info.resource,
-            ResourceKind::Buffer(BufferResource { handle: info.handle }),
-        )
-        .map(BufferId)
+        let id = self
+            .register_resource(
+                info.resource,
+                ResourceKind::Buffer(BufferResource { handle: info.handle }),
+            )
+            .map(BufferId);
+        self.inner
+            .tracker
+            .borrow_mut()
+            .use_buffer_raw(
+                id.value,
+                info.handle,
+                ResourceUse::UNINITIALIZED,
+                ResourceUse::UNINITIALIZED,
+                false,
+            )
+            .expect("invalid resource id");
+        id
     }
 
     /*/// Destroys a buffer resource.
@@ -227,15 +241,29 @@ impl Device {
 
     /// Registers an existing image resource.
     pub unsafe fn register_image_resource(&self, info: ImageRegistrationInfo) -> RefCounted<ImageId> {
-        self.register_resource(
-            info.resource,
-            ResourceKind::Image(ImageResource {
-                handle: info.handle,
-                format: info.format,
-                all_aspects: aspects_for_format(info.format),
-            }),
-        )
-        .map(ImageId)
+        let id = self
+            .register_resource(
+                info.resource,
+                ResourceKind::Image(ImageResource {
+                    handle: info.handle,
+                    format: info.format,
+                    all_aspects: aspects_for_format(info.format),
+                }),
+            )
+            .map(ImageId);
+        self.inner
+            .tracker
+            .borrow_mut()
+            .use_image_inner(
+                id.value,
+                info.handle,
+                info.format,
+                ResourceUse::UNINITIALIZED,
+                ResourceUse::UNINITIALIZED,
+                false,
+            )
+            .expect("invalid resource id");
+        id
     }
 
     /*/// Destroys an image resource.
@@ -405,6 +433,8 @@ impl Device {
             return;
         }
 
+        eprintln!("destroying resource");
+
         // destroy the object
         match resource.kind {
             ResourceKind::Buffer(ref buf) => self.inner.device.destroy_buffer(buf.handle, None),
@@ -445,7 +475,6 @@ impl Device {
             owner: OwnerQueue::None,
             timestamp: 0,
         });
-        //self.inner.usages.borrow_mut().uses.insert(id, Default::default());
         self.set_debug_object_name(object_type, object_handle, info.name, None);
         RefCounted::new(id, ref_count)
     }

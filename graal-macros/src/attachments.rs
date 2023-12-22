@@ -11,14 +11,11 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
     let mut color_attachments = vec![];
     let mut depth_format = None;
     let mut depth_attachment = None;
-    let mut stencil_format = None;
-    let mut stencil_attachment = None;
 
     for (_i, f) in fields.iter().enumerate() {
         let mut is_attachment = false;
         let mut is_color = false;
-        let mut is_depth = false;
-        let mut is_stencil = false;
+        let mut is_depth_stencil = false;
         let mut load_op = None;
         let mut store_op = None;
         let mut clear_color = None;
@@ -37,13 +34,13 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
 
                     if meta.path.is_ident("depth") {
                         //meta.parse_nested_meta(|meta| Err(meta.error("invalid syntax for `depth`")))?;
-                        is_depth = true;
+                        is_depth_stencil = true;
                         return Ok(());
                     }
 
                     if meta.path.is_ident("stencil") {
                         //meta.parse_nested_meta(|meta| Err(meta.error("invalid syntax for `stencil`")))?;
-                        is_stencil = true;
+                        is_depth_stencil = true;
                         return Ok(());
                     }
 
@@ -103,7 +100,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                             depth: #depth,
                             stencil: 0,
                         }));
-                        is_depth = true;
+                        is_depth_stencil = true;
                         return Ok(());
                     }
 
@@ -119,7 +116,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                             depth: 0.0,
                             stencil: #stencil,
                         }));
-                        is_stencil = true;
+                        is_depth_stencil = true;
                         return Ok(());
                     }
 
@@ -135,8 +132,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                             depth: #depth_stencil.0,
                             stencil: #depth_stencil.1,
                         }));
-                        is_depth = true;
-                        is_stencil = true;
+                        is_depth_stencil = true;
                         return Ok(());
                     }
 
@@ -149,19 +145,13 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
         if !is_attachment {
             return Err(syn::Error::new(f.span(), "missing `#[attachment(...)]` attribute"));
         }
-        if is_color && is_depth {
+        if is_color && is_depth_stencil {
             return Err(syn::Error::new(
                 f.span(),
-                "cannot be both a color and a depth attachment",
+                "cannot be both a color and a depth-stencil attachment",
             ));
         }
-        if is_color && is_stencil {
-            return Err(syn::Error::new(
-                f.span(),
-                "cannot be both a color and a stencil attachment",
-            ));
-        }
-        if !(is_color || is_depth || is_stencil) {
+        if !(is_color || is_depth_stencil) {
             // If unspecified, assume that this is a color attachment.
             is_color = true;
         }
@@ -173,7 +163,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
             ));
         }
 
-        if (is_depth || is_stencil) && clear_color.is_some() {
+        if is_depth_stencil && clear_color.is_some() {
             return Err(syn::Error::new(
                 f.span(),
                 "cannot specify `clear_color` for a depth or stencil attachment",
@@ -210,7 +200,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                     } else {
                         quote!(None)
                     }
-                } else if is_depth || is_stencil {
+                } else if is_depth_stencil {
                     if let Some(clear_depth_stencil) = clear_depth_stencil {
                         quote!(Some(#CRATE::vk::ClearValue { depth_stencil: #clear_depth_stencil }))
                     } else {
@@ -237,18 +227,12 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
         if is_color {
             color_formats.push(format);
             color_attachments.push(attachment_wrapper);
-        } else if is_depth {
+        } else if is_depth_stencil {
             if depth_format.is_some() {
                 return Err(syn::Error::new(f.span(), "more than one depth attachment specified"));
             }
             depth_attachment = Some(quote!(Some(#attachment_wrapper)));
             depth_format = Some(quote!(Some(#format)));
-        } else if is_stencil {
-            if stencil_format.is_some() {
-                return Err(syn::Error::new(f.span(), "more than one stencil attachment specified"));
-            }
-            stencil_attachment = Some(quote!(Some(#attachment_wrapper)));
-            stencil_format = Some(quote!(Some(#format)));
         }
     }
 
@@ -256,17 +240,14 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
     let (impl_generics, ty_generics, where_clause) = derive_input.generics.split_for_impl();
 
     let depth_format = depth_format.unwrap_or(quote! { None });
-    let stencil_format = stencil_format.unwrap_or(quote! { None });
     let depth_attachment = depth_attachment.unwrap_or(quote! { None });
-    let stencil_attachment = stencil_attachment.unwrap_or(quote! { None });
 
     let color_attachment_seq = 0..color_attachments.len();
 
     Ok(quote! {
         impl #impl_generics #CRATE::StaticAttachments for #struct_name #ty_generics #where_clause {
             const COLOR: &'static [#CRATE::vk::Format] = &[#(#color_formats),*];
-            const DEPTH: Option<#CRATE::vk::Format> = #depth_format;
-            const STENCIL: Option<#CRATE::vk::Format> = #stencil_format;
+            const DEPTH_STENCIL: Option<#CRATE::vk::Format> = #depth_format;
         }
 
         impl #impl_generics #CRATE::Attachments for #struct_name #ty_generics #where_clause {
@@ -282,12 +263,8 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                 })
             }
 
-            fn depth_attachment(&self) -> Option<#CRATE::Attachment> {
+            fn depth_stencil_attachment(&self) -> Option<#CRATE::Attachment> {
                 #depth_attachment
-            }
-
-            fn stencil_attachment(&self) -> Option<#CRATE::Attachment> {
-                #stencil_attachment
             }
         }
     })
