@@ -1,5 +1,5 @@
 use std::{
-    ffi::c_void,
+    ffi::{c_void, CString},
     mem,
     mem::MaybeUninit,
     ops::{Deref, DerefMut},
@@ -7,16 +7,19 @@ use std::{
 };
 
 use crate::{
-    map_texture_usage_to_layout, tracker::Tracker, vk, ArgumentKind, Arguments, Attachments, Buffer, Device, Format,
-    Image, ImageView, RefCounted, ResourceId, ResourceUse, VertexInput,
+    map_texture_usage_to_layout,
+    tracker::{emit_pipeline_barrier, Tracker},
+    vk, vk_ext_debug_utils, ArgumentKind, Arguments, Attachments, Buffer, Device, Format, Image, ImageView, RefCounted,
+    ResourceId, ResourceUse, VertexInput,
 };
-use crate::tracker::emit_pipeline_barrier;
 
 mod blit;
 mod render;
+mod compute;
 
 pub use blit::BlitCommandEncoder;
 pub use render::RenderEncoder;
+pub use compute::ComputeEncoder;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -147,6 +150,7 @@ unsafe fn do_cmd_push_descriptor_sets(
     }
 }
 
+// TODO move this to EncoderBase
 fn do_cmd_push_constants(
     device: &Device,
     command_buffer: vk::CommandBuffer,
@@ -270,7 +274,9 @@ impl<'a> EncoderBase<'a> {
     }
 
     pub fn use_image_view(&mut self, image_view: &ImageView, state: ResourceUse) {
-        self.command_buffer.refs.push(image_view.parent_image.clone().map(Into::into));
+        self.command_buffer
+            .refs
+            .push(image_view.parent_image.clone().map(Into::into));
         self.tracker
             .use_image_view(image_view, state, false)
             .expect("usage conflict");
@@ -312,5 +318,26 @@ impl CommandBuffer {
 
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    pub fn push_debug_group(&mut self, label: &str) {
+        unsafe {
+            let label = CString::new(label).unwrap();
+
+            vk_ext_debug_utils().cmd_begin_debug_utils_label(
+                self.command_buffer,
+                &vk::DebugUtilsLabelEXT {
+                    p_label_name: label.as_ptr(),
+                    color: [0.0, 0.0, 0.0, 0.0],
+                    ..Default::default()
+                },
+            );
+        }
+    }
+
+    pub fn pop_debug_group(&mut self) {
+        unsafe {
+            vk_ext_debug_utils().cmd_end_debug_utils_label(self.command_buffer);
+        }
     }
 }

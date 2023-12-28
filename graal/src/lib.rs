@@ -47,7 +47,7 @@ pub mod prelude {
         PolygonMode, PreRasterizationShaders, PrimitiveTopology, Queue, RasterizationState, Rect2D, SampledImage,
         Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StaticArguments,
         StaticAttachments, StencilState, TypedBuffer, Vertex, VertexBufferDescriptor, VertexBufferLayoutDescription,
-        VertexInputAttributeDescription, VertexInputRate, VertexInputState, RenderEncoder
+        VertexInputAttributeDescription, VertexInputRate, VertexInputState, RenderEncoder, ComputeEncoder
     };
 }
 
@@ -96,6 +96,29 @@ impl GraphicsPipeline {
         self.pipeline
     }
 }
+
+
+/// Compute pipelines.
+pub struct ComputePipeline {
+    pub(crate) device: Device,
+    pub(crate) pipeline: vk::Pipeline,
+    pub(crate) pipeline_layout: vk::PipelineLayout,
+}
+
+impl ComputePipeline {
+    pub(crate) fn new(device: Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout) -> Self {
+        Self {
+            device,
+            pipeline,
+            pipeline_layout,
+        }
+    }
+
+    pub fn pipeline(&self) -> vk::Pipeline {
+        self.pipeline
+    }
+}
+
 
 /// Samplers
 #[derive(Clone, Debug)]
@@ -961,6 +984,12 @@ pub struct GraphicsPipelineCreateInfo<'a> {
     pub fragment_output: FragmentOutputInterfaceDescriptor<'a>,
 }
 
+
+pub struct ComputePipelineCreateInfo<'a> {
+    pub layout: PipelineLayoutDescriptor<'a>,
+    pub compute_shader: ShaderEntryPoint<'static>,
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Specifies the type of a graphics pipeline with the given vertex input, arguments and push constants.
@@ -1177,11 +1206,11 @@ fn map_texture_usage_to_barrier(usage: ResourceUse) -> (vk::PipelineStageFlags2,
         stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
         access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
     }
-    if usage.contains(ResourceUse::STORAGE_READ) {
+    if usage.contains(ResourceUse::IMAGE_READ) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ;
     }
-    if usage.contains(ResourceUse::STORAGE_READ_WRITE) {
+    if usage.contains(ResourceUse::IMAGE_READ_WRITE) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
     }

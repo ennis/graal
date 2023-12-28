@@ -6,6 +6,7 @@ use crate::{
 use ash::vk;
 use slotmap::SecondaryMap;
 use std::ptr;
+use ash::vk::Handle;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum UsageConflict {
@@ -121,8 +122,8 @@ impl Tracker {
                         second_use: state,
                     });
                 }
-                entry.last_state = final_state;
             }
+            entry.last_state = final_state;
         } else {
             self.buffers.insert(
                 id.resource_id(),
@@ -186,6 +187,7 @@ impl Tracker {
         if let Some(entry) = self.images.get_mut(id.resource_id()) {
             if entry.last_state != state || !state.all_ordered() {
                 if allow_barriers {
+                    //eprintln!("image barrier {:p}: from {:?} to {:?}", entry.handle,  entry.last_state, state);
                     barrier = Some(ImageBarrier {
                         image: handle,
                         format: entry.format,
@@ -199,8 +201,8 @@ impl Tracker {
                         second_use: state,
                     });
                 }
-                entry.last_state = final_state;
             }
+            entry.last_state = final_state;
         } else {
             self.images.insert(
                 id.resource_id(),
@@ -217,7 +219,15 @@ impl Tracker {
         Ok(barrier)
     }
 
+    pub(super) fn dump(&self) {
+
+        for (id, entry) in self.images.iter() {
+            eprintln!("image {:p}: {:?} -> {:?}", entry.handle, entry.first_state, entry.last_state);
+        }
+    }
+
     pub(super) fn merge(&mut self, child_tracker: &Tracker) -> PipelineBarrier {
+
         let mut buffer_barriers = vec![];
         let mut image_barriers = vec![];
 

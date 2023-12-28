@@ -20,8 +20,17 @@ use slotmap::{Key, SecondaryMap, SlotMap};
 
 pub use queue::*;
 
-use crate::{aspects_for_format, device::resource::ResourceGroup, instance::{vk_khr_debug_utils, vk_khr_surface}, is_write_access, platform_impl, ArgumentsLayout, BufferRangeAny, BufferUsage, CompareOp, Error, Format, GraphicsPipelineCreateInfo, ImageSubresourceRange, ImageType, ImageUsage, ImageViewInfo, PreRasterizationShaders, ReadWriteStorageImage, ResourceStateOld, ResourceUse, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D, Sampler, GraphicsPipeline, Swapchain};
-use crate::tracker::Tracker;
+use crate::{
+    aspects_for_format,
+    device::resource::ResourceGroup,
+    instance::{vk_ext_debug_utils, vk_khr_surface},
+    is_write_access, platform_impl,
+    tracker::Tracker,
+    ArgumentsLayout, BufferRangeAny, BufferUsage, CompareOp, ComputePipeline, ComputePipelineCreateInfo, Error, Format, GraphicsPipeline,
+    GraphicsPipelineCreateInfo, ImageSubresourceRange, ImageType, ImageUsage, ImageViewInfo, PreRasterizationShaders,
+    ReadWriteStorageImage, ResourceStateOld, ResourceUse, Sampler, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D,
+    Swapchain,
+};
 
 mod init;
 mod queue;
@@ -175,9 +184,7 @@ pub struct BufferRegistrationInfo<'a> {
 #[derive(Debug)]
 pub enum ResourceAllocation {
     /// We allocated a block of memory exclusively for this resource.
-    Allocation {
-        allocation: gpu_allocator::vulkan::Allocation,
-    },
+    Allocation { allocation: gpu_allocator::vulkan::Allocation },
     /// The memory for this resource was imported or exported from/to an external handle.
     DeviceMemory { device_memory: vk::DeviceMemory },
 
@@ -249,9 +256,7 @@ fn get_preferred_swapchain_surface_format(surface_formats: &[vk::SurfaceFormatKH
         .expect("no suitable surface format available")
 }
 
-pub unsafe fn create_device_and_queue(
-    present_surface: Option<vk::SurfaceKHR>,
-) -> Result<(Device, Queue), DeviceCreateError> {
+pub unsafe fn create_device_and_queue(present_surface: Option<vk::SurfaceKHR>) -> Result<(Device, Queue), DeviceCreateError> {
     let device = Device::new(present_surface)?;
     let queue = device.get_queue_by_global_index(0);
     Ok((device, queue))
@@ -578,7 +583,7 @@ impl Device {
     }
 
     /// Helper function to associate a debug name to a vulkan handle.
-    fn set_debug_object_name(&self, object_type: vk::ObjectType, object_handle: u64, name: &str, serial: Option<u64>) {
+    pub(crate) fn set_debug_object_name(&self, object_type: vk::ObjectType, object_handle: u64, name: &str, serial: Option<u64>) {
         unsafe {
             let name = if let Some(serial) = serial {
                 format!("{}@{}", name, serial)
@@ -587,7 +592,7 @@ impl Device {
             };
             let object_name = CString::new(name.as_str()).unwrap();
 
-            vk_khr_debug_utils()
+            vk_ext_debug_utils()
                 .set_debug_utils_object_name(
                     self.inner.device.handle(),
                     &vk::DebugUtilsObjectNameInfoEXT {
@@ -602,13 +607,7 @@ impl Device {
     }
 
     /// Creates a swapchain object.
-    pub unsafe fn create_swapchain(
-        &self,
-        surface: vk::SurfaceKHR,
-        format: vk::SurfaceFormatKHR,
-        width: u32,
-        height: u32,
-    ) -> Swapchain {
+    pub unsafe fn create_swapchain(&self, surface: vk::SurfaceKHR, format: vk::SurfaceFormatKHR, width: u32, height: u32) -> Swapchain {
         let mut swapchain = Swapchain {
             handle: Default::default(),
             surface,
@@ -650,12 +649,11 @@ impl Device {
 
         let present_mode = init::get_preferred_present_mode(&present_modes);
         let image_extent = init::get_preferred_swap_extent((width, height), &capabilities);
-        let image_count =
-            if capabilities.max_image_count > 0 && capabilities.min_image_count + 1 > capabilities.max_image_count {
-                capabilities.max_image_count
-            } else {
-                capabilities.min_image_count + 1
-            };
+        let image_count = if capabilities.max_image_count > 0 && capabilities.min_image_count + 1 > capabilities.max_image_count {
+            capabilities.max_image_count
+        } else {
+            capabilities.min_image_count + 1
+        };
 
         let create_info = vk::SwapchainCreateInfoKHR {
             flags: Default::default(),
@@ -690,11 +688,7 @@ impl Device {
         swapchain.handle = new_handle;
         swapchain.width = width;
         swapchain.height = height;
-        swapchain.images = self
-            .inner
-            .vk_khr_swapchain
-            .get_swapchain_images(swapchain.handle)
-            .unwrap();
+        swapchain.images = self.inner.vk_khr_swapchain.get_swapchain_images(swapchain.handle).unwrap();
     }
 
     pub fn create_sampler(&self, info: &SamplerCreateInfo) -> Sampler {
@@ -728,10 +722,7 @@ impl Device {
                 .expect("failed to create sampler")
         };
         let sampler = Sampler::new(self, sampler);
-        self.inner
-            .sampler_cache
-            .borrow_mut()
-            .insert(info.clone(), sampler.clone());
+        self.inner.sampler_cache.borrow_mut().insert(info.clone(), sampler.clone());
         sampler
     }
 
@@ -789,24 +780,16 @@ impl Device {
         compile_options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_3 as u32);
         compile_options.set_target_spirv(SpirvVersion::V1_5);
 
-        let compilation_artifact = self.inner.compiler.compile_into_spirv(
-            source_content,
-            kind,
-            input_file_name,
-            entry_point,
-            Some(&compile_options),
-        )?;
+        let compilation_artifact =
+            self.inner
+                .compiler
+                .compile_into_spirv(source_content, kind, input_file_name, entry_point, Some(&compile_options))?;
 
         Ok(compilation_artifact.as_binary().into())
     }
 
     /// Creates a shader module.
-    fn create_shader_module(
-        &self,
-        kind: ShaderKind,
-        code: &ShaderCode,
-        entry_point: &str,
-    ) -> Result<vk::ShaderModule, Error> {
+    fn create_shader_module(&self, kind: ShaderKind, code: &ShaderCode, entry_point: &str) -> Result<vk::ShaderModule, Error> {
         let code = match code {
             ShaderCode::Source(source) => Cow::Owned(self.compile_shader(kind, *source, entry_point)?),
             ShaderCode::Spirv(spirv) => Cow::Borrowed(*spirv),
@@ -848,9 +831,7 @@ impl Device {
 
         let pc_range = match bind_point {
             vk::PipelineBindPoint::GRAPHICS => vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS
-                    | vk::ShaderStageFlags::MESH_EXT
-                    | vk::ShaderStageFlags::TASK_EXT,
+                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT,
                 offset: 0,
                 size: push_constants_size as u32,
             },
@@ -878,6 +859,49 @@ impl Device {
         };
 
         (set_layouts, pipeline_layout)
+    }
+    pub fn create_compute_pipeline(&self, create_info: ComputePipelineCreateInfo) -> Result<ComputePipeline, Error> {
+        // ------ create pipeline layout from statically known information ------
+        let (descriptor_set_layouts, pipeline_layout) = self.create_pipeline_layout(
+            vk::PipelineBindPoint::COMPUTE,
+            create_info.layout.arguments.as_ref(),
+            create_info.layout.push_constants_size,
+        );
+
+        let compute_shader = self.create_shader_module(
+            ShaderKind::Compute,
+            &create_info.compute_shader.code,
+            create_info.compute_shader.entry_point,
+        )?;
+
+        let create_info = vk::ComputePipelineCreateInfo {
+            flags: Default::default(),
+            stage: vk::PipelineShaderStageCreateInfo {
+                flags: Default::default(),
+                stage: vk::ShaderStageFlags::COMPUTE,
+                module: compute_shader,
+                p_name: b"main\0".as_ptr() as *const c_char, // TODO
+                p_specialization_info: ptr::null(),
+                ..Default::default()
+            },
+            layout: pipeline_layout,
+            ..Default::default()
+        };
+
+        let pipeline = unsafe {
+            match self
+                .inner
+                .device
+                .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+            {
+                Ok(pipelines) => pipelines[0],
+                Err(e) => {
+                    return Err(Error::Vulkan(e.1));
+                }
+            }
+        };
+
+        Ok(ComputePipeline::new(self.clone(), pipeline, pipeline_layout))
     }
 
     /// Creates a graphics pipeline.
@@ -1142,10 +1166,7 @@ impl Device {
             color_attachment_count: create_info.fragment_output.color_attachment_formats.len() as u32,
             p_color_attachment_formats: create_info.fragment_output.color_attachment_formats.as_ptr(),
             depth_attachment_format: create_info.fragment_output.depth_attachment_format.unwrap_or_default(),
-            stencil_attachment_format: create_info
-                .fragment_output
-                .stencil_attachment_format
-                .unwrap_or_default(),
+            stencil_attachment_format: create_info.fragment_output.stencil_attachment_format.unwrap_or_default(),
             ..Default::default()
         };
 

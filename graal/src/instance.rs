@@ -26,7 +26,7 @@ pub fn intialize_debug_messenger() -> &'static vk::DebugUtilsMessengerEXT {
     &DEBUG_MESSENGER
 }
 
-pub fn vk_khr_debug_utils() -> &'static ash::extensions::ext::DebugUtils {
+pub fn vk_ext_debug_utils() -> &'static ash::extensions::ext::DebugUtils {
     &VULKAN_DEBUG_UTILS
 }
 
@@ -176,7 +176,7 @@ fn create_debug_messenger() -> vk::DebugUtilsMessengerEXT {
 
     unsafe {
         // SAFETY: basic FFI and the create info should be correct
-        let debug_messenger = vk_khr_debug_utils()
+        let debug_messenger = vk_ext_debug_utils()
             .create_debug_utils_messenger(&debug_utils_messenger_create_info, None)
             .expect("failed to create debug messenger");
         debug_messenger

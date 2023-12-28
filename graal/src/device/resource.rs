@@ -433,8 +433,6 @@ impl Device {
             return;
         }
 
-        eprintln!("destroying resource");
-
         // destroy the object
         match resource.kind {
             ResourceKind::Buffer(ref buf) => self.inner.device.destroy_buffer(buf.handle, None),

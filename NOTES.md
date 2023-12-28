@@ -457,3 +457,20 @@ Modules:
   - blit.rs: blit commands & BlitEncoder
 - track.rs: use trackers
 - pipeline.rs: pipeline creation (Device::create_graphics_pipeline & GraphicsPipeline & shader compilation)
+
+# Next steps
+
+Basic functionality is done! The rest:
+- Move vulkan-specific stuff in its own submodule. Note that the only other backend we might need is metal on mac.
+- Maybe ray tracing
+- Fix TODOs
+- Remove inline uniforms
+- Resurrect external image extensions
+- Remove queues, replace with a special device API that submits on another queue
+
+
+# Command buffers?
+They exist so that GPU commands can be recorded in parallel. But from how many draw calls does this start to be beneficial? 1000? 10k? 100k?
+"When the CPU becomes the bottleneck": do we have numbers for recent desktop CPUs?
+
+Multithreaded recording is also less relevant with GPU-driven pipelines, since they may not issue draw calls per object on the CPU.

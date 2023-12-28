@@ -1,5 +1,6 @@
 //! Queues & submissions
 use std::{collections::VecDeque, ffi::c_void, mem, ptr, time::Duration};
+use std::ffi::c_char;
 
 use ash::prelude::VkResult;
 use tracing::debug;
@@ -7,7 +8,7 @@ use tracing::debug;
 use crate::{device::{
     Device, ImageRegistrationInfo, OwnerQueue, PipelineBarrierBuilder, ResourceAllocation,
     ResourceHandle, ResourceKind, ResourceRegistrationInfo, Swapchain,
-}, vk, Image, ImageType, ImageUsage, ResourceStateOld, ResourceUse, Size3D, SwapchainImage};
+}, vk, Image, ImageType, ImageUsage, ResourceStateOld, ResourceUse, Size3D, SwapchainImage, vk_ext_debug_utils};
 use crate::command::CommandBuffer;
 use crate::tracker::{emit_pipeline_barrier, Tracker};
 
@@ -237,6 +238,7 @@ impl Queue {
         let render_finished = self.get_or_create_semaphore().0;
 
         // submit a command buffer for transition to PRESENT layout and "render finished" semaphore
+        // FIXME: this creates a useless command buffer
         let mut cb = self.create_command_buffer();
         cb.tracker.use_image(&swapchain_image.image, ResourceUse::PRESENT, true).unwrap();
 
@@ -345,6 +347,9 @@ impl Queue {
             // finish the command buffer
             self.device.raw().end_command_buffer(cb.command_buffer)?;
 
+            //eprintln!("cb tracker dump:");
+            //cb.tracker.dump();
+
             // update the global resource tracker with the new states
             let pipeline_barrier = global_tracker.merge(&cb.tracker);
 
@@ -361,7 +366,13 @@ impl Queue {
                             },
                         )
                         .unwrap();
+                    vk_ext_debug_utils().cmd_begin_debug_utils_label(barrier_cb, &vk::DebugUtilsLabelEXT {
+                        p_label_name: b"barrier fixup\0".as_ptr() as *const c_char,
+                        color: [0.0,0.0,0.0,0.0],
+                        ..Default::default()
+                    });
                     emit_pipeline_barrier(&self.device, barrier_cb, &pipeline_barrier);
+                    vk_ext_debug_utils().cmd_end_debug_utils_label(barrier_cb);
                     self.device.end_command_buffer(barrier_cb).unwrap();
                 }
                 command_buffers.push(barrier_cb);
