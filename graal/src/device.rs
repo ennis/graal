@@ -1,39 +1,31 @@
 //! Abstractions over a vulkan device & queues.
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
-    collections::HashMap,
+    cell::Cell,
+    collections::{HashMap, VecDeque},
     ffi::{c_char, CString},
     fmt,
     ops::Deref,
-    os::raw::c_void,
     ptr,
-    ptr::NonNull,
     rc::{Rc, Weak},
-    sync::atomic::{AtomicUsize, Ordering},
+    sync::{Arc, Mutex},
 };
 
 use ash::vk;
-use fxhash::FxHashMap;
-use shaderc::{EnvVersion, SpirvVersion, TargetEnv};
 use slotmap::{Key, SecondaryMap, SlotMap};
-
-pub use queue::*;
+use tracing::error;
 
 use crate::{
-    aspects_for_format,
+    compile_shader,
     device::resource::ResourceGroup,
     instance::{vk_ext_debug_utils, vk_khr_surface},
-    is_write_access, platform_impl,
-    tracker::Tracker,
-    ArgumentsLayout, BufferRangeAny, BufferUsage, CompareOp, ComputePipeline, ComputePipelineCreateInfo, Error, Format, GraphicsPipeline,
-    GraphicsPipelineCreateInfo, ImageSubresourceRange, ImageType, ImageUsage, ImageViewInfo, PreRasterizationShaders,
-    ReadWriteStorageImage, ResourceStateOld, ResourceUse, Sampler, SamplerCreateInfo, ShaderCode, ShaderKind, ShaderSource, Size3D,
-    Swapchain,
+    is_write_access, platform_impl, Arguments, ArgumentsLayout, BufferAccess, BufferInner, BufferUsage, CommandPool,
+    CommandStream, CompareOp, ComputePipeline, ComputePipelineCreateInfo, Error, GraphicsPipeline,
+    GraphicsPipelineCreateInfo, ImageAccess, ImageInner, ImageView, ImageViewInfo, ImageViewInner,
+    PreRasterizationShaders, ResourceMaps, Sampler, SamplerCreateInfo, ShaderCode, ShaderStage, Size3D, Swapchain,
 };
 
 mod init;
-mod queue;
 mod resource;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,33 +48,89 @@ pub struct WeakDevice {
     pub(crate) inner: Weak<DeviceInner>,
 }
 
+impl WeakDevice {
+    pub(crate) fn upgrade(&self) -> Option<Device> {
+        self.inner.upgrade().map(|inner| Device { inner })
+    }
+}
+
 impl fmt::Debug for WeakDevice {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("WeakDevice").finish_non_exhaustive()
     }
 }
 
+//////////////////////////////////////////////////////////////////////////////////////////////////////
+pub(crate) struct ActiveSubmission {
+    pub index: u64,
+    pub queue: u32,
+    pub command_pools: Vec<CommandPool>,
+}
+
+impl ActiveSubmission {
+    pub(crate) fn new(index: u64, queue: u32, command_pools: Vec<CommandPool>) -> ActiveSubmission {
+        ActiveSubmission {
+            index,
+            queue,
+            command_pools,
+        }
+    }
+}
+
+pub(crate) struct DeviceTracker {
+    pub active_submissions: VecDeque<ActiveSubmission>,
+    pub last_submission_index: u64,
+    pub buffers: SecondaryMap<BufferId, BufferAccess>,
+    pub images: SecondaryMap<ImageId, ImageAccess>,
+}
+
+impl DeviceTracker {
+    fn new() -> DeviceTracker {
+        DeviceTracker {
+            active_submissions: VecDeque::new(),
+            last_submission_index: 0,
+            buffers: SecondaryMap::new(),
+            images: SecondaryMap::new(),
+            //retired_command_pools: Vec::new(),
+            //free_command_pools: Vec::new(),
+        }
+    }
+}
+
 pub(crate) struct DeviceInner {
     /// Underlying vulkan device
     device: ash::Device,
+
     /// Platform-specific extension functions
     platform_extensions: platform_impl::PlatformExtensions,
     physical_device: vk::PhysicalDevice,
-    physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-    physical_device_properties: vk::PhysicalDeviceProperties,
-    queues: Vec<QueueData>,
-    allocator: RefCell<gpu_allocator::vulkan::Allocator>,
+    queues: Vec<Arc<QueueShared>>,
+    allocator: Mutex<gpu_allocator::vulkan::Allocator>,
     vk_khr_swapchain: ash::extensions::khr::Swapchain,
     vk_ext_shader_object: ash::extensions::ext::ShaderObject,
     vk_khr_push_descriptor: ash::extensions::khr::PushDescriptor,
     vk_ext_mesh_shader: ash::extensions::ext::MeshShader,
     vk_ext_extended_dynamic_state3: ash::extensions::ext::ExtendedDynamicState3,
-    resources: RefCell<ResourceMap>,
-    tracker: RefCell<Tracker>,
-    resource_groups: RefCell<ResourceGroupMap>,
+    vk_ext_descriptor_buffer: ash::extensions::ext::DescriptorBuffer,
 
-    deletion_lists: RefCell<Vec<DeferredDeletionList>>,
-    sampler_cache: RefCell<HashMap<SamplerCreateInfo, Sampler>>,
+    // physical device properties
+    physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    physical_device_descriptor_buffer_properties: vk::PhysicalDeviceDescriptorBufferPropertiesEXT,
+    physical_device_properties: vk::PhysicalDeviceProperties2,
+
+    // We don't need to hold strong refs here, we just need an ID for them.
+    image_ids: Mutex<SlotMap<ImageId, Arc<ImageInner>>>,
+    buffer_ids: Mutex<SlotMap<BufferId, Arc<BufferInner>>>,
+    image_view_ids: Mutex<SlotMap<ImageViewId, Arc<ImageViewInner>>>,
+    groups: Mutex<ResourceGroupMap>,
+    // Command pools per queue and thread.
+    free_command_pools: Mutex<Vec<CommandPool>>,
+    // resources for which the user reference has dropped, but which may still be in use by the GPU.
+    dropped_resources: Mutex<ResourceMaps>,
+    pub(crate) tracker: Mutex<DeviceTracker>,
+
+    deletion_lists: Mutex<Vec<DeferredDeletionList>>,
+    sampler_cache: Mutex<HashMap<SamplerCreateInfo, Sampler>>,
     compiler: shaderc::Compiler,
 }
 
@@ -107,64 +155,23 @@ impl Deref for Device {
 }
 
 slotmap::new_key_type! {
-    /// Identifies a GPU resource (buffer or image).
-    pub struct ResourceId;
+    /// Identifies a GPU resource.
+    pub struct ImageId;
+
+    /// Identifies a GPU resource.
+    pub struct BufferId;
+
+    /// Identifies a GPU resource.
+    pub struct ImageViewId;
 
     /// Identifies a resource group.
     pub struct GroupId;
-}
-
-/// Identifier for a buffer resource.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct BufferId(pub(crate) ResourceId);
-
-impl BufferId {
-    /// Returns the underlying ResourceId.
-    pub fn resource_id(&self) -> ResourceId {
-        self.0
-    }
-
-    /// Produces an invalid BufferId, for testing.
-    #[cfg(test)]
-    pub fn invalid() -> BufferId {
-        BufferId(ResourceId::null())
-    }
-}
-
-/// Identifier for an image resource.
-#[derive(Copy, Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
-pub struct ImageId(pub(crate) ResourceId);
-
-impl ImageId {
-    /// Returns the underlying ResourceId.
-    pub fn resource_id(&self) -> ResourceId {
-        self.0
-    }
-
-    /// Produces an invalid ImageId, for testing.
-    pub fn invalid() -> ImageId {
-        ImageId(ResourceId::null())
-    }
-}
-
-impl From<ImageId> for ResourceId {
-    fn from(value: ImageId) -> Self {
-        value.0
-    }
-}
-
-impl From<BufferId> for ResourceId {
-    fn from(value: BufferId) -> Self {
-        value.0
-    }
 }
 
 // TODO: move this to a separate module?
 #[derive(Debug)]
 pub struct ResourceRegistrationInfo<'a> {
     pub name: &'a str,
-    pub allocation: ResourceAllocation,
-    pub initial_wait: Option<SemaphoreWait>,
 }
 
 #[derive(Debug)]
@@ -177,14 +184,15 @@ pub struct ImageRegistrationInfo<'a> {
 #[derive(Debug)]
 pub struct BufferRegistrationInfo<'a> {
     pub resource: ResourceRegistrationInfo<'a>,
-    pub handle: vk::Buffer,
 }
 
 /// Describes how a resource got its memory.
 #[derive(Debug)]
 pub enum ResourceAllocation {
     /// We allocated a block of memory exclusively for this resource.
-    Allocation { allocation: gpu_allocator::vulkan::Allocation },
+    Allocation {
+        allocation: gpu_allocator::vulkan::Allocation,
+    },
     /// The memory for this resource was imported or exported from/to an external handle.
     DeviceMemory { device_memory: vk::DeviceMemory },
 
@@ -192,10 +200,15 @@ pub enum ResourceAllocation {
     External,
 }
 
+impl ResourceAllocation {
+    fn is_external(&self) -> bool {
+        matches!(self, ResourceAllocation::External)
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 #[derive(Debug)]
 enum DeferredDeletionObject {
-    ImageView(vk::ImageView),
     Sampler(vk::Sampler),
     DescriptorSetLayout(vk::DescriptorSetLayout),
     PipelineLayout(vk::PipelineLayout),
@@ -204,11 +217,6 @@ enum DeferredDeletionObject {
     Shader(vk::ShaderEXT),
 }
 
-impl From<vk::ImageView> for DeferredDeletionObject {
-    fn from(view: vk::ImageView) -> Self {
-        DeferredDeletionObject::ImageView(view)
-    }
-}
 impl From<vk::Sampler> for DeferredDeletionObject {
     fn from(sampler: vk::Sampler) -> Self {
         DeferredDeletionObject::Sampler(sampler)
@@ -256,13 +264,13 @@ fn get_preferred_swapchain_surface_format(surface_formats: &[vk::SurfaceFormatKH
         .expect("no suitable surface format available")
 }
 
-pub unsafe fn create_device_and_queue(present_surface: Option<vk::SurfaceKHR>) -> Result<(Device, Queue), DeviceCreateError> {
+pub unsafe fn create_device_and_command_stream(
+    present_surface: Option<vk::SurfaceKHR>,
+) -> Result<(Device, CommandStream), DeviceCreateError> {
     let device = Device::new(present_surface)?;
-    let queue = device.get_queue_by_global_index(0);
-    Ok((device, queue))
+    let command_stream = device.create_command_stream(0);
+    Ok((device, command_stream))
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 struct DeferredDeletionList {
@@ -272,286 +280,21 @@ struct DeferredDeletionList {
     objects: Vec<DeferredDeletionObject>,
 }
 
-struct QueueData {
+pub(crate) struct QueueShared {
     /// Family index.
-    family_index: u32,
+    pub family: u32,
     /// Index within queues of the same family (see vkGetDeviceQueue).
-    index: u32,
-    queue: vk::Queue,
-    timeline: vk::Semaphore,
-    next_submission_timestamp: Cell<u64>,
+    pub index_in_family: u32,
+    pub index: u32,
+    pub queue: vk::Queue,
+    pub timeline: vk::Semaphore,
+    pub next_submission_timestamp: Cell<u64>,
+    pub free_command_pools: Mutex<Vec<CommandPool>>,
 }
 
-#[derive(Debug)]
-pub(crate) struct ImageResource {
-    handle: vk::Image,
-    format: vk::Format,
-    all_aspects: vk::ImageAspectFlags,
-}
-
-#[derive(Debug)]
-pub(crate) struct BufferResource {
-    handle: vk::Buffer,
-}
-/// Describes how the resource is access by different queues.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum OwnerQueue {
-    None,
-    Exclusive(usize),
-    Concurrent(u16),
-}
-
-#[derive(Debug)]
-pub struct RefCount(NonNull<AtomicUsize>);
-
-unsafe impl Send for RefCount {}
-unsafe impl Sync for RefCount {}
-
-impl RefCount {
-    const MAX: usize = 1 << 24;
-
-    /// Construct a new `RefCount`, with an initial count of 1.
-    fn new() -> RefCount {
-        let bx = Box::new(AtomicUsize::new(1));
-        Self(unsafe { NonNull::new_unchecked(Box::into_raw(bx)) })
-    }
-
-    fn load(&self) -> usize {
-        unsafe { self.0.as_ref() }.load(Ordering::Acquire)
-    }
-
-    fn is_unique(&self) -> bool {
-        self.load() == 1
-    }
-}
-
-impl Clone for RefCount {
-    fn clone(&self) -> Self {
-        let old_size = unsafe { self.0.as_ref() }.fetch_add(1, Ordering::AcqRel);
-        assert!(old_size < Self::MAX);
-        Self(self.0)
-    }
-}
-
-impl Drop for RefCount {
-    fn drop(&mut self) {
-        unsafe {
-            if self.0.as_ref().fetch_sub(1, Ordering::AcqRel) == 1 {
-                drop(Box::from_raw(self.0.as_ptr()));
-            }
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct RefCounted<T> {
-    pub ref_count: RefCount,
-    pub value: T,
-}
-
-impl<T> RefCounted<T> {
-    pub fn new(value: T, initial_count: RefCount) -> Self {
-        Self {
-            ref_count: initial_count,
-            value,
-        }
-    }
-
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> RefCounted<U> {
-        RefCounted {
-            ref_count: self.ref_count,
-            value: f(self.value),
-        }
-    }
-}
-
-#[derive(Debug)]
-enum ResourceKind {
-    Buffer(BufferResource),
-    Image(ImageResource),
-}
-
-#[derive(Debug)]
-pub(crate) struct Resource {
-    name: String,
-    // Could be usize, or a pointer to an atomic usize variable. With the pointer,
-    // there's no need to hold a reference to the device for Samplers, etc, or to manually call
-    // `device.drop_resource(id)`. But that's one more allocation.
-    ref_count: RefCount,
-    allocation: ResourceAllocation,
-    kind: ResourceKind,
-    group: Option<GroupId>,
-    owner: OwnerQueue,
-    /// Timestamp of the last submission that accessed the resource on its owner queue.
-    ///
-    /// It's a value of the timeline semaphore of the queue.
-    ///
-    /// TODO: it's only used for deferred deletion, to ensure that no queue is still using the resource.
-    /// We could replace that by a set of semaphore waits in order to support waiting on a resource
-    /// used concurrently by multiple queues.
-    timestamp: u64,
-}
-
-impl Resource {
-    pub(crate) fn as_image(&self) -> &ImageResource {
-        match &self.kind {
-            ResourceKind::Image(r) => r,
-            _ => panic!("expected an image resource"),
-        }
-    }
-
-    pub(crate) fn as_buffer(&self) -> &BufferResource {
-        match &self.kind {
-            ResourceKind::Buffer(r) => r,
-            _ => panic!("expected a buffer resource"),
-        }
-    }
-}
-
-type ResourceMap = SlotMap<ResourceId, Resource>;
 type ResourceGroupMap = SlotMap<GroupId, ResourceGroup>;
 
-#[derive(Copy, Clone, Debug, Default)]
-struct DependencyState {
-    stages: vk::PipelineStageFlags2,
-    flush_mask: vk::AccessFlags2,
-    visible: vk::AccessFlags2,
-    layout: vk::ImageLayout,
-}
-
-/*
-#[derive(Copy, Clone)]
-struct ResourceUse {
-    aspect: vk::ImageAspectFlags,
-    state: ResourceStateOld,
-}*/
-
-/// Helper to build a pipeline barrier.
-#[derive(Default)]
-pub(super) struct PipelineBarrierBuilder {
-    image_barriers: Vec<vk::ImageMemoryBarrier2>,
-    buffer_barriers: Vec<vk::BufferMemoryBarrier2>,
-}
-
-impl PipelineBarrierBuilder {
-    fn get_or_create_image_barrier(&mut self, image: vk::Image) -> &mut vk::ImageMemoryBarrier2 {
-        let index = self.image_barriers.iter().position(|barrier| barrier.image == image);
-        if let Some(index) = index {
-            &mut self.image_barriers[index]
-        } else {
-            let barrier = vk::ImageMemoryBarrier2::default();
-            self.image_barriers.push(barrier);
-            self.image_barriers.last_mut().unwrap()
-        }
-    }
-
-    fn get_or_create_buffer_barrier(&mut self, buffer: vk::Buffer) -> &mut vk::BufferMemoryBarrier2 {
-        let index = self.buffer_barriers.iter().position(|barrier| barrier.buffer == buffer);
-        if let Some(index) = index {
-            &mut self.buffer_barriers[index]
-        } else {
-            let barrier = vk::BufferMemoryBarrier2::default();
-            self.buffer_barriers.push(barrier);
-            self.buffer_barriers.last_mut().unwrap()
-        }
-    }
-
-    fn clear(&mut self) {
-        self.buffer_barriers.clear();
-        self.image_barriers.clear();
-    }
-
-    fn is_empty(&self) -> bool {
-        self.buffer_barriers.is_empty() && self.image_barriers.is_empty()
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-enum ResourceHandle {
-    Buffer(vk::Buffer),
-    Image(vk::Image),
-}
-
-impl From<vk::Buffer> for ResourceHandle {
-    fn from(buffer: vk::Buffer) -> Self {
-        Self::Buffer(buffer)
-    }
-}
-
-impl From<vk::Image> for ResourceHandle {
-    fn from(image: vk::Image) -> Self {
-        Self::Image(image)
-    }
-}
-
-/*
-fn ensure_memory_dependency(
-    barriers: &mut PipelineBarrierBuilder,
-    handle: ResourceHandle,
-    dep_state: &mut DependencyState,
-    use_: &ResourceUse,
-) {
-    // We need to insert a memory dependency if:
-    // - the image needs a layout transition
-    // - the resource has writes that are not visible to the target access
-    //
-    // We need to insert an execution dependency if:
-    // - we're writing to the resource (write-after-read hazard, write-after-write hazard)
-    if !(dep_state.visible.contains(use_.state.access) || dep_state.visible.contains(vk::AccessFlags2::MEMORY_READ))
-        || dep_state.layout != use_.state.layout
-        || is_write_access(use_.state.access)
-    {
-        match handle {
-            ResourceHandle::Buffer(buffer) => {
-                let barrier = barriers.get_or_create_buffer_barrier(buffer);
-                barrier.buffer = buffer;
-                barrier.src_stage_mask |= dep_state.stages;
-                barrier.dst_stage_mask |= use_.state.stages;
-                barrier.src_access_mask |= dep_state.flush_mask;
-                barrier.dst_access_mask |= use_.state.access;
-                barrier.offset = 0;
-                barrier.size = vk::WHOLE_SIZE;
-            }
-            ResourceHandle::Image(image) => {
-                let barrier = barriers.get_or_create_image_barrier(image);
-                barrier.image = image;
-                barrier.src_stage_mask |= dep_state.stages;
-                barrier.dst_stage_mask |= use_.state.stages;
-                barrier.src_access_mask |= dep_state.flush_mask;
-                barrier.dst_access_mask |= use_.state.access;
-                barrier.old_layout = dep_state.layout;
-                barrier.new_layout = use_.state.layout;
-                barrier.subresource_range = vk::ImageSubresourceRange {
-                    aspect_mask: use_.aspect,
-                    base_mip_level: 0,
-                    level_count: vk::REMAINING_MIP_LEVELS,
-                    base_array_layer: 0,
-                    layer_count: vk::REMAINING_ARRAY_LAYERS,
-                    ..Default::default()
-                };
-                dep_state.layout = use_.state.layout;
-            }
-        }
-    }
-
-    if is_write_access(use_.state.access) {
-        // we're writing to the resource, so reset visibility...
-        dep_state.visible = vk::AccessFlags2::empty();
-        // ... but signal that there is data to flush.
-        dep_state.flush_mask = use_.state.access;
-    } else {
-        // This memory dependency makes all writes on the resource available, and
-        // visible to the types specified in `access.access_mask`.
-        // There's no write, so we don't need to flush anything.
-        dep_state.flush_mask = vk::AccessFlags2::empty();
-        dep_state.visible |= use_.state.access;
-    }
-
-    // Update the resource stage mask
-    dep_state.stages = use_.state.stages;
-}
-
-*/
+////////////////////////////////////////////////////////////////////////////////////////////////////
 
 impl Device {
     pub fn weak(&self) -> WeakDevice {
@@ -582,8 +325,18 @@ impl Device {
         &self.inner.vk_ext_mesh_shader
     }
 
+    pub fn ext_descriptor_buffer(&self) -> &ash::extensions::ext::DescriptorBuffer {
+        &self.inner.vk_ext_descriptor_buffer
+    }
+
     /// Helper function to associate a debug name to a vulkan handle.
-    pub(crate) fn set_debug_object_name(&self, object_type: vk::ObjectType, object_handle: u64, name: &str, serial: Option<u64>) {
+    pub(crate) fn set_debug_object_name(
+        &self,
+        object_type: vk::ObjectType,
+        object_handle: u64,
+        name: &str,
+        serial: Option<u64>,
+    ) {
         unsafe {
             let name = if let Some(serial) = serial {
                 format!("{}@{}", name, serial)
@@ -607,7 +360,13 @@ impl Device {
     }
 
     /// Creates a swapchain object.
-    pub unsafe fn create_swapchain(&self, surface: vk::SurfaceKHR, format: vk::SurfaceFormatKHR, width: u32, height: u32) -> Swapchain {
+    pub unsafe fn create_swapchain(
+        &self,
+        surface: vk::SurfaceKHR,
+        format: vk::SurfaceFormatKHR,
+        width: u32,
+        height: u32,
+    ) -> Swapchain {
         let mut swapchain = Swapchain {
             handle: Default::default(),
             surface,
@@ -649,11 +408,12 @@ impl Device {
 
         let present_mode = init::get_preferred_present_mode(&present_modes);
         let image_extent = init::get_preferred_swap_extent((width, height), &capabilities);
-        let image_count = if capabilities.max_image_count > 0 && capabilities.min_image_count + 1 > capabilities.max_image_count {
-            capabilities.max_image_count
-        } else {
-            capabilities.min_image_count + 1
-        };
+        let image_count =
+            if capabilities.max_image_count > 0 && capabilities.min_image_count + 1 > capabilities.max_image_count {
+                capabilities.max_image_count
+            } else {
+                capabilities.min_image_count + 1
+            };
 
         let create_info = vk::SwapchainCreateInfoKHR {
             flags: Default::default(),
@@ -688,11 +448,33 @@ impl Device {
         swapchain.handle = new_handle;
         swapchain.width = width;
         swapchain.height = height;
-        swapchain.images = self.inner.vk_khr_swapchain.get_swapchain_images(swapchain.handle).unwrap();
+        swapchain.images = self
+            .inner
+            .vk_khr_swapchain
+            .get_swapchain_images(swapchain.handle)
+            .unwrap();
     }
 
+    /*// Problem: need to know the descriptor layout to create the descriptor buffer
+    pub fn create_argument_buffer_untyped(&self, arguments_layout: &ArgumentsLayout) -> ArgumentBufferUntyped {
+        // Build descriptor set layout
+        // FIXME: obviously it's not good to re-create the layout every time, but I really don't want the application
+        // to manage the lifetime of DescriptorSetLayouts when they could clearly be statically associated to argument types.
+
+        let layout = self.create_descriptor_set_layout(arguments_layout);
+
+        unsafe {
+            let buffer_size = self.ext_descriptor_buffer().get_descriptor_set_layout_size(layout);
+            self.create_buffer(buffer_size, BufferUsage::UNIFORM_BUFFER, ResourceState::HostVisible)
+        }
+
+        unsafe {
+            self.destroy_descriptor_set_layout(layout, None);
+        }
+    }*/
+
     pub fn create_sampler(&self, info: &SamplerCreateInfo) -> Sampler {
-        if let Some(sampler) = self.inner.sampler_cache.borrow().get(info) {
+        if let Some(sampler) = self.inner.sampler_cache.lock().unwrap().get(info) {
             return sampler.clone();
         }
 
@@ -722,76 +504,41 @@ impl Device {
                 .expect("failed to create sampler")
         };
         let sampler = Sampler::new(self, sampler);
-        self.inner.sampler_cache.borrow_mut().insert(info.clone(), sampler.clone());
+        self.inner
+            .sampler_cache
+            .lock()
+            .unwrap()
+            .insert(info.clone(), sampler.clone());
         sampler
     }
 
-    /// Compiles a shader
-    // TODO: this could be moved outside of device?
-    fn compile_shader(&self, kind: ShaderKind, source: ShaderSource, entry_point: &str) -> Result<Vec<u32>, Error> {
-        let input_file_name = match source {
-            ShaderSource::Content(_) => "<embedded shader>",
-            ShaderSource::File(path) => path.file_name().unwrap().to_str().unwrap(),
-        };
-
-        let source_from_path;
-        let source_content = match source {
-            ShaderSource::Content(str) => str,
-            ShaderSource::File(path) => {
-                source_from_path = std::fs::read_to_string(path)?;
-                source_from_path.as_str()
-            }
-        };
-        let kind = match kind {
-            ShaderKind::Vertex => shaderc::ShaderKind::Vertex,
-            ShaderKind::Fragment => shaderc::ShaderKind::Fragment,
-            ShaderKind::Geometry => shaderc::ShaderKind::Geometry,
-            ShaderKind::Compute => shaderc::ShaderKind::Compute,
-            ShaderKind::TessControl => shaderc::ShaderKind::TessControl,
-            ShaderKind::TessEvaluation => shaderc::ShaderKind::TessEvaluation,
-            ShaderKind::Mesh => shaderc::ShaderKind::Mesh,
-            ShaderKind::Task => shaderc::ShaderKind::Task,
-        };
-
-        let mut compile_options = shaderc::CompileOptions::new().unwrap();
-        let mut base_include_path = std::env::current_dir().expect("failed to get current directory");
-
-        match source {
-            ShaderSource::File(path) => {
-                if let Some(parent) = path.parent() {
-                    base_include_path = parent.to_path_buf();
-                }
-            }
-            _ => {}
+    pub(crate) fn get_or_create_command_pool(&self, queue_family: u32) -> CommandPool {
+        let free_command_pools = &mut self.inner.free_command_pools.lock().unwrap();
+        let index = free_command_pools
+            .iter()
+            .position(|pool| pool.queue_family == queue_family);
+        if let Some(index) = index {
+            return free_command_pools.swap_remove(index);
+        } else {
+            unsafe { CommandPool::new(&self.inner.device, queue_family) }
         }
-
-        compile_options.set_include_callback(move |requested_source, _type, _requesting_source, _include_depth| {
-            let mut path = base_include_path.clone();
-            path.push(requested_source);
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(e) => return Err(e.to_string()),
-            };
-            Ok(shaderc::ResolvedInclude {
-                resolved_name: path.display().to_string(),
-                content,
-            })
-        });
-        compile_options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_3 as u32);
-        compile_options.set_target_spirv(SpirvVersion::V1_5);
-
-        let compilation_artifact =
-            self.inner
-                .compiler
-                .compile_into_spirv(source_content, kind, input_file_name, entry_point, Some(&compile_options))?;
-
-        Ok(compilation_artifact.as_binary().into())
     }
 
     /// Creates a shader module.
-    fn create_shader_module(&self, kind: ShaderKind, code: &ShaderCode, entry_point: &str) -> Result<vk::ShaderModule, Error> {
+    fn create_shader_module(
+        &self,
+        kind: ShaderStage,
+        code: &ShaderCode,
+        entry_point: &str,
+    ) -> Result<vk::ShaderModule, Error> {
         let code = match code {
-            ShaderCode::Source(source) => Cow::Owned(self.compile_shader(kind, *source, entry_point)?),
+            ShaderCode::Source(source) => Cow::Owned(compile_shader(
+                kind,
+                *source,
+                entry_point,
+                "",
+                shaderc::CompileOptions::new().unwrap(),
+            )?),
             ShaderCode::Spirv(spirv) => Cow::Borrowed(*spirv),
         };
 
@@ -805,6 +552,22 @@ impl Device {
         Ok(module)
     }
 
+    fn create_descriptor_set_layout(&self, arguments: &ArgumentsLayout) -> vk::DescriptorSetLayout {
+        let create_info = vk::DescriptorSetLayoutCreateInfo {
+            flags: vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR,
+            binding_count: arguments.bindings.len() as u32,
+            p_bindings: arguments.bindings.as_ptr(),
+            ..Default::default()
+        };
+        let sl = unsafe {
+            self.inner
+                .device
+                .create_descriptor_set_layout(&create_info, None)
+                .expect("failed to create descriptor set layout")
+        };
+        sl
+    }
+
     /// Creates a pipeline layout object.
     fn create_pipeline_layout(
         &self,
@@ -814,24 +577,14 @@ impl Device {
     ) -> (Vec<vk::DescriptorSetLayout>, vk::PipelineLayout) {
         let mut set_layouts = Vec::with_capacity(arg_layouts.len());
         for layout in arg_layouts.iter() {
-            let create_info = vk::DescriptorSetLayoutCreateInfo {
-                flags: vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR,
-                binding_count: layout.bindings.len() as u32,
-                p_bindings: layout.bindings.as_ptr(),
-                ..Default::default()
-            };
-            let sl = unsafe {
-                self.inner
-                    .device
-                    .create_descriptor_set_layout(&create_info, None)
-                    .expect("failed to create descriptor set layout")
-            };
-            set_layouts.push(sl);
+            set_layouts.push(self.create_descriptor_set_layout(layout));
         }
 
         let pc_range = match bind_point {
             vk::PipelineBindPoint::GRAPHICS => vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT,
+                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS
+                    | vk::ShaderStageFlags::MESH_EXT
+                    | vk::ShaderStageFlags::TASK_EXT,
                 offset: 0,
                 size: push_constants_size as u32,
             },
@@ -860,6 +613,7 @@ impl Device {
 
         (set_layouts, pipeline_layout)
     }
+
     pub fn create_compute_pipeline(&self, create_info: ComputePipelineCreateInfo) -> Result<ComputePipeline, Error> {
         // ------ create pipeline layout from statically known information ------
         let (descriptor_set_layouts, pipeline_layout) = self.create_pipeline_layout(
@@ -869,13 +623,13 @@ impl Device {
         );
 
         let compute_shader = self.create_shader_module(
-            ShaderKind::Compute,
+            ShaderStage::Compute,
             &create_info.compute_shader.code,
             create_info.compute_shader.entry_point,
         )?;
 
         let create_info = vk::ComputePipelineCreateInfo {
-            flags: Default::default(),
+            flags: vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT,
             stage: vk::PipelineShaderStageCreateInfo {
                 flags: Default::default(),
                 stage: vk::ShaderStageFlags::COMPUTE,
@@ -982,18 +736,18 @@ impl Device {
                 tess_evaluation,
                 geometry,
             } => {
-                let vertex = self.create_shader_module(ShaderKind::Vertex, &vertex.code, vertex.entry_point)?;
+                let vertex = self.create_shader_module(ShaderStage::Vertex, &vertex.code, vertex.entry_point)?;
                 let tess_control = tess_control
                     .as_ref()
-                    .map(|t| self.create_shader_module(ShaderKind::TessControl, &t.code, t.entry_point))
+                    .map(|t| self.create_shader_module(ShaderStage::TessControl, &t.code, t.entry_point))
                     .transpose()?;
                 let tess_evaluation = tess_evaluation
                     .as_ref()
-                    .map(|t| self.create_shader_module(ShaderKind::TessEvaluation, &t.code, t.entry_point))
+                    .map(|t| self.create_shader_module(ShaderStage::TessEvaluation, &t.code, t.entry_point))
                     .transpose()?;
                 let geometry = geometry
                     .as_ref()
-                    .map(|t| self.create_shader_module(ShaderKind::Geometry, &t.code, t.entry_point))
+                    .map(|t| self.create_shader_module(ShaderStage::Geometry, &t.code, t.entry_point))
                     .transpose()?;
 
                 stages.push(vk::PipelineShaderStageCreateInfo {
@@ -1037,7 +791,7 @@ impl Device {
             }
             PreRasterizationShaders::MeshShading { mesh, task } => {
                 if let Some(task) = task {
-                    let task = self.create_shader_module(ShaderKind::Task, &task.code, task.entry_point)?;
+                    let task = self.create_shader_module(ShaderStage::Task, &task.code, task.entry_point)?;
                     stages.push(vk::PipelineShaderStageCreateInfo {
                         flags: Default::default(),
                         stage: vk::ShaderStageFlags::TASK_EXT,
@@ -1048,7 +802,7 @@ impl Device {
                     });
                 }
 
-                let mesh = self.create_shader_module(ShaderKind::Mesh, &mesh.code, mesh.entry_point)?;
+                let mesh = self.create_shader_module(ShaderStage::Mesh, &mesh.code, mesh.entry_point)?;
                 stages.push(vk::PipelineShaderStageCreateInfo {
                     flags: Default::default(),
                     stage: vk::ShaderStageFlags::MESH_EXT,
@@ -1061,7 +815,7 @@ impl Device {
         };
 
         let fragment = self.create_shader_module(
-            ShaderKind::Fragment,
+            ShaderStage::Fragment,
             &create_info.fragment_shader.code,
             create_info.fragment_shader.entry_point,
         )?;
@@ -1109,6 +863,7 @@ impl Device {
         let conservative_rasterization_state = vk::PipelineRasterizationConservativeStateCreateInfoEXT {
             p_next: &line_rasterization_state as *const _ as *const _,
             conservative_rasterization_mode: create_info.rasterization.conservative_rasterization_mode.into(),
+            //extra_primitive_overestimation_size: 0.1,
             ..Default::default()
         };
 
@@ -1166,13 +921,16 @@ impl Device {
             color_attachment_count: create_info.fragment_output.color_attachment_formats.len() as u32,
             p_color_attachment_formats: create_info.fragment_output.color_attachment_formats.as_ptr(),
             depth_attachment_format: create_info.fragment_output.depth_attachment_format.unwrap_or_default(),
-            stencil_attachment_format: create_info.fragment_output.stencil_attachment_format.unwrap_or_default(),
+            stencil_attachment_format: create_info
+                .fragment_output
+                .stencil_attachment_format
+                .unwrap_or_default(),
             ..Default::default()
         };
 
         let pipeline_create_info = vk::GraphicsPipelineCreateInfo {
             p_next: &rendering_info as *const _ as *const _,
-            flags: Default::default(),
+            flags: vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT,
             stage_count: stages.len() as u32,
             p_stages: stages.as_ptr(),
             p_vertex_input_state: &vertex_input_state,

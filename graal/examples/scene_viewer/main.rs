@@ -18,7 +18,7 @@ fn main() {
     let surface = graal::get_vulkan_surface(window.raw_window_handle().unwrap());
 
     let (device, mut queue) =
-        unsafe { graal::create_device_and_queue(Some(surface)).expect("failed to create device") };
+        unsafe { graal::create_device_and_command_stream(Some(surface)).expect("failed to create device") };
     let surface_format = unsafe { device.get_preferred_surface_format(surface) };
     let mut swapchain = unsafe { device.create_swapchain(surface, surface_format, window.inner_size().into()) };
 

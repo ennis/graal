@@ -58,8 +58,9 @@ pub struct ImageViewInfo {
 }
 
 bitflags! {
+    /// NOTE: if you modify this, also update `graal-macros/argument.rs`, it uses the raw values.
     #[derive(Copy,Clone,Debug,PartialEq,Eq,Hash)]
-    pub struct ResourceUse: u32 {
+    pub struct BufferAccess: u32 {
         /// The resource is in an unknown state.
         const UNINITIALIZED = 1 << 0;
 
@@ -69,6 +70,7 @@ bitflags! {
         const COPY_SRC = 1 << 1;
         /// The destination of a hardware copy.
         const COPY_DST = 1 << 2;
+
         // Buffer-only uses
 
         /// The index buffer used for drawing.
@@ -88,21 +90,41 @@ bitflags! {
         /// Read-write or write-only storage buffer usage.
         const STORAGE_READ_WRITE = 1 << 10;
 
-
-        /// Valid use bits for buffers.
-        const BUFFER_VALID =
+        const INCLUSIVE =
             Self::COPY_SRC.bits()
-            | Self::COPY_DST.bits()
             | Self::INDEX.bits()
             | Self::VERTEX.bits()
             | Self::UNIFORM.bits()
-            | Self::INDIRECT.bits()
-            | Self::MAP_READ.bits()
-            | Self::MAP_WRITE.bits()
+            | Self::STORAGE_READ.bits()
+            | Self::INDIRECT.bits();
+
+        const EXCLUSIVE =
+            Self::COPY_DST.bits()
             | Self::STORAGE_READ.bits()
             | Self::STORAGE_READ_WRITE.bits();
 
-        // Image-only uses
+        /// The combination of all usages that the are guaranteed to be be ordered by the hardware.
+        /// If a usage is ordered, then if the texture state doesn't change between draw calls, there
+        /// are no barriers needed for synchronization.
+        const ORDERED =
+            Self::INCLUSIVE.bits()
+            | Self::STORAGE_READ.bits()
+            | Self::MAP_WRITE.bits();
+    }
+}
+
+bitflags! {
+    /// NOTE: if you modify this, also update `graal-macros/argument.rs`, it uses the raw values.
+    #[derive(Copy,Clone,Debug,PartialEq,Eq,Hash)]
+    pub struct ImageAccess: u32 {
+        /// The resource is in an unknown state.
+        const UNINITIALIZED = 1 << 0;
+
+        /// The source of a hardware copy.
+        const COPY_SRC = 1 << 1;
+        /// The destination of a hardware copy.
+        const COPY_DST = 1 << 2;
+
 
         /// Read-only sampled or fetched resource.
         const SAMPLED_READ = 1 << 11;
@@ -119,37 +141,17 @@ bitflags! {
         /// Ready to present image to the surface.
         const PRESENT = 1 << 17;
 
-        /// Valid use bits for images.
-        const IMAGE_VALID =
-            Self::COPY_SRC.bits()
-            | Self::COPY_DST.bits()
-            | Self::SAMPLED_READ.bits()
-            | Self::COLOR_TARGET.bits()
-            | Self::DEPTH_STENCIL_READ.bits()
-            | Self::DEPTH_STENCIL_WRITE.bits()
-            | Self::IMAGE_READ.bits()
-            | Self::IMAGE_READ_WRITE.bits()
-            | Self::PRESENT.bits();
-
-
         /// The combination of states that a resource may be in _at the same time_.
         const INCLUSIVE =
             Self::COPY_SRC.bits()
             | Self::SAMPLED_READ.bits()
-            | Self::DEPTH_STENCIL_READ.bits()
-            | Self::INDEX.bits()
-            | Self::VERTEX.bits()
-            | Self::UNIFORM.bits()
-            | Self::STORAGE_READ.bits()
-            | Self::INDIRECT.bits();
+            | Self::DEPTH_STENCIL_READ.bits();
 
         /// The combination of states that a texture must exclusively be in.
         const EXCLUSIVE =
             Self::COPY_DST.bits()
             | Self::COLOR_TARGET.bits()
             | Self::DEPTH_STENCIL_WRITE.bits()
-            | Self::STORAGE_READ.bits()
-            | Self::STORAGE_READ_WRITE.bits()
             | Self::PRESENT.bits();
 
         /// The combination of all usages that the are guaranteed to be be ordered by the hardware.
@@ -158,77 +160,20 @@ bitflags! {
         const ORDERED =
             Self::INCLUSIVE.bits()
             | Self::COLOR_TARGET.bits()
-            | Self::DEPTH_STENCIL_WRITE.bits()
-            | Self::STORAGE_READ.bits()
-            | Self::MAP_WRITE.bits();
-
-
-        /// Flag used by the wgpu-core texture tracker to say that the tracker does not know the state of the sub-resource.
-        /// This is different from UNINITIALIZED as that says the tracker does know, but the texture has not been initialized.
-        const UNKNOWN = 1 << 18;
+            | Self::DEPTH_STENCIL_WRITE.bits();
     }
 }
 
-impl ResourceUse {
+impl BufferAccess {
     pub fn all_ordered(self) -> bool {
         Self::ORDERED.contains(self)
     }
 }
 
-#[derive(Copy, Clone, Debug)]
-pub struct ResourceStateOld {
-    /// Stages that will access the resource.
-    pub stages: vk::PipelineStageFlags2,
-    /// Access flags for the resource.
-    pub access: vk::AccessFlags2,
-    /// Requested layout for the resource.
-    pub layout: vk::ImageLayout,
-}
-
-impl ResourceStateOld {
-    pub const TRANSFER_SRC: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::TRANSFER,
-        access: vk::AccessFlags2::TRANSFER_READ,
-        layout: vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-    };
-    pub const TRANSFER_DST: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::TRANSFER,
-        access: vk::AccessFlags2::TRANSFER_WRITE,
-        layout: vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-    };
-    pub const SHADER_READ: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::ALL_GRAPHICS,
-        access: vk::AccessFlags2::SHADER_READ,
-        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-    };
-    pub const COLOR_ATTACHMENT_OUTPUT: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT,
-        access: vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
-        layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-    };
-    pub const DEPTH_STENCIL_ATTACHMENT: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::from_raw(
-            vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS.as_raw()
-                | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS.as_raw(),
-        ),
-        access: vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE,
-        layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-    };
-    pub const VERTEX_BUFFER: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::VERTEX_INPUT,
-        access: vk::AccessFlags2::VERTEX_ATTRIBUTE_READ,
-        layout: vk::ImageLayout::UNDEFINED,
-    };
-    pub const INDEX_BUFFER: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::VERTEX_INPUT,
-        access: vk::AccessFlags2::INDEX_READ,
-        layout: vk::ImageLayout::UNDEFINED,
-    };
-    pub const PRESENT: ResourceStateOld = ResourceStateOld {
-        stages: vk::PipelineStageFlags2::NONE,
-        access: vk::AccessFlags2::NONE,
-        layout: vk::ImageLayout::PRESENT_SRC_KHR,
-    };
+impl ImageAccess {
+    pub fn all_ordered(self) -> bool {
+        Self::ORDERED.contains(self)
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -339,6 +284,7 @@ bitflags! {
         const INDEX_BUFFER = 0b100_0000;
         const VERTEX_BUFFER = 0b1000_0000;
         const INDIRECT_BUFFER = 0b1_0000_0000;
+        const ARGUMENT_BUFFER = 0b10_0000_0000;
     }
 }
 
@@ -1495,7 +1441,7 @@ pub enum ShaderSource<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum ShaderKind {
+pub enum ShaderStage {
     Vertex,
     Fragment,
     Geometry,
@@ -1506,17 +1452,17 @@ pub enum ShaderKind {
     Task,
 }
 
-impl ShaderKind {
+impl ShaderStage {
     pub fn to_vk_shader_stage(&self) -> vk::ShaderStageFlags {
         match self {
-            ShaderKind::Vertex => vk::ShaderStageFlags::VERTEX,
-            ShaderKind::Fragment => vk::ShaderStageFlags::FRAGMENT,
-            ShaderKind::Compute => vk::ShaderStageFlags::COMPUTE,
-            ShaderKind::Geometry => vk::ShaderStageFlags::GEOMETRY,
-            ShaderKind::TessControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
-            ShaderKind::TessEvaluation => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-            ShaderKind::Mesh => vk::ShaderStageFlags::MESH_NV,
-            ShaderKind::Task => vk::ShaderStageFlags::TASK_NV,
+            ShaderStage::Vertex => vk::ShaderStageFlags::VERTEX,
+            ShaderStage::Fragment => vk::ShaderStageFlags::FRAGMENT,
+            ShaderStage::Compute => vk::ShaderStageFlags::COMPUTE,
+            ShaderStage::Geometry => vk::ShaderStageFlags::GEOMETRY,
+            ShaderStage::TessControl => vk::ShaderStageFlags::TESSELLATION_CONTROL,
+            ShaderStage::TessEvaluation => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+            ShaderStage::Mesh => vk::ShaderStageFlags::MESH_NV,
+            ShaderStage::Task => vk::ShaderStageFlags::TASK_NV,
         }
     }
 }

@@ -1,21 +1,23 @@
 //! Memory resources (images and buffers) and resource groups.
-use std::{mem, ptr};
+use std::{
+    ffi::c_void,
+    mem, ptr,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+};
 
-use ash::vk::Handle;
 use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 use tracing::debug;
 
 use crate::{
-    aspects_for_format,
-    device::{BufferId, Device, GroupId, ImageId, ResourceAllocation, ResourceId},
-    is_write_access, vk, Buffer, BufferCreateInfo, BufferUsage, Image, ImageCreateInfo, MemoryLocation, ResourceUse,
-    Size3D, TypedBuffer,
+    device::{Device, GroupId, ResourceAllocation},
+    is_write_access, vk, BufferAccess, BufferInner, BufferUntyped, BufferUsage, Image, ImageCreateInfo, ImageInner,
+    ImageView, ImageViewInfo, ImageViewInner, MemoryLocation, Resource, Size3D,
 };
 
-use super::{
-    BufferRegistrationInfo, BufferResource, DeferredDeletionList, DeferredDeletionObject, ImageRegistrationInfo,
-    ImageResource, OwnerQueue, RefCount, RefCounted, Resource, ResourceKind, ResourceRegistrationInfo,
-};
+use super::{DeferredDeletionList, DeferredDeletionObject};
 
 pub(crate) struct ResourceGroup {
     // The timeline values that a pass needs to wait for to ensure an execution dependency between the pass
@@ -49,20 +51,14 @@ impl Device {
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
     /// Creates a new buffer resource.
-    pub fn create_buffer(
-        &self,
-        name: &str,
-        usage: BufferUsage,
-        memory_location: MemoryLocation,
-        byte_size: u64,
-    ) -> Buffer {
+    pub fn create_buffer(&self, usage: BufferUsage, memory_location: MemoryLocation, byte_size: u64) -> BufferUntyped {
         assert!(byte_size > 0, "buffer size must be greater than zero");
 
         // create the buffer object first
         let create_info = vk::BufferCreateInfo {
             flags: Default::default(),
             size: byte_size,
-            usage: usage.into(),
+            usage: usage.to_vk_buffer_usage_flags() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             sharing_mode: vk::SharingMode::EXCLUSIVE,
             queue_family_index_count: 0,
             p_queue_family_indices: ptr::null(),
@@ -79,7 +75,7 @@ impl Device {
         let mem_req = unsafe { self.inner.device.get_buffer_memory_requirements(handle) };
 
         let allocation_create_desc = AllocationCreateDesc {
-            name,
+            name: "",
             requirements: mem_req,
             location: memory_location,
             linear: true,
@@ -88,7 +84,8 @@ impl Device {
         let allocation = self
             .inner
             .allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .allocate(&allocation_create_desc)
             .expect("failed to allocate device memory");
         unsafe {
@@ -99,21 +96,10 @@ impl Device {
         }
         let mapped_ptr = allocation.mapped_ptr();
         let allocation = ResourceAllocation::Allocation { allocation };
+        let inner = unsafe { self.register_buffer(allocation, handle) };
 
-        let id = unsafe {
-            self.register_buffer_resource(BufferRegistrationInfo {
-                resource: ResourceRegistrationInfo {
-                    name,
-                    initial_wait: None,
-                    allocation,
-                },
-                handle,
-            })
-        };
-
-        Buffer {
-            device: self.clone(),
-            id,
+        BufferUntyped {
+            inner,
             handle,
             size: byte_size,
             usage,
@@ -122,31 +108,62 @@ impl Device {
     }
 
     /// Registers an existing buffer resource.
-    pub unsafe fn register_buffer_resource(&self, info: BufferRegistrationInfo) -> RefCounted<BufferId> {
-        let id = self
-            .register_resource(
-                info.resource,
-                ResourceKind::Buffer(BufferResource { handle: info.handle }),
-            )
-            .map(BufferId);
-        self.inner
-            .tracker
-            .borrow_mut()
-            .use_buffer_raw(
-                id.value,
-                info.handle,
-                ResourceUse::UNINITIALIZED,
-                ResourceUse::UNINITIALIZED,
-                false,
-            )
-            .expect("invalid resource id");
-        id
+    pub unsafe fn register_buffer(&self, allocation: ResourceAllocation, handle: vk::Buffer) -> Arc<BufferInner> {
+        let device_address = self.get_buffer_device_address(&vk::BufferDeviceAddressInfo {
+            buffer: handle,
+            ..Default::default()
+        });
+
+        let mut buffer_ids = self.inner.buffer_ids.lock().unwrap();
+        let id = buffer_ids.insert_with_key(|id| {
+            Arc::new(BufferInner {
+                device: self.clone(),
+                id,
+                last_submission_index: AtomicU64::new(0),
+                allocation,
+                group: None,
+                handle,
+                device_address,
+            })
+        });
+        buffer_ids.get(id).unwrap().clone()
     }
 
-    /*/// Destroys a buffer resource.
-    pub unsafe fn destroy_buffer(&self, id: BufferId) {
-        self.destroy_resource(id.into());
-    }*/
+    pub unsafe fn register_image(
+        &self,
+        allocation: ResourceAllocation,
+        handle: vk::Image,
+        format: vk::Format,
+    ) -> Arc<ImageInner> {
+        self.register_image_inner(allocation, handle, format, false)
+    }
+
+    pub(crate) fn register_swapchain_image(&self, handle: vk::Image, format: vk::Format) -> Arc<ImageInner> {
+        self.register_image_inner(ResourceAllocation::External, handle, format, true)
+    }
+
+    fn register_image_inner(
+        &self,
+        allocation: ResourceAllocation,
+        handle: vk::Image,
+        format: vk::Format,
+        swapchain_image: bool,
+    ) -> Arc<ImageInner> {
+        let mut image_ids = self.inner.image_ids.lock().unwrap();
+        let id = image_ids.insert_with_key(|id| {
+            Arc::new(ImageInner {
+                device: self.clone(),
+                id,
+                last_submission_index: AtomicU64::new(0),
+                allocation,
+                group: None,
+                handle,
+                swapchain_image,
+                format,
+            })
+        });
+        image_ids.get(id).unwrap().clone()
+    }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // IMAGES
@@ -163,7 +180,7 @@ impl Device {
     ///
     /// # Examples
     ///
-    pub fn create_image(&self, name: &str, image_info: &ImageCreateInfo) -> Image {
+    pub fn create_image(&self, image_info: &ImageCreateInfo) -> Image {
         let create_info = vk::ImageCreateInfo {
             image_type: image_info.type_.into(),
             format: image_info.format,
@@ -190,9 +207,8 @@ impl Device {
         };
         let mem_req = unsafe { self.inner.device.get_image_memory_requirements(handle) };
 
-        // allocate immediately
         let allocation_create_desc = AllocationCreateDesc {
-            name,
+            name: "",
             requirements: mem_req,
             location: image_info.memory_location,
             linear: true,
@@ -201,7 +217,8 @@ impl Device {
         let allocation = self
             .inner
             .allocator
-            .borrow_mut()
+            .lock()
+            .unwrap()
             .allocate(&allocation_create_desc)
             .expect("failed to allocate device memory");
         unsafe {
@@ -212,22 +229,12 @@ impl Device {
         }
 
         // register the resource in the context
-        let id = unsafe {
-            self.register_image_resource(ImageRegistrationInfo {
-                resource: ResourceRegistrationInfo {
-                    name,
-                    allocation: ResourceAllocation::Allocation { allocation },
-                    initial_wait: None,
-                },
-                handle,
-                format: image_info.format,
-            })
-        };
+        let inner =
+            unsafe { self.register_image(ResourceAllocation::Allocation { allocation }, handle, image_info.format) };
 
         Image {
-            device: self.clone(),
-            id,
             handle,
+            inner,
             usage: image_info.usage,
             type_: image_info.type_,
             format: image_info.format,
@@ -239,37 +246,63 @@ impl Device {
         }
     }
 
-    /// Registers an existing image resource.
-    pub unsafe fn register_image_resource(&self, info: ImageRegistrationInfo) -> RefCounted<ImageId> {
-        let id = self
-            .register_resource(
-                info.resource,
-                ResourceKind::Image(ImageResource {
-                    handle: info.handle,
-                    format: info.format,
-                    all_aspects: aspects_for_format(info.format),
-                }),
-            )
-            .map(ImageId);
-        self.inner
-            .tracker
-            .borrow_mut()
-            .use_image_inner(
-                id.value,
-                info.handle,
-                info.format,
-                ResourceUse::UNINITIALIZED,
-                ResourceUse::UNINITIALIZED,
-                false,
-            )
-            .expect("invalid resource id");
-        id
-    }
+    pub fn create_image_view(&self, image: &Image, info: &ImageViewInfo) -> ImageView {
+        // FIXME: support non-zero base mip level
+        if info.subresource_range.base_mip_level != 0 {
+            unimplemented!("non-zero base mip level");
+        }
 
-    /*/// Destroys an image resource.
-    pub unsafe fn destroy_image(&self, id: ImageId) {
-        self.destroy_resource(id.into());
-    }*/
+        let create_info = vk::ImageViewCreateInfo {
+            flags: vk::ImageViewCreateFlags::empty(),
+            image: image.handle,
+            view_type: info.view_type,
+            format: info.format,
+            components: vk::ComponentMapping {
+                r: info.component_mapping[0],
+                g: info.component_mapping[1],
+                b: info.component_mapping[2],
+                a: info.component_mapping[3],
+            },
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: info.subresource_range.aspect_mask,
+                base_mip_level: info.subresource_range.base_mip_level,
+                level_count: info.subresource_range.level_count,
+                base_array_layer: info.subresource_range.base_array_layer,
+                layer_count: info.subresource_range.layer_count,
+            },
+            ..Default::default()
+        };
+
+        // SAFETY: the device is valid, the create info is valid
+        let handle = unsafe {
+            self.inner
+                .device
+                .create_image_view(&create_info, None)
+                .expect("failed to create image view")
+        };
+
+        let mut image_view_ids = self.inner.image_view_ids.lock().unwrap();
+        let id = image_view_ids.insert_with_key(|id| {
+            Arc::new(ImageViewInner {
+                image: image.inner.clone(),
+                id,
+                handle,
+                last_submission_index: AtomicU64::new(0),
+            })
+        });
+        let inner = image_view_ids.get(id).unwrap().clone();
+
+        ImageView {
+            inner,
+            image: image.id(),
+            handle,
+            image_handle: image.handle,
+            format: info.format,
+            original_format: image.format,
+            // TODO: size of mip level
+            size: image.size,
+        }
+    }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // RESOURCE GROUPS
@@ -287,7 +320,7 @@ impl Device {
     ) -> GroupId {
         // resource groups are for read-only resources
         assert!(!is_write_access(dst_access_mask));
-        self.inner.resource_groups.borrow_mut().insert(ResourceGroup {
+        self.inner.groups.lock().unwrap().insert(ResourceGroup {
             //wait: Default::default(),
             src_stage_mask: Default::default(),
             dst_stage_mask,
@@ -298,14 +331,14 @@ impl Device {
 
     /// Destroys a resource group.
     pub fn destroy_resource_group(&self, group_id: GroupId) {
-        self.inner.resource_groups.borrow_mut().remove(group_id);
+        self.inner.groups.lock().unwrap().remove(group_id);
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
     // NON-RESOURCE OBJECTS
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
-    pub unsafe fn delete_later(&self, object: impl Into<DeferredDeletionObject>) {
+    /*pub unsafe fn delete_later(&self, object: impl Into<DeferredDeletionObject>) {
         let object = object.into();
 
         // get next submission timestamps on all queues
@@ -333,10 +366,10 @@ impl Device {
                 last.objects.push(object);
             }
         }
-    }
+    }*/
 
     fn cleanup_objects(&self) {
-        let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
+        /*let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
 
         // fetch the completed timestamps on all queues
         let mut completed_timestamps = vec![0; self.inner.queues.len()];
@@ -354,9 +387,6 @@ impl Device {
             if expired {
                 for obj in list.objects.iter() {
                     match obj {
-                        DeferredDeletionObject::ImageView(view) => unsafe {
-                            self.inner.device.destroy_image_view(*view, None);
-                        },
                         DeferredDeletionObject::Sampler(sampler) => unsafe {
                             self.inner.device.destroy_sampler(*sampler, None);
                         },
@@ -380,100 +410,123 @@ impl Device {
             }
 
             !expired
-        });
+        });*/
     }
 
-    // Cleanup expired resources on the specified queue.
-    pub(crate) unsafe fn cleanup_queue_resources(&self, queue_index: usize, completed_timestamp: u64) {
-        let mut resources = self.inner.resources.borrow_mut();
-        resources.retain(|_id, resource| {
-            if resource.ref_count.is_unique()
-                // TODO: the condition is always true for now
-                && resource.owner == OwnerQueue::Exclusive(queue_index)
-                && resource.timestamp <= completed_timestamp
-            {
-                self.destroy_resource_now(resource);
-                false
-            } else {
-                true
-            }
-        });
-
-        // We cleanup non-memory resources here, even though they're not associated with the queue.
-        //
-        // We could also do that in an hypothetical `Device::end_frame` method,
-        // but we don't want to add another method that the user would need to call periodically
-        // when there's already `Queue::end_frame` (which calls cleanup_queue_resources).
-        self.cleanup_objects();
+    // Called by `Buffer::drop`
+    pub(crate) fn drop_buffer(&self, inner: &Arc<BufferInner>) {
+        //self.inner.buffer_ids.lock().unwrap().remove(inner.id);
+        //self.inner.tracker.lock().unwrap().buffers.remove(inner.id);
+        self.delete_later(inner);
     }
 
-    pub(crate) fn set_current_queue_timestamp(&self, queue: usize, timestamp: u64) {
-        self.inner.queues[queue].next_submission_timestamp.set(timestamp);
+    pub(crate) fn drop_image(&self, inner: &Arc<ImageInner>) {
+        //self.inner.image_ids.lock().unwrap().remove(inner.id);
+        //self.inner.tracker.lock().unwrap().images.remove(inner.id);
+        self.delete_later(inner);
     }
 
-    ////////////////////////////////////////////////////////////////////////////////////////////////
-    // INTERNALS
-    ////////////////////////////////////////////////////////////////////////////////////////////////
+    pub(crate) fn drop_image_view(&self, inner: &Arc<ImageViewInner>) {
+        //self.inner.image_view_ids.lock().unwrap().remove(inner.id);
+        self.delete_later(inner);
+    }
 
-    // Not used anymore, replaced by a refcount
-    /*/// Marks a resource for deletion once the queue that currently owns it is done with it.
-    unsafe fn destroy_resource(&self, id: ResourceId) {
-        let mut resources = self.inner.resources.borrow_mut();
-        let resource = resources.get_mut(id).expect("invalid resource id");
-        if resource.owner == OwnerQueue::None {
-            // FIXME: and delete right now
-            resources.remove(id);
-        } else {
-            resource.discarded = true;
-        }
-    }*/
+    fn delete_later<R: Resource>(&self, resource: &Arc<R>) {
+        // Otherwise, add it to the list of dropped resources. This list is cleaned-up in TODO.
+        self.inner.dropped_resources.lock().unwrap().insert(resource.clone());
+    }
 
-    unsafe fn destroy_resource_now(&self, resource: &mut Resource) {
-        if let ResourceAllocation::External = resource.allocation {
-            return;
-        }
-
-        // destroy the object
-        match resource.kind {
-            ResourceKind::Buffer(ref buf) => self.inner.device.destroy_buffer(buf.handle, None),
-            ResourceKind::Image(ref img) => self.inner.device.destroy_image(img.handle, None),
-        };
-
-        // release the associated memory
-        // the mem::replace is there to move out the allocation object (which isn't Clone)
-        match mem::replace(&mut resource.allocation, ResourceAllocation::External) {
+    pub(crate) unsafe fn free_memory(&self, allocation: &mut ResourceAllocation) {
+        match mem::replace(allocation, ResourceAllocation::External) {
             ResourceAllocation::Allocation { allocation } => self
                 .inner
                 .allocator
-                .borrow_mut()
+                .lock()
+                .unwrap()
                 .free(allocation)
                 .expect("failed to free memory"),
-            ResourceAllocation::DeviceMemory { device_memory } => {
+            ResourceAllocation::DeviceMemory { device_memory } => unsafe {
                 self.inner.device.free_memory(device_memory, None);
-            }
+            },
             ResourceAllocation::External => {
                 unreachable!()
             }
         }
     }
 
-    unsafe fn register_resource(&self, info: ResourceRegistrationInfo, kind: ResourceKind) -> RefCounted<ResourceId> {
-        let (object_type, object_handle) = match kind {
-            ResourceKind::Buffer(ref buf) => (vk::ObjectType::BUFFER, buf.handle.as_raw()),
-            ResourceKind::Image(ref img) => (vk::ObjectType::IMAGE, img.handle.as_raw()),
+    // Cleanup expired resources.
+    pub fn cleanup(&self) {
+        // TODO multiple queues
+        let queue_timeline = self.inner.queues[0].timeline;
+        let last_completed_submission_index = unsafe {
+            self.get_semaphore_counter_value(queue_timeline)
+                .expect("get_semaphore_counter_value failed")
         };
 
-        let ref_count = RefCount::new();
-        let id = self.inner.resources.borrow_mut().insert(Resource {
-            name: info.name.to_string(),
-            ref_count: ref_count.clone(),
-            kind,
-            allocation: info.allocation,
-            group: None,
-            owner: OwnerQueue::None,
-            timestamp: 0,
+        let mut tracker = self.inner.tracker.lock().unwrap();
+        let mut image_ids = self.inner.image_ids.lock().unwrap();
+        let mut buffer_ids = self.inner.buffer_ids.lock().unwrap();
+        let mut image_view_ids = self.inner.image_view_ids.lock().unwrap();
+        let mut dropped_resources = self.inner.dropped_resources.lock().unwrap();
+
+        // FIXME: we should also make sure that there's no pending reference to the resource in an unsubmitted command stream,
+        // otherwise the resource will be destroyed on submission
+        dropped_resources.images.retain(|id, image| {
+            if image.last_submission_index.load(Ordering::Relaxed) <= last_completed_submission_index {
+                image_ids.remove(*id);
+                false
+            } else {
+                true
+            }
         });
-        self.set_debug_object_name(object_type, object_handle, info.name, None);
-        RefCounted::new(id, ref_count)
+        dropped_resources.buffers.retain(|id, buffer| {
+            if buffer.last_submission_index.load(Ordering::Relaxed) <= last_completed_submission_index {
+                buffer_ids.remove(*id);
+                false
+            } else {
+                true
+            }
+        });
+        dropped_resources.image_views.retain(|id, image_view| {
+            if image_view.last_submission_index.load(Ordering::Relaxed) <= last_completed_submission_index {
+                image_view_ids.remove(*id);
+                false
+            } else {
+                true
+            }
+        });
+
+        // process all completed submissions, oldest to newest
+        //let mut active_submissions = tracker.active_submissions.lock().unwrap();
+        let mut free_command_pools = self.inner.free_command_pools.lock().unwrap();
+
+        loop {
+            let Some(submission) = tracker.active_submissions.front() else {
+                break;
+            };
+            if submission.index > last_completed_submission_index {
+                break;
+            }
+            debug!("cleaning up submission {}", submission.index);
+            let submission = tracker.active_submissions.pop_front().unwrap();
+            for mut command_pool in submission.command_pools {
+                // SAFETY: command buffers are not in use anymore
+                unsafe {
+                    command_pool.reset(&self.inner.device);
+                }
+                free_command_pools.push(command_pool);
+            }
+        }
+
+        // We cleanup non-memory resources here, even though they're not associated with the queue.
+        //
+        // We could also do that in an hypothetical `Device::end_frame` method,
+        // but we don't want to add another method that the user would need to call periodically
+        // when there's already `Queue::end_frame` (which calls cleanup_queue_resources).
+        //self.cleanup_objects();
+    }
+
+    pub(crate) fn set_current_queue_timestamp(&self, queue: usize, timestamp: u64) {
+        self.inner.queues[queue].next_submission_timestamp.set(timestamp);
     }
 }

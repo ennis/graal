@@ -1,4 +1,4 @@
-use graal::Queue;
+use graal::CommandStream;
 use winit::{
     event::MouseButton,
     keyboard::{Key, NamedKey},
@@ -27,6 +27,6 @@ impl App {
         // TODO
     }
 
-    pub fn render(&mut self, queue: &mut Queue) {}
+    pub fn render(&mut self, queue: &mut CommandStream) {}
     pub fn on_exit(&mut self) {}
 }

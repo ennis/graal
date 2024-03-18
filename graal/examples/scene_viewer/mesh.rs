@@ -1,6 +1,6 @@
 use crate::aabb::AABB;
 use glam::Vec3;
-use graal::{TypedBuffer, Vertex};
+use graal::{Buffer, Vertex};
 
 /// Represents a vertex with position, normal and tangent attributes.
 #[derive(Copy, Clone, Debug, Vertex)]
@@ -15,10 +15,10 @@ pub struct Vertex3D {
 #[derive(Copy, Clone, Debug)]
 pub struct MeshData {
     /// GPU vertex buffer containing vertex attributes.
-    pub vertex_buffer: TypedBuffer<Vertex3D>,
+    pub vertex_buffer: Buffer<Vertex3D>,
 
     /// GPU index buffer containing vertex indices.
-    pub index_buffer: TypedBuffer<u32>,
+    pub index_buffer: Buffer<u32>,
 
     /// Number of vertices.
     pub vertex_count: usize,

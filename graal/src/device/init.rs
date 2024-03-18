@@ -1,20 +1,20 @@
 //! Device initialization helpers
 use std::{
-    cell::{Cell, RefCell},
+    cell::Cell,
     ffi::{c_void, CStr, CString},
     ptr,
     rc::Rc,
+    sync::{Arc, Mutex},
 };
 
 use tracing::debug;
 
 use crate::{
     instance::{get_vulkan_entry, get_vulkan_instance, vk_khr_surface},
-    platform_impl, vk,
+    platform_impl, vk, ResourceMaps,
 };
-use crate::tracker::Tracker;
 
-use super::{Device, DeviceCreateError, DeviceInner, Queue, QueueData, QueueFamilyConfig};
+use super::{CommandStream, Device, DeviceCreateError, DeviceInner, DeviceTracker, QueueFamilyConfig, QueueShared};
 
 struct PhysicalDeviceAndProperties {
     physical_device: vk::PhysicalDevice,
@@ -134,6 +134,8 @@ const DEVICE_EXTENSIONS: &[&str] = &[
     "VK_EXT_line_rasterization",
     "VK_EXT_mesh_shader",
     "VK_EXT_conservative_rasterization",
+    "VK_EXT_fragment_shader_interlock",
+    //"VK_EXT_descriptor_buffer",
 ];
 
 impl Device {
@@ -209,13 +211,16 @@ impl Device {
                     .create_semaphore(&semaphore_create_info, None)
                     .expect("failed to queue timeline semaphore");
 
-                queues.push(QueueData {
-                    family_index: cfg.family_index,
-                    index: i,
+                let global_index = queues.len() as u32;
+                queues.push(Arc::new(QueueShared {
+                    family: cfg.family_index,
+                    index_in_family: i,
+                    index: global_index,
                     queue,
                     timeline,
                     next_submission_timestamp: Cell::new(1),
-                });
+                    free_command_pools: Mutex::new(vec![]),
+                }));
             }
         }
 
@@ -225,24 +230,33 @@ impl Device {
             debug_settings: Default::default(),
             device: device.clone(),     // not cheap!
             instance: instance.clone(), // not cheap!
-            buffer_device_address: false,
+            buffer_device_address: true,
             allocation_sizes: Default::default(),
         };
 
         let allocator =
             gpu_allocator::vulkan::Allocator::new(&allocator_create_desc).expect("failed to create GPU allocator");
 
-        // More stuff
+        // Extensions
         let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(instance, &device);
         let vk_ext_shader_object = ash::extensions::ext::ShaderObject::new(instance, &device);
         let vk_khr_push_descriptor = ash::extensions::khr::PushDescriptor::new(instance, &device);
         let vk_ext_extended_dynamic_state3 = ash::extensions::ext::ExtendedDynamicState3::new(instance, &device);
         let vk_ext_mesh_shader = ash::extensions::ext::MeshShader::new(instance, &device);
+        let vk_ext_descriptor_buffer = ash::extensions::ext::DescriptorBuffer::new(instance, &device);
         let physical_device_memory_properties = instance.get_physical_device_memory_properties(physical_device);
         let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
-        let physical_device_properties = instance.get_physical_device_properties(physical_device);
 
-        // Compiler
+        let mut physical_device_descriptor_buffer_properties =
+            vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
+        let mut physical_device_properties = vk::PhysicalDeviceProperties2 {
+            p_next: &mut physical_device_descriptor_buffer_properties as *mut _ as *mut c_void,
+            ..Default::default()
+        };
+
+        instance.get_physical_device_properties2(physical_device, &mut physical_device_properties);
+
+        // Create the shader compiler instance
         let compiler = shaderc::Compiler::new().expect("failed to create the shader compiler");
 
         Ok(Device {
@@ -251,20 +265,26 @@ impl Device {
                 platform_extensions,
                 physical_device,
                 physical_device_properties,
+                physical_device_descriptor_buffer_properties,
                 physical_device_memory_properties,
                 queues,
-                allocator: RefCell::new(allocator),
+                allocator: Mutex::new(allocator),
                 vk_khr_swapchain,
                 vk_ext_shader_object,
                 vk_khr_push_descriptor,
                 vk_ext_mesh_shader,
                 vk_ext_extended_dynamic_state3,
-                resources: RefCell::new(Default::default()),
-                tracker: RefCell::new(Tracker::new()),
-                resource_groups: RefCell::new(Default::default()),
-                deletion_lists: RefCell::new(vec![]),
-                sampler_cache: RefCell::new(Default::default()),
+                vk_ext_descriptor_buffer,
+                image_ids: Mutex::new(Default::default()),
+                buffer_ids: Mutex::new(Default::default()),
+                tracker: Mutex::new(DeviceTracker::new()),
+                deletion_lists: Mutex::new(vec![]),
+                sampler_cache: Mutex::new(Default::default()),
                 compiler,
+                groups: Mutex::new(Default::default()),
+                free_command_pools: Mutex::new(Default::default()),
+                image_view_ids: Mutex::new(Default::default()),
+                dropped_resources: Mutex::new(ResourceMaps::new()),
             }),
         })
     }
@@ -301,13 +321,20 @@ impl Device {
             ..Default::default()
         }];
 
-        let mut timeline_features = vk::PhysicalDeviceTimelineSemaphoreFeatures {
-            timeline_semaphore: vk::TRUE,
+        let mut fragment_shader_interlock_features = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
+            //p_next: &mut timeline_features as *mut _ as *mut c_void,
+            fragment_shader_pixel_interlock: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut descriptor_buffer_features = vk::PhysicalDeviceDescriptorBufferFeaturesEXT {
+            p_next: &mut fragment_shader_interlock_features as *mut _ as *mut c_void,
+            descriptor_buffer: vk::TRUE,
             ..Default::default()
         };
 
         let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT {
-            p_next: &mut timeline_features as *mut _ as *mut c_void,
+            p_next: &mut descriptor_buffer_features as *mut _ as *mut c_void,
             task_shader: vk::TRUE,
             mesh_shader: vk::TRUE,
             ..Default::default()
@@ -364,8 +391,24 @@ impl Device {
             ..Default::default()
         };
 
-        let mut features2 = vk::PhysicalDeviceFeatures2 {
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features {
             p_next: &mut vk13_features as *mut _ as *mut c_void,
+            descriptor_indexing: vk::TRUE,
+            shader_uniform_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
+            shader_storage_image_array_non_uniform_indexing: vk::TRUE,
+            runtime_descriptor_array: vk::TRUE,
+            buffer_device_address: vk::TRUE,
+            timeline_semaphore: vk::TRUE,
+            storage_buffer8_bit_access: vk::TRUE,
+            shader_int8: vk::TRUE,
+            scalar_block_layout: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut features2 = vk::PhysicalDeviceFeatures2 {
+            p_next: &mut vk12_features as *mut _ as *mut c_void,
             features: vk::PhysicalDeviceFeatures {
                 tessellation_shader: vk::TRUE,
                 fill_mode_non_solid: vk::TRUE,
@@ -416,31 +459,12 @@ impl Device {
     }
 
     /// Returns the physical device properties.
-    pub fn physical_device_properties(&self) -> &vk::PhysicalDeviceProperties {
+    pub fn physical_device_properties(&self) -> &vk::PhysicalDeviceProperties2 {
         &self.inner.physical_device_properties
     }
 
-    ///
-    pub fn get_queue(&self, family_index: u32, index: u32) -> Queue {
-        let global_index = self
-            .inner
-            .queues
-            .iter()
-            .position(|q| q.family_index == family_index && q.index == index)
-            .unwrap();
-        self.get_queue_by_global_index(global_index)
-    }
-
-    pub fn get_queue_by_global_index(&self, global_index: usize) -> Queue {
-        unsafe {
-            Queue::new(
-                self.clone(),
-                global_index,
-                self.inner.queues[global_index].queue,
-                self.inner.queues[global_index].timeline,
-                self.inner.queues[global_index].family_index,
-                self.inner.queues[global_index].next_submission_timestamp.get(),
-            )
-        }
+    pub fn create_command_stream(&self, queue_index: usize) -> CommandStream {
+        let command_pool = self.get_or_create_command_pool(self.inner.queues[queue_index].family);
+        CommandStream::new(self.clone(), command_pool, self.inner.queues[queue_index].clone())
     }
 }

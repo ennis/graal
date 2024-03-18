@@ -1,63 +1,88 @@
-use std::{ffi::c_void, mem};
+use std::{mem, mem::MaybeUninit, slice};
 
 use ash::vk;
 
 use crate::{
-    command::{do_cmd_push_constants, do_cmd_push_descriptor_sets, EncoderBase},
-    Arguments, CommandBuffer, ComputePipeline, Device,
+    command::{do_cmd_push_constants, do_cmd_push_descriptor_sets, DescriptorWrite},
+    ArgumentKind, Arguments, CommandStream, ComputePipeline, Device,
 };
-
-enum ComputeCommand {
-    BindArguments {
-        set: u32,
-        /// Offset in argument array
-        offset: u32,
-        /// Number of arguments
-        count: u32,
-    },
-    BindPipeline {
-        pipeline: vk::Pipeline,
-        pipeline_layout: vk::PipelineLayout,
-    },
-    BindPushConstants {
-        /// Offset in encoder buffer (in bytes)
-        offset: u32,
-        /// Size in bytes
-        size: u32,
-    },
-    Dispatch {
-        group_count_x: u32,
-        group_count_y: u32,
-        group_count_z: u32,
-    },
-}
 
 /// A context object to submit commands to a command buffer after a pipeline has been bound to it.
 ///
 /// This is used in `RenderPass::bind_pipeline`.
 pub struct ComputeEncoder<'a> {
-    base: EncoderBase<'a>,
-    commands: Vec<ComputeCommand>,
+    stream: &'a mut CommandStream,
+    command_buffer: vk::CommandBuffer,
+    pipeline_layout: vk::PipelineLayout,
 }
 
 impl<'a> ComputeEncoder<'a> {
     pub fn device(&self) -> &Device {
-        self.base.command_buffer.device()
+        self.stream.device()
     }
 
     pub fn bind_arguments<A: Arguments>(&mut self, set: u32, arguments: &A) {
+        let mut descriptor_writes = vec![];
+        for arg in arguments.arguments() {
+            match arg.kind {
+                ArgumentKind::Image { image_view, access } => {
+                    self.stream.use_image_view(image_view, access);
+                    descriptor_writes.push(DescriptorWrite::Image {
+                        binding: arg.binding,
+                        descriptor_type: arg.descriptor_type,
+                        image_view: image_view.handle(),
+                        format: image_view.format(),
+                        access,
+                    });
+                }
+                ArgumentKind::Buffer {
+                    buffer,
+                    access,
+                    offset,
+                    size,
+                } => {
+                    self.stream.use_buffer(&buffer.inner, access);
+                    descriptor_writes.push(DescriptorWrite::Buffer {
+                        binding: arg.binding,
+                        descriptor_type: arg.descriptor_type,
+                        buffer: buffer.handle(),
+                        access,
+                        offset,
+                        size,
+                    });
+                }
+                ArgumentKind::Sampler { sampler } => {
+                    descriptor_writes.push(DescriptorWrite::Sampler {
+                        binding: arg.binding,
+                        descriptor_type: arg.descriptor_type,
+                        sampler: sampler.handle(),
+                    });
+                }
+            }
+        }
+
+        let device = self.stream.device();
+
         unsafe {
-            let (offset, count) = self.base.record_arguments(arguments);
-            self.commands.push(ComputeCommand::BindArguments { set, offset, count })
+            do_cmd_push_descriptor_sets(
+                device,
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                set,
+                descriptor_writes.as_slice(),
+            );
         }
     }
 
     // SAFETY: TBD
     pub fn bind_compute_pipeline(&mut self, pipeline: &ComputePipeline) {
-        self.commands.push(ComputeCommand::BindPipeline {
-            pipeline: pipeline.pipeline,
-            pipeline_layout: pipeline.pipeline_layout,
-        })
+        let device = self.stream.device();
+        unsafe {
+            device.cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
+        }
+        self.pipeline_layout = pipeline.pipeline_layout;
+        // TODO: we need to hold a reference to the pipeline until the command buffers are submitted
     }
 
     /// Binds push constants.
@@ -65,77 +90,39 @@ impl<'a> ComputeEncoder<'a> {
     where
         P: Copy + ?Sized,
     {
-        let size = mem::size_of_val(data);
-        let offset = unsafe { self.base.push_constants_raw(size, data as *const _ as *const c_void) };
-        self.commands.push(ComputeCommand::BindPushConstants { offset, size: size as u32 });
+        unsafe {
+            do_cmd_push_constants(
+                &self.stream.device,
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                slice::from_raw_parts(data as *const P as *const MaybeUninit<u8>, mem::size_of_val(data)),
+            );
+        }
     }
 
     pub fn dispatch(&mut self, group_count_x: u32, group_count_y: u32, group_count_z: u32) {
-        self.commands.push(ComputeCommand::Dispatch {
-            group_count_x,
-            group_count_y,
-            group_count_z,
-        })
-    }
-
-    unsafe fn record_compute_commands(&mut self) {
-        self.base.flush_pipeline_barriers();
-
-        let device = &self.base.command_buffer.device;
-        let command_buffer = self.base.command_buffer.command_buffer;
-        let mut current_pipeline_layout = vk::PipelineLayout::null();
-
-        for command in self.commands.iter() {
-            match *command {
-                ComputeCommand::BindPipeline { pipeline, pipeline_layout } => {
-                    device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline);
-                    current_pipeline_layout = pipeline_layout;
-                }
-                ComputeCommand::BindArguments { set, offset, count } => {
-                    do_cmd_push_descriptor_sets(
-                        device,
-                        command_buffer,
-                        vk::PipelineBindPoint::COMPUTE,
-                        current_pipeline_layout,
-                        set,
-                        &self.base.descriptor_writes[(offset as usize)..(offset as usize + count as usize)],
-                    );
-                }
-                ComputeCommand::BindPushConstants { offset, size } => {
-                    do_cmd_push_constants(
-                        device,
-                        command_buffer,
-                        vk::PipelineBindPoint::COMPUTE,
-                        current_pipeline_layout,
-                        &self.base.push_constant_data[(offset as usize)..(offset as usize + size as usize)],
-                    );
-                }
-                ComputeCommand::Dispatch {
-                    group_count_x,
-                    group_count_y,
-                    group_count_z,
-                } => {
-                    device.cmd_dispatch(command_buffer, group_count_x, group_count_y, group_count_z);
-                }
-            }
-        }
-    }
-}
-
-impl<'a> Drop for ComputeEncoder<'a> {
-    fn drop(&mut self) {
+        self.stream.flush_barriers();
         unsafe {
-            self.record_compute_commands();
+            self.stream
+                .device
+                .cmd_dispatch(self.command_buffer, group_count_x, group_count_y, group_count_z);
         }
+    }
+
+    pub fn finish(self) {
+        // Nothing to do. Provided for consistency with other encoders.
     }
 }
 
-impl CommandBuffer {
+impl CommandStream {
     /// Start a compute pass
     pub fn begin_compute(&mut self) -> ComputeEncoder {
+        let command_buffer = self.get_or_create_command_buffer();
         ComputeEncoder {
-            base: EncoderBase::new(self),
-            commands: vec![],
+            stream: self,
+            command_buffer,
+            pipeline_layout: Default::default(),
         }
     }
 }

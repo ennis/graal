@@ -474,3 +474,173 @@ They exist so that GPU commands can be recorded in parallel. But from how many d
 "When the CPU becomes the bottleneck": do we have numbers for recent desktop CPUs?
 
 Multithreaded recording is also less relevant with GPU-driven pipelines, since they may not issue draw calls per object on the CPU.
+
+
+# Arguments next
+
+- Remove special descriptor types (Read{Only,Write}Storage{Image,Buffer}), replace by attributes on argument fields.
+   - Reason: less boilerplate this way
+- Support descriptor arrays
+- Introduce `ArgumentBlock`s that hold descriptors 
+   - also they hold refs to the resources inside
+   - they will need to hold onto ImageView objects
+- Keep track of image views, etc. the same way as resources: record the last use
+- Resurrect resource groups
+
+# Resources next
+
+Keep the current design. In addition:
+- Resources now hold an `Arc<ResourceInner>`, with `ResourceInner` used for tracking: the Arc refcount is used to check if the user 
+  (or any other object) still holds references, and `ResourceInner::timestamp` holds the last submission that uses the resource. 
+  Checking this `Arc` is enough to see if a resource should be deleted or not.
+
+OR:
+- Resources hold `Arc<ImageInner>`, `Arc<BufferInner>`. Trackers hold references to those. 
+- It's easier to hold onto them in argument buffers. Argbuffers need to merge the resources that it references into the parent tracker (the encoder tracker). 
+  The tracker needs: the ID of the resource, a strong reference to it, and the raw handle (to set up pipeline barriers). `Arc<{Buffer,Image}Inner>` has all three in the same location.
+
+
+Note: going through the whole list of resources on every frame is wasteful.
+Alternatives:
+- when the last user reference to the resource is dropped:
+   - remove the resource in the tracker
+   - if it is in use (check last submission index): add it to the list of resources awaiting deletion
+   - otherwise: destroy the resource immediately
+- periodically:
+   - go through the list of resources awaiting deletion
+
+// ArgumentBuffers and encoders:
+// - Buffer references and uses: (Arc<BufferInner>, ResourceUse)
+// - Image references and uses: (Arc<ImageInner>, ResourceUse)
+// - stateless references
+//
+// Command buffers:
+// - Sparse two-sided buffer references and uses: (Arc<BufferInner>, start_state, end_state)
+// - Sparse two-sided image references and uses: (Arc<ImageInner>, start_state, end_state)
+// - stateless references
+//
+// Device tracker:
+// - Dense one-sided buffer references and uses: (Arc<BufferInner>, end_state)
+// - Dense one-sided image references and uses: (Arc<ImageInner>, end_state)
+//
+// Active submissions:
+// - Buffer references
+// - Image references
+// - stateless references
+//
+// Two-sided buffer tracker => BufferTracker
+// Two-sided image tracker => ImageTracker
+// stateless references => individual SecondaryMaps or FxHashMaps
+
+# Command pool allocation
+
+Right now we allocate one command pool per submission, and since we submit often, and usually only one command buffer, this means almost one command pool per command buffer.
+Check whether this matters in relevant drivers.
+
+FIXME: this is broken: nothing guarantees that there aren't unsubmitted command buffers that will be submitted in a later call to `submit_raw`.
+We retire the command pool after the submission, but nothing guarantees that the caller passed all created command buffers back to submit. 
+It's possible to create cbs, submit some of them in one submission, and submit the rest later. We can't retire the command pool unless we know that all CBs are submitted.
+
+=> Impossible to reliably track command pools if we're exposing command buffers to the application as long-lived objects
+
+Implementations:
+- radv, nvk: command pools are just boilerplate; command buffers are allocated separately. Pool flags ignored, reset pool just loops over all command buffers.
+
+Conclusion: don't bother with tracking pools. Just use one pool per-thread and per-queue, and recycle individual command buffers in them.
+
+## Alternative
+
+Do not expose Queues directly, instead expose "command streams".
+Command streams reference a queue and are responsible for allocating command buffers.
+Call `CommandStream::flush` to finish recording and submit all pending command buffers to the GPU.
+`CommandStreams` are tied to a particular thread, but they can be cloned and sent to other threads for multithreaded command recording (`command_stream.fork()`).
+Cloned command streams are "joined" to a parent command stream when dropped: command buffers (and pools) are merged into the main command stream. 
+
+Q: Removing compute/transfer encoders?
+
+Issue: binding arguments and setting push constants need a pipeline bind point (graphics or compute). Previously this was
+not necessary because we knew whether we were in a compute or graphics encoder. Without encoders, we don't. 
+
+
+------------------------------------------------------
+
+
+# Idea 2: a more declarative approach
+
+By simply wrapping the underlying graphics API, there's a lot that is still exposed to users, and a lot of boilerplate necessary (queues, command buffers, encoders, resource usages).
+Plus automatic synchronization is tricky because we don't know the whole frame in advance (e.g. we must defer the actual recording of draw commands because we can't put pipeline barriers in the middle of render passes).
+
+Thus, render graphs. But there are a few things to consider:
+
+## Build every pass VS build once
+If we build the graph on every pass, it's probably not more efficient than the "automatic tracking" approach (the amount of work is equivalent and the API is less flexible).
+So build the graph only when something changes.
+
+## Conditional rendering
+I.e. running a pass conditionally. This may change barriers, so at first this will need a pipeline recompilation.
+
+## Inputs and outputs
+We can't **only** have resources internal to the graph. We need to be able to import / export resources between graphs.
+Those resources need to be allocated and their usage cannot be inferred from usage, since the application can dynamically
+change where they are used.
+Compiler analogy: calls to external libraries.
+This means that tracking of memory resources is still necessary.
+
+## Parameters
+The builder functions for render graphs will need to take a special "Variable" type for parameters that may either be constant
+or dynamic.
+E.g. `clear_image(image, impl Variable<ClearColor>)`.
+Parameters include:
+- image clear color
+- buffer fill value
+- buffer slice start/size
+- viewport x,y,width,height
+- scissor
+- imported image formats (this can affect )
+
+Before execution:
+```rust
+fn execute() {
+  let mut graph_params = GraphParameters::new();
+  graph_params.set(CLEAR_COLOR, ...);   // With CLEAR_COLOR being some kind of typed identifier
+  graph_params.set(INPUT_IMAGE, ...);   // external image
+  device.execute(graph, graph_params);
+}
+```
+
+
+## Arguments
+I'd be nice if we could keep the same structure, and use callbacks to set the uniform buffers. 
+Unfortunately, this means that the callback would be in control of defining which buffers/images are used in the pass, 
+and that will require dynamic tracking.
+
+### Argument arrays
+These are built outside of graphs, and represent groups of external resources.
+
+## Graphs
+- Submitted to one queue only
+- Make them as big as possible
+- They can own long-lived resources, like pipelines 
+  - In fact, pipelines can be tied to graphs
+
+## Conclusion
+
+Challenging:
+- passing arguments
+  - especially things containing lifetimes
+- imported/exported resources
+
+Evolve current API:
+- instead of submitting command buffers, submit render graphs. No tracking necessary inside the render graphs since their structure is known ahead of time.
+
+
+# Argument buffers (groups of resources)
+
+Argument buffers will hold arrays of descriptors to resources (images & buffers). 
+The resulting descriptor set is always bound, and resources are accessed by indexing into the descriptor array in the shader (bindless rendering).
+
+Note that adding a resource to an argument buffer "locks" it into a particular state. The individual resources can't be used as a group anymore.
+
+Use cases:
+- accessing textures by index in a shader: bindless rendering
+- accessing images by index in shaders: both as textures AND as images (requires a layout transition)

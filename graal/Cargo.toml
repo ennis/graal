@@ -19,7 +19,7 @@ ordered-float = "4.1.1"
 shaderc = "0.8.3"
 graal-macros = { workspace = true }
 fxhash = "0.2.1"
-drop_bomb = "0.1.5"
+thread_local = "1.1.7"
 
 [dependencies.winapi]
 version = "0.3.9"

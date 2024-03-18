@@ -48,6 +48,13 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
         //let mut is_argument = false;
         let mut is_binding = false;
         let mut binding_index: Option<u32> = None;
+        let mut read_only = false;
+        let mut read_write = false;
+        let mut storage = false;
+        let mut storage_image = false;
+        let mut uniform = false;
+        let mut sampled_image = false;
+        let mut sampler = false;
 
         for attr in f.attrs.iter() {
             if attr.path().is_ident("argument") {
@@ -60,6 +67,41 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
                         let value = meta.value()?;
                         let index: syn::LitInt = value.parse()?;
                         binding_index = Some(index.base10_parse()?);
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("read_only") {
+                        read_only = true;
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("read_write") {
+                        read_write = true;
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("storage") {
+                        storage = true;
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("storage_image") {
+                        storage_image = true;
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("uniform") {
+                        uniform = true;
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("sampled_image") {
+                        sampled_image = true;
+                        return Ok(());
+                    }
+
+                    if meta.path.is_ident("sampler") {
+                        sampler = true;
                         return Ok(());
                     }
 
@@ -77,6 +119,33 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
                     Err(meta.error("invalid syntax for `#[argument]`"))
                 })?;
             }
+        }
+
+        if read_only && read_write {
+            return Err(syn::Error::new(
+                f.span(),
+                "`read_only` and `read_write` are mutually exclusive",
+            ));
+        }
+        // default to read only access
+        if !(read_only || read_write) {
+            read_only = true;
+        }
+
+        if [storage, storage_image, uniform, sampled_image, sampler]
+            .iter()
+            .filter(|x| **x)
+            .count()
+            > 1
+        {
+            return Err(syn::Error::new(
+                f.span(),
+                "`storage`, `storage_image`, `uniform`, `sampled_image` and `sampler` are mutually exclusive",
+            ));
+        }
+
+        if storage || storage_image || uniform || sampled_image || sampler {
+            is_binding = true;
         }
 
         // determine binding index
@@ -99,16 +168,81 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
             }
             let ty = &f.ty;
 
+            let mut descriptor_type = quote!();
+            let mut access = quote!();
+            let shader_stages: u32 = 0xFF;
+
+            /*
+            /// The index buffer used for drawing.
+            const INDEX = 1 << 3;
+            /// A vertex buffer used for drawing.
+            const VERTEX = 1 << 4;
+            /// A uniform buffer bound in a bind group.
+            const UNIFORM = 1 << 5;
+            /// The indirect or count buffer in a indirect draw or dispatch.
+            const INDIRECT = 1 << 6;
+            /// The argument to a read-only mapping.
+            const MAP_READ = 1 << 7;
+            /// The argument to a write-only mapping.
+            const MAP_WRITE = 1 << 8;
+            /// Read-only storage buffer usage. Corresponds to a UAV in d3d, so is exclusive, despite being read only.
+            const STORAGE_READ = 1 << 9;
+            /// Read-write or write-only storage buffer usage.
+            const STORAGE_READ_WRITE = 1 << 10;*/
+
+            // FIXME: we shouldn't use the raw values here; remove this once the values are moved to a separate crate
+            if storage_image {
+                descriptor_type = quote!(#CRATE::vk::DescriptorType::STORAGE_IMAGE);
+                if read_only {
+                    access = quote!(#CRATE::ImageAccess::IMAGE_READ);
+                } else if read_write {
+                    access = quote!(#CRATE::ImageAccess::IMAGE_READ_WRITE);
+                }
+            } else if sampled_image {
+                descriptor_type = quote!(#CRATE::vk::DescriptorType::SAMPLED_IMAGE);
+                access = quote!(#CRATE::ImageAccess::SAMPLED_READ);
+            } else if uniform {
+                descriptor_type = quote!(#CRATE::vk::DescriptorType::UNIFORM_BUFFER);
+                access = quote!(#CRATE::BufferAccess::UNIFORM);
+            } else if storage {
+                descriptor_type = quote!(#CRATE::vk::DescriptorType::STORAGE_BUFFER);
+                if read_only {
+                    access = quote!(#CRATE::BufferAccess::STORAGE_READ);
+                } else if read_write {
+                    access = quote!(#CRATE::BufferAccess::STORAGE_READ_WRITE);
+                }
+            } else if sampler {
+                descriptor_type = quote!(#CRATE::vk::DescriptorType::SAMPLER);
+            } else {
+                return Err(syn::Error::new(
+                    f.span(),
+                    "invalid argument type; must be `storage`, `storage_image`, `uniform`, `sampled_image` or `sampler`",
+                ));
+            }
+
             bindings.push(quote! {
                 #CRATE::vk::DescriptorSetLayoutBinding {
                     binding              : #binding_index,
-                    stage_flags          : <#ty as #CRATE::Argument>::SHADER_STAGES,
-                    descriptor_type      : <#ty as #CRATE::Argument>::DESCRIPTOR_TYPE,
-                    descriptor_count     : <#ty as #CRATE::Argument>::DESCRIPTOR_COUNT,
+                    stage_flags          : #CRATE::vk::ShaderStageFlags::ALL,
+                    descriptor_type      : #descriptor_type,
+                    descriptor_count     : 1,   // TODO: arrays
                     p_immutable_samplers : ::std::ptr::null()
                 },
             });
-            argument_infos.push(quote!(#CRATE::Argument::argument_description(&self.#member, #binding_index)));
+
+            if storage_image || sampled_image || uniform || storage {
+                argument_infos.push(quote!(#CRATE::ArgumentDescription {
+                    binding: #binding_index,
+                    descriptor_type: #descriptor_type,
+                    kind: #CRATE::ArgumentKind::from((self.#member, #access)),
+                }));
+            } else if sampler {
+                argument_infos.push(quote!(#CRATE::ArgumentDescription {
+                    binding: #binding_index,
+                    descriptor_type: #descriptor_type,
+                    kind: #CRATE::ArgumentKind::from(self.#member),
+                }));
+            };
         } else {
             let ty = &f.ty;
             let data_member_name = data_member_name(i, &f.ident);

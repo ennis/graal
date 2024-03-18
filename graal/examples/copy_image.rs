@@ -1,5 +1,5 @@
-use std::{path::Path, ptr, time::Duration};
 use image::DynamicImage;
+use std::{path::Path, ptr, time::Duration};
 
 use raw_window_handle::HasRawWindowHandle;
 use winit::{
@@ -9,14 +9,13 @@ use winit::{
 };
 
 use graal::{
-    vk, BufferCreateInfo, BufferUsage, Image, ImageCopyBuffer, ImageCopyView, ImageCreateInfo, ImageDataLayout,
-    ImageSubresourceLayers, ImageType, ImageUsage, MemoryLocation, Point3D, Queue, Rect3D,
+    vk, BufferCreateInfo, BufferUsage, CommandStream, Image, ImageCopyBuffer, ImageCopyView, ImageCreateInfo,
+    ImageDataLayout, ImageSubresourceLayers, ImageType, ImageUsage, MemoryLocation, Point3D, Rect3D,
 };
 
-fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipmaps: bool) -> Image {
-
+fn load_image(cmd: &mut CommandStream, path: impl AsRef<Path>, usage: ImageUsage, mipmaps: bool) -> Image {
     let path = path.as_ref();
-    let device = queue.device().clone();
+    let device = cmd.device().clone();
 
     let dyn_image = image::open(path).expect("could not open image file");
 
@@ -25,7 +24,7 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipm
         DynamicImage::ImageLumaA8(_) => (vk::Format::R8G8_UNORM, 2usize),
         DynamicImage::ImageRgb8(_) => (vk::Format::R8G8B8_SRGB, 3usize),
         DynamicImage::ImageRgba8(_) => (vk::Format::R8G8B8A8_SRGB, 4usize),
-        _ => unimplemented!()
+        _ => unimplemented!(),
     };
 
     let width = dyn_image.width();
@@ -34,40 +33,33 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipm
     let mip_levels = graal::mip_level_count(width, height);
 
     // create the texture
-    let image = device.create_image(
-        path.to_str().unwrap(),
-        &ImageCreateInfo {
-            memory_location: MemoryLocation::GpuOnly,
-            type_: ImageType::Image2D,
-            usage: usage | ImageUsage::TRANSFER_DST,
-            format: vk_format,
-            width,
-            height,
-            depth: 1,
-            mip_levels,
-            array_layers: 1,
-            samples: 1,
-        },
-    );
+    let image = device.create_image(&ImageCreateInfo {
+        memory_location: MemoryLocation::GpuOnly,
+        type_: ImageType::Image2D,
+        usage: usage | ImageUsage::TRANSFER_DST,
+        format: vk_format,
+        width,
+        height,
+        depth: 1,
+        mip_levels,
+        array_layers: 1,
+        samples: 1,
+    });
 
     let byte_size = width as u64 * height as u64 * bpp as u64;
 
     // create a staging buffer
-    let staging_buffer = device.create_buffer(
-        "staging",
-        BufferUsage::TRANSFER_SRC,
-        MemoryLocation::CpuToGpu,
-        byte_size,
-    );
+    let staging_buffer = device.create_buffer(BufferUsage::TRANSFER_SRC, MemoryLocation::CpuToGpu, byte_size);
 
     // read image data
     unsafe {
-        ptr::copy_nonoverlapping(dyn_image.as_bytes().as_ptr(), staging_buffer.mapped_data().unwrap(), byte_size as usize);
-    }
+        ptr::copy_nonoverlapping(
+            dyn_image.as_bytes().as_ptr(),
+            staging_buffer.mapped_data().unwrap(),
+            byte_size as usize,
+        );
 
-    let mut cmd_buf = queue.create_command_buffer();
-    let mut encoder = cmd_buf.begin_blit();
-    unsafe {
+        let mut encoder = cmd.begin_blit();
         encoder.copy_buffer_to_image(
             ImageCopyBuffer {
                 buffer: &staging_buffer,
@@ -90,9 +82,6 @@ fn load_image(queue: &mut Queue, path: impl AsRef<Path>, usage: ImageUsage, mipm
             },
         );
     }
-    drop(encoder);
-
-    queue.submit([cmd_buf]).unwrap();
 
     image
 }
@@ -109,8 +98,8 @@ fn main() {
 
     let surface = graal::get_vulkan_surface(window.raw_window_handle().unwrap());
 
-    let (device, mut queue) =
-        unsafe { graal::create_device_and_queue(Some(surface)).expect("failed to create device") };
+    let (device, mut cmd) =
+        unsafe { graal::create_device_and_command_stream(Some(surface)).expect("failed to create device") };
     let surface_format = unsafe { device.get_preferred_surface_format(surface) };
     let window_size = window.inner_size();
     let mut swapchain =
@@ -131,8 +120,7 @@ fn main() {
                     },
                     WindowEvent::RedrawRequested => unsafe {
                         // SAFETY: swapchain is valid
-                        let swapchain_image =
-                            queue.acquire_next_swapchain_image(&swapchain, Duration::from_millis(100));
+                        let swapchain_image = cmd.acquire_next_swapchain_image(&swapchain, Duration::from_millis(100));
 
                         let swapchain_image = match swapchain_image {
                             Ok(image) => image,
@@ -143,7 +131,7 @@ fn main() {
                         };
 
                         let image = load_image(
-                            &mut queue,
+                            &mut cmd,
                             "data/yukari.png",
                             ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
                             false,
@@ -152,9 +140,8 @@ fn main() {
                         let blit_w = image.size().width.min(swapchain_size.0);
                         let blit_h = image.size().height.min(swapchain_size.1);
 
-                        let mut cb = queue.create_command_buffer();
-                        let mut encoder = cb.begin_blit();
                         unsafe {
+                            let mut encoder = cmd.begin_blit();
                             encoder.blit_image(
                                 &image,
                                 ImageSubresourceLayers {
@@ -189,11 +176,9 @@ fn main() {
                                 vk::Filter::NEAREST,
                             );
                         }
-                        drop(encoder);
 
-                        queue.submit([cb]).expect("blit failed");
-                        queue.present(&swapchain_image).unwrap();
-                        queue.end_frame().unwrap();
+                        cmd.present(&swapchain_image).unwrap();
+                        device.cleanup();
                     },
                     _ => {}
                 },

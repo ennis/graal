@@ -1,58 +1,69 @@
+mod command;
+mod device;
+mod instance;
+mod platform;
+mod platform_impl;
+mod shader;
+mod surface;
+mod tracker;
+mod types;
+pub mod util;
+
+use ash::vk::Handle;
+use fxhash::FxHashMap;
 use std::{
     borrow::Cow,
     convert::TryInto,
     marker::PhantomData,
     mem,
     ops::{Bound, RangeBounds},
+    os::raw::c_void,
+    path::Path,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
-use std::os::raw::c_void;
-use std::ptr::NonNull;
+use tracing::debug;
 
-// reexports
+// --- reexports ---
+
+// TODO: make it optional
 pub use ash::{self, vk};
 pub use gpu_allocator::MemoryLocation;
+pub use shaderc;
 // reexports for macro internals
 #[doc(hidden)]
 pub use memoffset::offset_of as __offset_of;
 #[doc(hidden)]
 pub use memoffset::offset_of_tuple as __offset_of_tuple;
 pub use ordered_float;
+pub use shader::{compile_shader, get_shader_compiler};
 
+pub use command::*;
 pub use device::*;
-// proc-macros
-pub use graal_macros::{Arguments, Attachments, Vertex};
 pub use instance::*;
-//pub use platform::*;
 pub use surface::*;
 pub use types::*;
-pub use command::*;
-
-mod device;
-mod instance;
-mod platform;
-mod platform_impl;
-mod surface;
-mod types;
-pub mod util;
-mod command;
-mod tracker;
+// proc-macros
+pub use graal_macros::{Arguments, Attachments, Vertex};
 
 pub mod prelude {
     pub use crate::{
-        util::{DeviceExt, QueueExt},
-        vk, Arguments, Attachments, BufferUsage, ClearColorValue, ColorBlendEquation, ColorTargetState, CompareOp,
-        DepthStencilState, Device, Format, FragmentOutputInterfaceDescriptor, FrontFace, GraphicsPipeline,
-        GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageType, ImageUsage, ImageView, IndexType,
-        LineRasterization, LineRasterizationMode, MemoryLocation, PipelineBindPoint, PipelineLayoutDescriptor, Point2D,
-        PolygonMode, PreRasterizationShaders, PrimitiveTopology, Queue, RasterizationState, Rect2D, SampledImage,
-        Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StaticArguments,
-        StaticAttachments, StencilState, TypedBuffer, Vertex, VertexBufferDescriptor, VertexBufferLayoutDescription,
-        VertexInputAttributeDescription, VertexInputRate, VertexInputState, RenderEncoder, ComputeEncoder
+        util::{CommandStreamExt, DeviceExt},
+        vk, Arguments, Attachments, Buffer, BufferUsage, ClearColorValue, ColorBlendEquation, ColorTargetState,
+        CommandStream, CompareOp, ComputeEncoder, DepthStencilState, Device, Format, FragmentOutputInterfaceDescriptor,
+        FrontFace, GraphicsPipeline, GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageType, ImageUsage,
+        ImageView, IndexType, LineRasterization, LineRasterizationMode, MemoryLocation, PipelineBindPoint,
+        PipelineLayoutDescriptor, Point2D, PolygonMode, PreRasterizationShaders, PrimitiveTopology, RasterizationState,
+        Rect2D, RenderEncoder, Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D,
+        StaticArguments, StaticAttachments, StencilState, Vertex, VertexBufferDescriptor,
+        VertexBufferLayoutDescription, VertexInputAttributeDescription, VertexInputRate, VertexInputState,
     };
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
 
 /// Represents a swap chain.
 #[derive(Debug)]
@@ -75,7 +86,6 @@ pub struct SwapchainImage {
     pub image: Image,
 }
 
-
 /// Graphics pipelines.
 pub struct GraphicsPipeline {
     pub(crate) device: Device,
@@ -92,11 +102,15 @@ impl GraphicsPipeline {
         }
     }
 
+    pub fn set_label(&self, label: &str) {
+        self.device
+            .set_debug_object_name(vk::ObjectType::PIPELINE, self.pipeline.as_raw(), label, None);
+    }
+
     pub fn pipeline(&self) -> vk::Pipeline {
         self.pipeline
     }
 }
-
 
 /// Compute pipelines.
 pub struct ComputePipeline {
@@ -114,11 +128,15 @@ impl ComputePipeline {
         }
     }
 
+    pub fn set_label(&self, label: &str) {
+        self.device
+            .set_debug_object_name(vk::ObjectType::PIPELINE, self.pipeline.as_raw(), label, None);
+    }
+
     pub fn pipeline(&self) -> vk::Pipeline {
         self.pipeline
     }
 }
-
 
 /// Samplers
 #[derive(Clone, Debug)]
@@ -136,6 +154,15 @@ impl Sampler {
         }
     }
 
+    pub fn set_label(&self, label: &str) {
+        self.device.upgrade().unwrap().set_debug_object_name(
+            vk::ObjectType::SAMPLER,
+            self.sampler.as_raw(),
+            label,
+            None,
+        );
+    }
+
     pub fn handle(&self) -> vk::Sampler {
         // FIXME: check if the device is still alive, otherwise the sampler isn't valid anymore
         //assert!(self.device.strong_count() > 0);
@@ -143,38 +170,227 @@ impl Sampler {
     }
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Allocates command buffers in a `vk::CommandPool` and allows re-use of freed command buffers.
+#[derive(Debug)]
+struct CommandPool {
+    queue_family: u32,
+    command_pool: vk::CommandPool,
+    free: Vec<vk::CommandBuffer>,
+    used: Vec<vk::CommandBuffer>,
+}
+
+impl CommandPool {
+    unsafe fn new(device: &ash::Device, queue_family_index: u32) -> CommandPool {
+        // create a new one
+        let create_info = vk::CommandPoolCreateInfo {
+            flags: vk::CommandPoolCreateFlags::TRANSIENT,
+            queue_family_index,
+            ..Default::default()
+        };
+        let command_pool = device
+            .create_command_pool(&create_info, None)
+            .expect("failed to create a command pool");
+
+        CommandPool {
+            queue_family: queue_family_index,
+            command_pool,
+            free: vec![],
+            used: vec![],
+        }
+    }
+
+    fn alloc(&mut self, device: &ash::Device) -> vk::CommandBuffer {
+        let cb = self.free.pop().unwrap_or_else(|| unsafe {
+            let allocate_info = vk::CommandBufferAllocateInfo {
+                command_pool: self.command_pool,
+                level: vk::CommandBufferLevel::PRIMARY,
+                command_buffer_count: 1,
+                ..Default::default()
+            };
+            let buffers = device
+                .allocate_command_buffers(&allocate_info)
+                .expect("failed to allocate command buffers");
+            buffers[0]
+        });
+        self.used.push(cb);
+        cb
+    }
+
+    unsafe fn reset(&mut self, device: &ash::Device) {
+        device
+            .reset_command_pool(self.command_pool, vk::CommandPoolResetFlags::empty())
+            .unwrap();
+        self.free.append(&mut self.used)
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct ResourceMapsWithAccess {
+    pub buffers: FxHashMap<BufferId, (Arc<BufferInner>, BufferAccess)>,
+    pub images: FxHashMap<ImageId, (Arc<ImageInner>, ImageAccess)>,
+    pub image_views: FxHashMap<ImageViewId, Arc<ImageViewInner>>,
+}
+
+impl ResourceMapsWithAccess {
+    fn new() -> Self {
+        Self {
+            buffers: FxHashMap::default(),
+            images: FxHashMap::default(),
+            image_views: FxHashMap::default(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct ResourceMaps {
+    pub buffers: FxHashMap<BufferId, Arc<BufferInner>>,
+    pub images: FxHashMap<ImageId, Arc<ImageInner>>,
+    pub image_views: FxHashMap<ImageViewId, Arc<ImageViewInner>>,
+}
+
+impl ResourceMaps {
+    fn new() -> Self {
+        Self {
+            buffers: FxHashMap::default(),
+            images: FxHashMap::default(),
+            image_views: FxHashMap::default(),
+        }
+    }
+}
+
+impl ResourceMaps {
+    fn insert<R: Resource>(&mut self, resource: Arc<R>) {
+        R::insert(self, resource)
+    }
+}
+
+fn make_buffer_barrier(buffer: vk::Buffer, src: BufferAccess, dst: BufferAccess) -> vk::BufferMemoryBarrier2 {
+    let (src_stage_mask, src_access_mask) = map_buffer_access_to_barrier(src);
+    let (dst_stage_mask, dst_access_mask) = map_buffer_access_to_barrier(dst);
+    vk::BufferMemoryBarrier2 {
+        src_stage_mask,
+        src_access_mask,
+        dst_stage_mask,
+        dst_access_mask,
+        buffer,
+        offset: 0,
+        size: vk::WHOLE_SIZE,
+        ..Default::default()
+    }
+}
+
+fn make_image_barrier(
+    image: vk::Image,
+    format: vk::Format,
+    src: ImageAccess,
+    dst: ImageAccess,
+) -> vk::ImageMemoryBarrier2 {
+    let (src_stage_mask, src_access_mask) = map_image_access_to_barrier(src);
+    let (dst_stage_mask, dst_access_mask) = map_image_access_to_barrier(dst);
+
+    let src_layout = map_image_access_to_layout(src, format);
+    let dst_layout = map_image_access_to_layout(dst, format);
+
+    vk::ImageMemoryBarrier2 {
+        src_stage_mask,
+        src_access_mask,
+        dst_stage_mask,
+        dst_access_mask,
+        old_layout: src_layout,
+        new_layout: dst_layout,
+        image,
+        subresource_range: vk::ImageSubresourceRange {
+            aspect_mask: aspects_for_format(format),
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        },
+        ..Default::default()
+    }
+}
+
+trait Resource {
+    type Id;
+    fn insert(maps: &mut ResourceMaps, resource: Arc<Self>);
+    fn remove(&self, maps: &mut ResourceMaps);
+    fn submission_index(&self) -> u64;
+}
+
+#[derive(Debug)]
+struct BufferInner {
+    device: Device,
+    id: BufferId,
+    last_submission_index: AtomicU64,
+    allocation: ResourceAllocation,
+    group: Option<GroupId>,
+    handle: vk::Buffer,
+    device_address: vk::DeviceAddress,
+}
+
+impl Resource for BufferInner {
+    type Id = BufferId;
+
+    fn insert(maps: &mut ResourceMaps, resource: Arc<Self>) {
+        maps.buffers.insert(resource.id, resource);
+    }
+
+    fn remove(&self, maps: &mut ResourceMaps) {
+        maps.buffers.remove(&self.id);
+    }
+
+    fn submission_index(&self) -> u64 {
+        self.last_submission_index.load(Ordering::Relaxed)
+    }
+}
+
+impl BufferInner {
+    fn set_last_submission_index(&self, submission_index: u64) {
+        self.last_submission_index.store(submission_index, Ordering::Release);
+    }
+}
+
+impl Drop for BufferInner {
+    fn drop(&mut self) {
+        // SAFETY: The device resource tracker holds strong references to resources as long as they are in use by the GPU.
+        // This prevents `drop` from being called while the resource is still in use, and thus it's safe to delete the
+        // resource here.
+        unsafe {
+            debug!("dropping buffer {:?} (handle: {:?})", self.id, self.handle);
+            self.device.free_memory(&mut self.allocation);
+            self.device.destroy_buffer(self.handle, None);
+        }
+    }
+}
+
 /// Wrapper around a Vulkan buffer.
 #[derive(Debug)]
-pub struct Buffer {
-    device: Device,
-    id: RefCounted<BufferId>,
+pub struct BufferUntyped {
+    inner: Arc<BufferInner>,
     handle: vk::Buffer,
     size: u64,
     usage: BufferUsage,
     mapped_ptr: Option<NonNull<c_void>>,
 }
 
-impl Buffer {
-    /*fn new(
-        device: Device,
-        id: RefCounted<BufferId>,
-        handle: vk::Buffer,
-        size: usize,
-        usage: vk::BufferUsageFlags,
-        mapped_ptr: Option<NonNull<c_void>>,
-    ) -> Self {
-        Self {
-            device,
-            id,
-            handle,
-            size,
-            usage,
-            mapped_ptr,
-        }
-    }*/
+impl Drop for BufferUntyped {
+    fn drop(&mut self) {
+        self.inner.device.drop_buffer(&self.inner)
+    }
+}
 
-    pub fn id(&self) -> RefCounted<BufferId> {
-        self.id.clone()
+impl BufferUntyped {
+    pub fn set_label(&self, label: &str) {
+        self.inner
+            .device
+            .set_debug_object_name(vk::ObjectType::BUFFER, self.handle.as_raw(), label, None);
+    }
+
+    pub(crate) fn id(&self) -> BufferId {
+        self.inner.id
     }
 
     /// Returns the size of the buffer in bytes.
@@ -194,7 +410,7 @@ impl Buffer {
 
     /// Returns the device on which the buffer was created.
     pub fn device(&self) -> &Device {
-        &self.device
+        &self.inner.device
     }
 
     /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
@@ -203,11 +419,56 @@ impl Buffer {
     }
 }
 
+#[derive(Debug)]
+struct ImageInner {
+    device: Device,
+    id: ImageId,
+    last_submission_index: AtomicU64,
+    allocation: ResourceAllocation,
+    group: Option<GroupId>,
+    handle: vk::Image,
+    format: vk::Format,
+    swapchain_image: bool,
+}
+
+impl ImageInner {
+    fn set_last_submission_index(&self, submission_index: u64) {
+        self.last_submission_index.store(submission_index, Ordering::Release);
+    }
+}
+
+impl Resource for ImageInner {
+    type Id = ImageId;
+
+    fn insert(maps: &mut ResourceMaps, resource: Arc<Self>) {
+        maps.images.insert(resource.id, resource);
+    }
+
+    fn remove(&self, maps: &mut ResourceMaps) {
+        maps.images.remove(&self.id);
+    }
+
+    fn submission_index(&self) -> u64 {
+        self.last_submission_index.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ImageInner {
+    fn drop(&mut self) {
+        if !self.swapchain_image {
+            unsafe {
+                debug!("dropping image {:?} (handle: {:?})", self.id, self.handle);
+                self.device.free_memory(&mut self.allocation);
+                self.device.destroy_image(self.handle, None);
+            }
+        }
+    }
+}
+
 /// Wrapper around a Vulkan image.
 #[derive(Debug)]
 pub struct Image {
-    device: Device,
-    id: RefCounted<ImageId>,
+    inner: Arc<ImageInner>,
     handle: vk::Image,
     usage: ImageUsage,
     type_: ImageType,
@@ -215,26 +476,18 @@ pub struct Image {
     size: Size3D,
 }
 
+impl Drop for Image {
+    fn drop(&mut self) {
+        self.inner.device.drop_image(&self.inner)
+    }
+}
+
 impl Image {
-    /*pub(super) fn new(
-        device: Device,
-        id: RefCounted<ImageId>,
-        handle: vk::Image,
-        usage: vk::ImageUsageFlags,
-        type_: vk::ImageType,
-        format: vk::Format,
-        extent: vk::Extent3D,
-    ) -> Self {
-        Image {
-            device,
-            id,
-            handle,
-            usage,
-            type_,
-            format,
-            extent,
-        }
-    }*/
+    pub fn set_label(&self, label: &str) {
+        self.inner
+            .device
+            .set_debug_object_name(vk::ObjectType::IMAGE, self.handle.as_raw(), label, None);
+    }
 
     /// Returns the `vk::ImageType` of the image.
     pub fn image_type(&self) -> ImageType {
@@ -268,8 +521,8 @@ impl Image {
         self.usage
     }
 
-    pub fn id(&self) -> RefCounted<ImageId> {
-        self.id.clone()
+    pub fn id(&self) -> ImageId {
+        self.inner.id
     }
 
     /// Returns the image handle.
@@ -304,63 +557,63 @@ impl Image {
 
     /// Creates an `ImageView` object.
     fn create_view(&self, info: &ImageViewInfo) -> ImageView {
-        // TODO: check that format is compatible
+        self.inner.device.create_image_view(self, info)
+    }
+}
 
-        // FIXME: support non-zero base mip level
-        if info.subresource_range.base_mip_level != 0 {
-            unimplemented!("non-zero base mip level");
-        }
+#[derive(Debug)]
+struct ImageViewInner {
+    image: Arc<ImageInner>,
+    id: ImageViewId,
+    handle: vk::ImageView,
+    last_submission_index: AtomicU64,
+}
 
-        let create_info = vk::ImageViewCreateInfo {
-            flags: vk::ImageViewCreateFlags::empty(),
-            image: self.handle,
-            view_type: info.view_type,
-            format: info.format,
-            components: vk::ComponentMapping {
-                r: info.component_mapping[0],
-                g: info.component_mapping[1],
-                b: info.component_mapping[2],
-                a: info.component_mapping[3],
-            },
-            subresource_range: vk::ImageSubresourceRange {
-                aspect_mask: info.subresource_range.aspect_mask,
-                base_mip_level: info.subresource_range.base_mip_level,
-                level_count: info.subresource_range.level_count,
-                base_array_layer: info.subresource_range.base_array_layer,
-                layer_count: info.subresource_range.layer_count,
-            },
-            ..Default::default()
-        };
+impl ImageViewInner {
+    fn set_last_submission_index(&self, submission_index: u64) {
+        self.last_submission_index.store(submission_index, Ordering::Release);
+    }
+}
 
-        // SAFETY: the device is valid, the create info is valid
-        let handle = unsafe {
-            self.device
-                .create_image_view(&create_info, None)
-                .expect("failed to create image view")
-        };
+impl Resource for ImageViewInner {
+    type Id = ImageViewId;
 
-        ImageView {
-            device: self.device.clone(),
-            parent_image: self.id.clone(),
-            handle,
-            image_handle: self.handle,
-            format: info.format,
-            original_format: self.format,
-            // TODO: size of mip level
-            size: self.size,
+    fn insert(maps: &mut ResourceMaps, resource: Arc<Self>) {
+        maps.image_views.insert(resource.id, resource);
+    }
+
+    fn remove(&self, maps: &mut ResourceMaps) {
+        maps.image_views.remove(&self.id);
+    }
+
+    fn submission_index(&self) -> u64 {
+        self.last_submission_index.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for ImageViewInner {
+    fn drop(&mut self) {
+        unsafe {
+            self.image.device.destroy_image_view(self.handle, None);
         }
     }
 }
 
 #[derive(Debug)]
 pub struct ImageView {
-    device: Device,
-    parent_image: RefCounted<ImageId>,
+    inner: Arc<ImageViewInner>,
+    image: ImageId,
     image_handle: vk::Image,
     handle: vk::ImageView,
     format: Format,
     original_format: Format,
     size: Size3D,
+}
+
+impl Drop for ImageView {
+    fn drop(&mut self) {
+        self.inner.image.device.drop_image_view(&self.inner)
+    }
 }
 
 impl ImageView {
@@ -385,6 +638,13 @@ impl ImageView {
         self.handle
     }
 
+    pub fn set_label(&self, label: &str) {
+        self.inner
+            .image
+            .device
+            .set_debug_object_name(vk::ObjectType::IMAGE_VIEW, self.handle.as_raw(), label, None);
+    }
+
     fn image_handle(&self) -> vk::Image {
         self.image_handle
     }
@@ -393,22 +653,17 @@ impl ImageView {
         self.original_format
     }
 
-    fn parent_id(&self) -> RefCounted<ImageId> {
-        self.parent_image.clone()
-    }
-
-    pub fn as_read_write_storage(&self) -> ReadWriteStorageImage {
-        ReadWriteStorageImage { image_view: self }
+    fn image_id(&self) -> ImageId {
+        self.image.clone()
     }
 }
 
-impl Drop for ImageView {
-    fn drop(&mut self) {
-        unsafe {
-            self.device.delete_later(self.handle);
-        }
-    }
-}
+/*
+/// Wrapper around a descriptor buffer
+pub struct ArgumentBufferUntyped {
+    descriptor_buffer: BufferUntyped,
+    tracker: ArgumentBufferTracker,
+}*/
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -426,7 +681,7 @@ pub enum Error {
 
 #[derive(Copy, Clone, Debug)]
 pub struct ImageCopyBuffer<'a> {
-    pub buffer: &'a Buffer,
+    pub buffer: &'a BufferUntyped,
     pub layout: ImageDataLayout,
 }
 
@@ -460,17 +715,73 @@ pub struct ArgumentDescription<'a> {
 pub enum ArgumentKind<'a> {
     Image {
         image_view: &'a ImageView,
-        use_: ResourceUse,
+        access: ImageAccess,
     },
     Buffer {
-        buffer: &'a Buffer,
-        use_: ResourceUse,
+        buffer: &'a BufferUntyped,
+        access: BufferAccess,
         offset: u64,
         size: u64,
     },
     Sampler {
         sampler: &'a Sampler,
     },
+}
+
+impl<'a> From<(&'a ImageView, ImageAccess)> for ArgumentKind<'a> {
+    fn from((image_view, access): (&'a ImageView, ImageAccess)) -> Self {
+        ArgumentKind::Image { image_view, access }
+    }
+}
+
+impl<'a, T: ?Sized> From<(BufferRange<'a, T>, BufferAccess)> for ArgumentKind<'a> {
+    fn from((buffer_range, access): (BufferRange<'a, T>, BufferAccess)) -> Self {
+        ArgumentKind::Buffer {
+            buffer: buffer_range.untyped.buffer,
+            access,
+            offset: buffer_range.untyped.offset,
+            size: buffer_range.untyped.size,
+        }
+    }
+}
+
+impl<'a> From<(BufferRangeUntyped<'a>, BufferAccess)> for ArgumentKind<'a> {
+    fn from((buffer_range, access): (BufferRangeUntyped<'a>, BufferAccess)) -> Self {
+        ArgumentKind::Buffer {
+            buffer: buffer_range.buffer,
+            access,
+            offset: buffer_range.offset,
+            size: buffer_range.size,
+        }
+    }
+}
+
+impl<'a, T: ?Sized> From<(&'a Buffer<T>, BufferAccess)> for ArgumentKind<'a> {
+    fn from((buffer, access): (&'a Buffer<T>, BufferAccess)) -> Self {
+        ArgumentKind::Buffer {
+            buffer: &buffer.untyped,
+            access,
+            offset: 0,
+            size: buffer.untyped.size,
+        }
+    }
+}
+
+impl<'a> From<(&'a BufferUntyped, BufferAccess)> for ArgumentKind<'a> {
+    fn from((buffer, access): (&'a BufferUntyped, BufferAccess)) -> Self {
+        ArgumentKind::Buffer {
+            buffer: &buffer,
+            access,
+            offset: 0,
+            size: buffer.size,
+        }
+    }
+}
+
+impl<'a> From<&'a Sampler> for ArgumentKind<'a> {
+    fn from(sampler: &'a Sampler) -> Self {
+        ArgumentKind::Sampler { sampler }
+    }
 }
 
 pub trait Arguments {
@@ -484,7 +795,7 @@ pub trait Arguments {
     fn inline_data(&self) -> Cow<Self::InlineData>;
 }
 
-pub unsafe trait Argument {
+pub trait Argument {
     /// Descriptor type.
     const DESCRIPTOR_TYPE: vk::DescriptorType;
     /// Number of descriptors represented by this object.
@@ -504,30 +815,107 @@ pub unsafe trait Argument {
     fn argument_description(&self, binding: u32) -> ArgumentDescription;
 }
 
-/// Sampled image descriptor.
-#[derive(Debug)]
-pub struct SampledImage<'a> {
-    pub image_view: &'a ImageView,
+/*
+#[derive(Copy, Clone, Debug)]
+pub enum ImageDescriptorType {
+    SampledImage,
+    ReadOnlyStorageImage,
+    ReadWriteStorageImage,
 }
 
-unsafe impl<'a> Argument for SampledImage<'a> {
-    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::SAMPLED_IMAGE;
+impl ImageDescriptorType {
+    pub const fn access(self) -> ImageAccess {
+        match self {
+            ImageDescriptorType::SampledImage => ImageAccess::SAMPLED_READ,
+            ImageDescriptorType::ReadOnlyStorageImage => ImageAccess::IMAGE_READ,
+            ImageDescriptorType::ReadWriteStorageImage => ImageAccess::IMAGE_READ_WRITE,
+        }
+    }
+
+    pub const fn to_vk_descriptor_type(self) -> vk::DescriptorType {
+        match self {
+            ImageDescriptorType::SampledImage => vk::DescriptorType::SAMPLED_IMAGE,
+            ImageDescriptorType::ReadOnlyStorageImage => vk::DescriptorType::STORAGE_IMAGE,
+            ImageDescriptorType::ReadWriteStorageImage => vk::DescriptorType::STORAGE_IMAGE,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum BufferDescriptorType {
+    UniformBuffer,
+    ReadOnlyStorageBuffer,
+    ReadWriteStorageBuffer,
+}
+
+impl BufferDescriptorType {
+    pub const fn access(self) -> BufferAccess {
+        match self {
+            BufferDescriptorType::UniformBuffer => BufferAccess::UNIFORM,
+            BufferDescriptorType::ReadOnlyStorageBuffer => BufferAccess::STORAGE_READ,
+            BufferDescriptorType::ReadWriteStorageBuffer => BufferAccess::STORAGE_READ_WRITE,
+        }
+    }
+
+    pub const fn to_vk_descriptor_type(self) -> vk::DescriptorType {
+        match self {
+            BufferDescriptorType::UniformBuffer => vk::DescriptorType::UNIFORM_BUFFER,
+            BufferDescriptorType::ReadOnlyStorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+            BufferDescriptorType::ReadWriteStorageBuffer => vk::DescriptorType::STORAGE_BUFFER,
+        }
+    }
+}*/
+
+#[doc(hidden)]
+pub struct ImageArgumentWrapper<'a, const DESCRIPTOR_TYPE: i32, const ACCESS: u32, const SHADER_STAGES: u32>(
+    pub &'a ImageView,
+);
+#[doc(hidden)]
+pub struct BufferArgumentWrapper<'a, const DESCRIPTOR_TYPE: i32, const ACCESS: u32, const SHADER_STAGES: u32, T>(
+    pub BufferRange<'a, T>,
+);
+
+impl<'a, const DESCRIPTOR_TYPE: i32, const ACCESS: u32, const SHADER_STAGES: u32> Argument
+    for ImageArgumentWrapper<'a, DESCRIPTOR_TYPE, ACCESS, SHADER_STAGES>
+{
+    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::from_raw(DESCRIPTOR_TYPE);
     const DESCRIPTOR_COUNT: u32 = 1;
-    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(SHADER_STAGES);
 
     fn argument_description(&self, binding: u32) -> ArgumentDescription {
         ArgumentDescription {
             binding,
-            descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+            descriptor_type: Self::DESCRIPTOR_TYPE,
             kind: ArgumentKind::Image {
-                image_view: self.image_view,
-                use_: ResourceUse::SAMPLED_READ,
+                image_view: self.0,
+                access: ImageAccess::from_bits(ACCESS).unwrap(),
             },
         }
     }
 }
 
-unsafe impl<'a> Argument for &'a Sampler {
+impl<'a, const DESCRIPTOR_TYPE: i32, const ACCESS: u32, const SHADER_STAGES: u32, T> Argument
+    for BufferArgumentWrapper<'a, DESCRIPTOR_TYPE, ACCESS, SHADER_STAGES, T>
+{
+    const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::from_raw(DESCRIPTOR_TYPE);
+    const DESCRIPTOR_COUNT: u32 = 1;
+    const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::from_raw(SHADER_STAGES);
+
+    fn argument_description(&self, binding: u32) -> ArgumentDescription {
+        ArgumentDescription {
+            binding,
+            descriptor_type: Self::DESCRIPTOR_TYPE,
+            kind: ArgumentKind::Buffer {
+                buffer: self.0.untyped.buffer,
+                access: BufferAccess::from_bits(ACCESS).unwrap(),
+                offset: self.0.untyped.offset,
+                size: self.0.untyped.size,
+            },
+        }
+    }
+}
+
+impl<'a> Argument for &'a Sampler {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::SAMPLER;
     const DESCRIPTOR_COUNT: u32 = 1;
     const SHADER_STAGES: vk::ShaderStageFlags = vk::ShaderStageFlags::ALL;
@@ -541,14 +929,10 @@ unsafe impl<'a> Argument for &'a Sampler {
     }
 }
 
+/*
 /// Uniform buffer descriptor.
-#[derive(Copy, Clone, Debug)]
-pub struct UniformBuffer<'a, T> {
-    pub buffer: &'a Buffer,
-    pub offset: vk::DeviceSize,
-    pub range: vk::DeviceSize,
-    _phantom: PhantomData<fn() -> T>,
-}
+#[derive(Copy, Clone)]
+pub struct UniformBuffer<'a, T>(pub BufferRange<'a, T>);
 
 unsafe impl<'a, T> Argument for UniformBuffer<'a, T> {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::UNIFORM_BUFFER;
@@ -560,23 +944,18 @@ unsafe impl<'a, T> Argument for UniformBuffer<'a, T> {
             binding,
             descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
             kind: ArgumentKind::Buffer {
-                buffer: self.buffer,
-                use_: ResourceUse::UNIFORM,
-                offset: self.offset,
-                size: self.range,
+                buffer: self.0.untyped.buffer,
+                access: BufferAccess::UNIFORM,
+                offset: self.0.untyped.offset,
+                size: self.0.untyped.size,
             },
         }
     }
 }
 
 /// Storage buffer descriptor.
-#[derive(Copy, Clone, Debug)]
-pub struct ReadOnlyStorageBuffer<'a, T: ?Sized> {
-    pub buffer: &'a Buffer,
-    pub offset: vk::DeviceSize,
-    pub range: vk::DeviceSize,
-    _phantom: PhantomData<fn() -> T>,
-}
+#[derive(Copy, Clone)]
+pub struct ReadOnlyStorageBuffer<'a, T: ?Sized>(pub BufferRange<'a, T>);
 
 unsafe impl<'a, T: ?Sized> Argument for ReadOnlyStorageBuffer<'a, T> {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::STORAGE_BUFFER;
@@ -588,23 +967,18 @@ unsafe impl<'a, T: ?Sized> Argument for ReadOnlyStorageBuffer<'a, T> {
             binding,
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
             kind: ArgumentKind::Buffer {
-                buffer: self.buffer,
-                use_: ResourceUse::STORAGE_READ,
-                offset: self.offset,
-                size: self.range,
+                buffer: self.0.untyped.buffer,
+                access: BufferAccess::STORAGE_READ,
+                offset: self.0.untyped.offset,
+                size: self.0.untyped.size,
             },
         }
     }
 }
 
 /// Storage buffer descriptor.
-#[derive(Copy, Clone, Debug)]
-pub struct ReadWriteStorageBuffer<'a, T: ?Sized> {
-    pub buffer: &'a Buffer,
-    pub offset: vk::DeviceSize,
-    pub range: vk::DeviceSize,
-    _phantom: PhantomData<fn() -> T>,
-}
+#[derive(Copy, Clone)]
+pub struct ReadWriteStorageBuffer<'a, T: ?Sized>(pub BufferRange<'a, T>);
 
 unsafe impl<'a, T: ?Sized> Argument for ReadWriteStorageBuffer<'a, T> {
     const DESCRIPTOR_TYPE: vk::DescriptorType = vk::DescriptorType::STORAGE_BUFFER;
@@ -616,10 +990,10 @@ unsafe impl<'a, T: ?Sized> Argument for ReadWriteStorageBuffer<'a, T> {
             binding,
             descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
             kind: ArgumentKind::Buffer {
-                buffer: self.buffer,
-                use_: ResourceUse::STORAGE_READ_WRITE,
-                offset: self.offset,
-                size: self.range,
+                buffer: self.0.untyped.buffer,
+                access: BufferAccess::STORAGE_READ_WRITE,
+                offset: self.0.untyped.offset,
+                size: self.0.untyped.size,
             },
         }
     }
@@ -629,6 +1003,12 @@ unsafe impl<'a, T: ?Sized> Argument for ReadWriteStorageBuffer<'a, T> {
 #[derive(Copy, Clone, Debug)]
 pub struct ReadWriteStorageImage<'a> {
     pub image_view: &'a ImageView,
+}
+
+impl<'a> ReadWriteStorageImage<'a> {
+    pub fn new(image_view: &'a ImageView) -> Self {
+        Self { image_view }
+    }
 }
 
 unsafe impl<'a> Argument for ReadWriteStorageImage<'a> {
@@ -642,17 +1022,18 @@ unsafe impl<'a> Argument for ReadWriteStorageImage<'a> {
             descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
             kind: ArgumentKind::Image {
                 image_view: self.image_view,
-                use_: ResourceUse::IMAGE_READ_WRITE,
+                access: ImageAccess::IMAGE_READ_WRITE,
             },
         }
     }
 }
+*/
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-impl Buffer {
+impl BufferUntyped {
     /// Byte range
-    pub fn byte_range(&self, range: impl RangeBounds<u64>) -> BufferRangeAny {
+    pub fn byte_range(&self, range: impl RangeBounds<u64>) -> BufferRangeUntyped {
         let byte_size = self.byte_size();
         let start = match range.start_bound() {
             Bound::Unbounded => 0,
@@ -666,7 +1047,7 @@ impl Buffer {
         };
         let size = end - start;
         assert!(start <= byte_size && end <= byte_size);
-        BufferRangeAny {
+        BufferRangeUntyped {
             buffer: self,
             offset: start,
             size,
@@ -675,77 +1056,53 @@ impl Buffer {
 }
 
 /// Typed buffers.
-pub struct TypedBuffer<T: ?Sized> {
-    buffer: Buffer,
+pub struct Buffer<T: ?Sized> {
+    pub untyped: BufferUntyped,
     _marker: PhantomData<T>,
 }
 
-impl<T: ?Sized> TypedBuffer<T> {
-    fn new(buffer: Buffer) -> Self {
+impl<T: ?Sized> Buffer<T> {
+    fn new(buffer: BufferUntyped) -> Self {
         Self {
-            buffer,
+            untyped: buffer,
             _marker: PhantomData,
         }
     }
 
     /// Returns the size of the buffer in bytes.
     pub fn byte_size(&self) -> u64 {
-        self.buffer.byte_size()
+        self.untyped.byte_size()
     }
 
     /// Returns the usage flags of the buffer.
     pub fn usage(&self) -> BufferUsage {
-        self.buffer.usage()
+        self.untyped.usage()
     }
 
     /// Returns the buffer handle.
     pub fn handle(&self) -> vk::Buffer {
-        self.buffer.handle()
+        self.untyped.handle()
     }
 
     /// Returns the device on which the buffer was created.
     pub fn device(&self) -> &Device {
-        self.buffer.device()
-    }
-
-    pub fn any(&self) -> &Buffer {
-        &self.buffer
-    }
-
-    pub fn as_read_only_storage_buffer(&self) -> ReadOnlyStorageBuffer<T> {
-        ReadOnlyStorageBuffer {
-            buffer: &self.buffer,
-            offset: 0,
-            range: self.byte_size(),
-            _phantom: PhantomData,
-        }
-    }
-
-    pub fn as_read_write_storage_buffer(&self) -> ReadWriteStorageBuffer<T> {
-        ReadWriteStorageBuffer {
-            buffer: &self.buffer,
-            offset: 0,
-            range: self.byte_size(),
-            _phantom: PhantomData,
-        }
+        self.untyped.device()
     }
 }
 
-impl<T> TypedBuffer<[T]> {
+impl<T> Buffer<[T]> {
     /// Returns the number of elements in the buffer.
     pub fn len(&self) -> usize {
-        let len = self.byte_size() / mem::size_of::<T>() as u64;
-        // I suppose this can fail on 32-bit platforms connected to GPUs with more than 4GB of VRAM
-        len.try_into().expect("buffer too large")
+        (self.byte_size() / mem::size_of::<T>() as u64) as usize
     }
 
     /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
     pub fn mapped_data(&self) -> Option<*mut T> {
-        self.buffer.mapped_data().map(|ptr| ptr as *mut T)
+        self.untyped.mapped_data().map(|ptr| ptr as *mut T)
     }
 
     /// Element range.
-    pub fn slice(&self, range: impl RangeBounds<usize>) -> BufferRange<T> {
+    pub fn slice(&self, range: impl RangeBounds<usize>) -> BufferRange<[T]> {
         let elem_size = mem::size_of::<T>();
         let start = match range.start_bound() {
             Bound::Unbounded => 0,
@@ -761,39 +1118,62 @@ impl<T> TypedBuffer<[T]> {
         let end = (end * elem_size) as u64;
 
         BufferRange {
-            any: self.buffer.byte_range(start..end),
+            untyped: self.untyped.byte_range(start..end),
             _phantom: PhantomData,
         }
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-pub struct BufferRangeAny<'a> {
-    pub buffer: &'a Buffer,
+pub struct BufferRangeUntyped<'a> {
+    pub buffer: &'a BufferUntyped,
     pub offset: u64,
     pub size: u64,
 }
 
-#[derive(Copy, Clone)]
-pub struct BufferRange<'a, T> {
-    any: BufferRangeAny<'a>,
-    _phantom: std::marker::PhantomData<T>,
+pub struct BufferRange<'a, T: ?Sized> {
+    pub untyped: BufferRangeUntyped<'a>,
+    _phantom: PhantomData<T>,
 }
 
-impl<'a, T> BufferRange<'a, T> {
-    // TODO rename this to "untyped" or something
-    pub fn any(&self) -> BufferRangeAny<'a> {
-        self.any
+// #26925 clone impl
+impl<'a, T: ?Sized> Clone for BufferRange<'a, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<'a, T: ?Sized> Copy for BufferRange<'a, T> {}
+
+impl<'a, T> BufferRange<'a, [T]> {
+    pub fn len(&self) -> usize {
+        (self.untyped.size / mem::size_of::<T>() as u64) as usize
     }
 
-    pub fn as_read_only_storage_buffer(&self) -> ReadOnlyStorageBuffer<T> {
-        ReadOnlyStorageBuffer {
-            buffer: self.any.buffer,
-            offset: self.any.offset,
-            range: self.any.size,
+    /*pub fn slice(&self, range: impl RangeBounds<usize>) -> BufferRange<'a, [T]> {
+        let elem_size = mem::size_of::<T>();
+        let start = match range.start_bound() {
+            Bound::Unbounded => 0,
+            Bound::Included(start) => *start,
+            Bound::Excluded(start) => *start + 1,
+        };
+        let end = match range.end_bound() {
+            Bound::Unbounded => self.len(),
+            Bound::Excluded(end) => *end,
+            Bound::Included(end) => *end + 1,
+        };
+        let start = (start * elem_size) as u64;
+        let end = (end * elem_size) as u64;
+
+        BufferRange {
+            untyped: BufferRangeAny {
+                buffer: self.untyped.buffer,
+                offset: self.untyped.offset + start,
+                size: end - start,
+            },
             _phantom: PhantomData,
         }
-    }
+    }*/
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -918,7 +1298,7 @@ impl<'a, A: AsAttachment<'a>> AsAttachment<'a> for AttachmentOverride<A> {
 #[derive(Copy, Clone, Debug)]
 pub struct VertexBufferDescriptor<'a> {
     pub binding: u32,
-    pub buffer_range: BufferRangeAny<'a>,
+    pub buffer_range: BufferRangeUntyped<'a>,
     pub stride: u32,
 }
 
@@ -958,36 +1338,78 @@ pub struct ShaderEntryPoint<'a> {
     pub entry_point: &'a str,
 }
 
+impl<'a> ShaderEntryPoint<'a> {
+    pub fn from_source_file(file_path: &'a Path) -> ShaderEntryPoint<'a> {
+        Self {
+            code: ShaderCode::Source(ShaderSource::File(file_path)),
+            entry_point: "main",
+        }
+    }
+}
+
 /// Specifies the shaders of a graphics pipeline.
-pub enum PreRasterizationShaders {
+pub enum PreRasterizationShaders<'a> {
     /// Shaders of the primitive shading pipeline (the classic vertex, tessellation, geometry and fragment shaders).
     PrimitiveShading {
-        vertex: ShaderEntryPoint<'static>,
-        tess_control: Option<ShaderEntryPoint<'static>>,
-        tess_evaluation: Option<ShaderEntryPoint<'static>>,
-        geometry: Option<ShaderEntryPoint<'static>>,
+        vertex: ShaderEntryPoint<'a>,
+        tess_control: Option<ShaderEntryPoint<'a>>,
+        tess_evaluation: Option<ShaderEntryPoint<'a>>,
+        geometry: Option<ShaderEntryPoint<'a>>,
     },
     /// Shaders of the mesh shading pipeline (the new mesh and task shaders).
     MeshShading {
-        task: Option<ShaderEntryPoint<'static>>,
-        mesh: ShaderEntryPoint<'static>,
+        task: Option<ShaderEntryPoint<'a>>,
+        mesh: ShaderEntryPoint<'a>,
     },
+}
+
+impl<'a> PreRasterizationShaders<'a> {
+    /// Creates a new `PreRasterizationShaders` object using mesh shading from the specified source file path.
+    ///
+    /// The specified source file should contain both task and mesh shaders. The entry point for both shaders is `main`.
+    /// Use the `__TASK__` and `__MESH__` macros to distinguish between the two shaders within the source file.
+    pub fn mesh_shading_from_source_file(file_path: &'a Path) -> Self {
+        let entry_point = "main";
+        Self::MeshShading {
+            task: Some(ShaderEntryPoint {
+                code: ShaderCode::Source(ShaderSource::File(file_path)),
+                entry_point,
+            }),
+            mesh: ShaderEntryPoint {
+                code: ShaderCode::Source(ShaderSource::File(file_path)),
+                entry_point,
+            },
+        }
+    }
+
+    /// Creates a new `PreRasterizationShaders` object using primitive shading, without tessellation, from the specified source file path.
+    pub fn vertex_shader_from_source_file(file_path: &'a Path) -> Self {
+        let entry_point = "main";
+        Self::PrimitiveShading {
+            vertex: ShaderEntryPoint {
+                code: ShaderCode::Source(ShaderSource::File(file_path)),
+                entry_point,
+            },
+            tess_control: None,
+            tess_evaluation: None,
+            geometry: None,
+        }
+    }
 }
 
 pub struct GraphicsPipelineCreateInfo<'a> {
     pub layout: PipelineLayoutDescriptor<'a>,
     pub vertex_input: VertexInputState<'a>,
-    pub pre_rasterization_shaders: PreRasterizationShaders,
+    pub pre_rasterization_shaders: PreRasterizationShaders<'a>,
     pub rasterization: RasterizationState,
-    pub fragment_shader: ShaderEntryPoint<'static>,
+    pub fragment_shader: ShaderEntryPoint<'a>,
     pub depth_stencil: DepthStencilState,
     pub fragment_output: FragmentOutputInterfaceDescriptor<'a>,
 }
 
-
 pub struct ComputePipelineCreateInfo<'a> {
     pub layout: PipelineLayoutDescriptor<'a>,
-    pub compute_shader: ShaderEntryPoint<'static>,
+    pub compute_shader: ShaderEntryPoint<'a>,
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1124,50 +1546,50 @@ pub fn aspects_for_format(fmt: vk::Format) -> vk::ImageAspectFlags {
     }
 }
 
-fn map_buffer_use_to_barrier(usage: ResourceUse) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+fn map_buffer_access_to_barrier(state: BufferAccess) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     let mut stages = vk::PipelineStageFlags2::empty();
     let mut access = vk::AccessFlags2::empty();
     let shader_stages = vk::PipelineStageFlags2::VERTEX_SHADER
         | vk::PipelineStageFlags2::FRAGMENT_SHADER
         | vk::PipelineStageFlags2::COMPUTE_SHADER;
 
-    if usage.contains(ResourceUse::MAP_READ) {
+    if state.contains(BufferAccess::MAP_READ) {
         stages |= vk::PipelineStageFlags2::HOST;
         access |= vk::AccessFlags2::HOST_READ;
     }
-    if usage.contains(ResourceUse::MAP_WRITE) {
+    if state.contains(BufferAccess::MAP_WRITE) {
         stages |= vk::PipelineStageFlags2::HOST;
         access |= vk::AccessFlags2::HOST_WRITE;
     }
-    if usage.contains(ResourceUse::COPY_SRC) {
+    if state.contains(BufferAccess::COPY_SRC) {
         stages |= vk::PipelineStageFlags2::TRANSFER;
         access |= vk::AccessFlags2::TRANSFER_READ;
     }
-    if usage.contains(ResourceUse::COPY_DST) {
+    if state.contains(BufferAccess::COPY_DST) {
         stages |= vk::PipelineStageFlags2::TRANSFER;
         access |= vk::AccessFlags2::TRANSFER_WRITE;
     }
-    if usage.contains(ResourceUse::UNIFORM) {
+    if state.contains(BufferAccess::UNIFORM) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::UNIFORM_READ;
     }
-    if usage.intersects(ResourceUse::STORAGE_READ) {
+    if state.intersects(BufferAccess::STORAGE_READ) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ;
     }
-    if usage.intersects(ResourceUse::STORAGE_READ_WRITE) {
+    if state.intersects(BufferAccess::STORAGE_READ_WRITE) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
     }
-    if usage.contains(ResourceUse::INDEX) {
+    if state.contains(BufferAccess::INDEX) {
         stages |= vk::PipelineStageFlags2::VERTEX_INPUT;
         access |= vk::AccessFlags2::INDEX_READ;
     }
-    if usage.contains(ResourceUse::VERTEX) {
+    if state.contains(BufferAccess::VERTEX) {
         stages |= vk::PipelineStageFlags2::VERTEX_INPUT;
         access |= vk::AccessFlags2::VERTEX_ATTRIBUTE_READ;
     }
-    if usage.contains(ResourceUse::INDIRECT) {
+    if state.contains(BufferAccess::INDIRECT) {
         stages |= vk::PipelineStageFlags2::DRAW_INDIRECT;
         access |= vk::AccessFlags2::INDIRECT_COMMAND_READ;
     }
@@ -1175,64 +1597,64 @@ fn map_buffer_use_to_barrier(usage: ResourceUse) -> (vk::PipelineStageFlags2, vk
     (stages, access)
 }
 
-fn map_texture_usage_to_barrier(usage: ResourceUse) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+fn map_image_access_to_barrier(state: ImageAccess) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     let mut stages = vk::PipelineStageFlags2::empty();
     let mut access = vk::AccessFlags2::empty();
     let shader_stages = vk::PipelineStageFlags2::VERTEX_SHADER
         | vk::PipelineStageFlags2::FRAGMENT_SHADER
         | vk::PipelineStageFlags2::COMPUTE_SHADER;
 
-    if usage.contains(ResourceUse::COPY_SRC) {
+    if state.contains(ImageAccess::COPY_SRC) {
         stages |= vk::PipelineStageFlags2::TRANSFER;
         access |= vk::AccessFlags2::TRANSFER_READ;
     }
-    if usage.contains(ResourceUse::COPY_DST) {
+    if state.contains(ImageAccess::COPY_DST) {
         stages |= vk::PipelineStageFlags2::TRANSFER;
         access |= vk::AccessFlags2::TRANSFER_WRITE;
     }
-    if usage.contains(ResourceUse::SAMPLED_READ) {
+    if state.contains(ImageAccess::SAMPLED_READ) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ;
     }
-    if usage.contains(ResourceUse::COLOR_TARGET) {
+    if state.contains(ImageAccess::COLOR_TARGET) {
         stages |= vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
         access |= vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
     }
-    if usage.intersects(ResourceUse::DEPTH_STENCIL_READ) {
+    if state.intersects(ImageAccess::DEPTH_STENCIL_READ) {
         stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
         access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ;
     }
-    if usage.intersects(ResourceUse::DEPTH_STENCIL_WRITE) {
+    if state.intersects(ImageAccess::DEPTH_STENCIL_WRITE) {
         stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
         access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
     }
-    if usage.contains(ResourceUse::IMAGE_READ) {
+    if state.contains(ImageAccess::IMAGE_READ) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ;
     }
-    if usage.contains(ResourceUse::IMAGE_READ_WRITE) {
+    if state.contains(ImageAccess::IMAGE_READ_WRITE) {
         stages |= shader_stages;
         access |= vk::AccessFlags2::SHADER_READ | vk::AccessFlags2::SHADER_WRITE;
     }
 
-    if usage == ResourceUse::UNINITIALIZED || usage == ResourceUse::PRESENT {
+    if state == ImageAccess::UNINITIALIZED || state == ImageAccess::PRESENT {
         (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty())
     } else {
         (stages, access)
     }
 }
 
-fn map_texture_usage_to_layout(usage: ResourceUse, format: Format) -> vk::ImageLayout {
+fn map_image_access_to_layout(access: ImageAccess, format: Format) -> vk::ImageLayout {
     let is_color = aspects_for_format(format).contains(vk::ImageAspectFlags::COLOR);
-    match usage {
-        ResourceUse::UNINITIALIZED => vk::ImageLayout::UNDEFINED,
-        ResourceUse::COPY_SRC => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        ResourceUse::COPY_DST => vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-        ResourceUse::SAMPLED_READ if is_color => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-        ResourceUse::COLOR_TARGET => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
-        ResourceUse::DEPTH_STENCIL_WRITE => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
+    match access {
+        ImageAccess::UNINITIALIZED => vk::ImageLayout::UNDEFINED,
+        ImageAccess::COPY_SRC => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        ImageAccess::COPY_DST => vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        ImageAccess::SAMPLED_READ if is_color => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        ImageAccess::COLOR_TARGET => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+        ImageAccess::DEPTH_STENCIL_WRITE => vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
         _ => {
-            if usage == ResourceUse::PRESENT {
+            if access == ImageAccess::PRESENT {
                 vk::ImageLayout::PRESENT_SRC_KHR
             } else if is_color {
                 vk::ImageLayout::GENERAL
