@@ -3,7 +3,7 @@ use std::{
     ffi::c_void,
     mem, ptr,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -14,7 +14,7 @@ use tracing::debug;
 use crate::{
     device::{Device, GroupId, ResourceAllocation},
     is_write_access, vk, BufferAccess, BufferInner, BufferUntyped, BufferUsage, Image, ImageCreateInfo, ImageInner,
-    ImageView, ImageViewInfo, ImageViewInner, MemoryLocation, Resource, Size3D,
+    ImageType, ImageUsage, ImageView, ImageViewInfo, ImageViewInner, MemoryLocation, Size3D,
 };
 
 use super::{DeferredDeletionList, DeferredDeletionObject};
@@ -96,10 +96,26 @@ impl Device {
         }
         let mapped_ptr = allocation.mapped_ptr();
         let allocation = ResourceAllocation::Allocation { allocation };
-        let inner = unsafe { self.register_buffer(allocation, handle) };
 
+        let device_address = unsafe {
+            self.get_buffer_device_address(&vk::BufferDeviceAddressInfo {
+                buffer: handle,
+                ..Default::default()
+            })
+        };
+
+        let id = self.inner.buffer_ids.lock().unwrap().insert(());
         BufferUntyped {
-            inner,
+            inner: Some(Arc::new(BufferInner {
+                device: self.clone(),
+                id,
+                user_ref_count: AtomicU32::new(1),
+                last_submission_index: AtomicU64::new(0),
+                allocation,
+                group: None,
+                handle,
+                device_address,
+            })),
             handle,
             size: byte_size,
             usage,
@@ -107,8 +123,12 @@ impl Device {
         }
     }
 
-    /// Registers an existing buffer resource.
-    pub unsafe fn register_buffer(&self, allocation: ResourceAllocation, handle: vk::Buffer) -> Arc<BufferInner> {
+    /*/// Registers an existing buffer resource.
+    pub(crate) unsafe fn register_buffer(
+        &self,
+        allocation: ResourceAllocation,
+        handle: vk::Buffer,
+    ) -> Arc<BufferInner> {
         let device_address = self.get_buffer_device_address(&vk::BufferDeviceAddressInfo {
             buffer: handle,
             ..Default::default()
@@ -119,6 +139,7 @@ impl Device {
             Arc::new(BufferInner {
                 device: self.clone(),
                 id,
+                user_ref_count: AtomicU32::new(1),
                 last_submission_index: AtomicU64::new(0),
                 allocation,
                 group: None,
@@ -127,42 +148,37 @@ impl Device {
             })
         });
         buffer_ids.get(id).unwrap().clone()
-    }
+    }*/
 
-    pub unsafe fn register_image(
+    pub(crate) fn register_swapchain_image(
         &self,
-        allocation: ResourceAllocation,
         handle: vk::Image,
         format: vk::Format,
-    ) -> Arc<ImageInner> {
-        self.register_image_inner(allocation, handle, format, false)
-    }
-
-    pub(crate) fn register_swapchain_image(&self, handle: vk::Image, format: vk::Format) -> Arc<ImageInner> {
-        self.register_image_inner(ResourceAllocation::External, handle, format, true)
-    }
-
-    fn register_image_inner(
-        &self,
-        allocation: ResourceAllocation,
-        handle: vk::Image,
-        format: vk::Format,
-        swapchain_image: bool,
-    ) -> Arc<ImageInner> {
-        let mut image_ids = self.inner.image_ids.lock().unwrap();
-        let id = image_ids.insert_with_key(|id| {
-            Arc::new(ImageInner {
+        width: u32,
+        height: u32,
+    ) -> Image {
+        let id = self.inner.image_ids.lock().unwrap().insert(());
+        Image {
+            inner: Some(Arc::new(ImageInner {
                 device: self.clone(),
                 id,
                 last_submission_index: AtomicU64::new(0),
-                allocation,
+                allocation: ResourceAllocation::External,
                 group: None,
                 handle,
-                swapchain_image,
+                swapchain_image: true,
                 format,
-            })
-        });
-        image_ids.get(id).unwrap().clone()
+            })),
+            handle,
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT,
+            type_: ImageType::Image2D,
+            format,
+            size: Size3D {
+                width,
+                height,
+                depth: 1,
+            },
+        }
     }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
@@ -228,13 +244,20 @@ impl Device {
                 .unwrap();
         }
 
-        // register the resource in the context
-        let inner =
-            unsafe { self.register_image(ResourceAllocation::Allocation { allocation }, handle, image_info.format) };
+        let id = self.inner.image_ids.lock().unwrap().insert(());
 
         Image {
             handle,
-            inner,
+            inner: Some(Arc::new(ImageInner {
+                device: self.clone(),
+                id,
+                last_submission_index: AtomicU64::new(0),
+                allocation: ResourceAllocation::Allocation { allocation },
+                group: None,
+                handle,
+                swapchain_image: false,
+                format: image_info.format,
+            })),
             usage: image_info.usage,
             type_: image_info.type_,
             format: image_info.format,
@@ -281,19 +304,15 @@ impl Device {
                 .expect("failed to create image view")
         };
 
-        let mut image_view_ids = self.inner.image_view_ids.lock().unwrap();
-        let id = image_view_ids.insert_with_key(|id| {
-            Arc::new(ImageViewInner {
-                image: image.inner.clone(),
+        let id = self.inner.image_view_ids.lock().unwrap().insert(());
+
+        ImageView {
+            inner: Some(Arc::new(ImageViewInner {
+                image: image.clone(),
                 id,
                 handle,
                 last_submission_index: AtomicU64::new(0),
-            })
-        });
-        let inner = image_view_ids.get(id).unwrap().clone();
-
-        ImageView {
-            inner,
+            })),
             image: image.id(),
             handle,
             image_handle: image.handle,
@@ -334,106 +353,36 @@ impl Device {
         self.inner.groups.lock().unwrap().remove(group_id);
     }
 
-    ////////////////////////////////////////////////////////////////////////////////////////////////
-    // NON-RESOURCE OBJECTS
-    ////////////////////////////////////////////////////////////////////////////////////////////////
+    /*
+    /// Called when the last user reference to a resource is dropped.
+    pub(crate) fn drop_resource<R: Resource>(&self, resource: &Arc<R>) {
+        // The last user reference to the resource has been dropped.
+        // However, there might still be pending references to the resource in command buffers
+        // that have not been submitted yet.
+        // In this case, the resource's `last_submission_index` will still be
+        //
 
-    /*pub unsafe fn delete_later(&self, object: impl Into<DeferredDeletionObject>) {
-        let object = object.into();
-
-        // get next submission timestamps on all queues
-        let mut next_submission_timestamps = vec![0; self.inner.queues.len()];
-        for (i, q) in self.inner.queues.iter().enumerate() {
-            next_submission_timestamps[i] = q.next_submission_timestamp.get();
-        }
-
-        // add the object to the current deletion list if the timestamps are the same
-        // otherwise create a new deletion list with the up-to-date timestamps
-        let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
-        if deletion_lists.is_empty() {
-            deletion_lists.push(DeferredDeletionList {
-                timestamps: next_submission_timestamps,
-                objects: vec![object],
-            });
-        } else {
-            let last = deletion_lists.last_mut().unwrap();
-            if last.timestamps != next_submission_timestamps {
-                deletion_lists.push(DeferredDeletionList {
-                    timestamps: next_submission_timestamps,
-                    objects: vec![object],
-                });
-            } else {
-                last.objects.push(object);
-            }
-        }
+        // add it to the list of dropped resources
+        self.inner.dropped_resources.lock().unwrap().insert(resource.clone());
     }*/
 
-    fn cleanup_objects(&self) {
-        /*let mut deletion_lists = self.inner.deletion_lists.borrow_mut();
-
-        // fetch the completed timestamps on all queues
-        let mut completed_timestamps = vec![0; self.inner.queues.len()];
-        for (i, q) in self.inner.queues.iter().enumerate() {
-            completed_timestamps[i] = unsafe { self.inner.device.get_semaphore_counter_value(q.timeline).unwrap() };
+    pub(crate) fn delete_later<T: 'static>(&self, submission_index: u64, object: T) {
+        let queue_timeline = self.inner.queues[0].timeline;
+        let last_completed_submission_index = unsafe {
+            self.get_semaphore_counter_value(queue_timeline)
+                .expect("get_semaphore_counter_value failed")
+        };
+        if submission_index <= last_completed_submission_index {
+            // drop the object immediately if the submission has completed
+            return;
         }
 
-        deletion_lists.retain(|list| {
-            let expired = list
-                .timestamps
-                .iter()
-                .zip(completed_timestamps.iter())
-                .all(|(list_timestamp, completed_timestamp)| list_timestamp <= completed_timestamp);
-
-            if expired {
-                for obj in list.objects.iter() {
-                    match obj {
-                        DeferredDeletionObject::Sampler(sampler) => unsafe {
-                            self.inner.device.destroy_sampler(*sampler, None);
-                        },
-                        DeferredDeletionObject::PipelineLayout(layout) => unsafe {
-                            self.inner.device.destroy_pipeline_layout(*layout, None);
-                        },
-                        DeferredDeletionObject::Pipeline(pipeline) => unsafe {
-                            self.inner.device.destroy_pipeline(*pipeline, None);
-                        },
-                        DeferredDeletionObject::Semaphore(semaphore) => unsafe {
-                            self.inner.device.destroy_semaphore(*semaphore, None);
-                        },
-                        DeferredDeletionObject::Shader(shader) => unsafe {
-                            self.inner.vk_ext_shader_object.destroy_shader(*shader, None);
-                        },
-                        DeferredDeletionObject::DescriptorSetLayout(layout) => unsafe {
-                            self.inner.device.destroy_descriptor_set_layout(*layout, None);
-                        },
-                    }
-                }
-            }
-
-            !expired
-        });*/
-    }
-
-    // Called by `Buffer::drop`
-    pub(crate) fn drop_buffer(&self, inner: &Arc<BufferInner>) {
-        //self.inner.buffer_ids.lock().unwrap().remove(inner.id);
-        //self.inner.tracker.lock().unwrap().buffers.remove(inner.id);
-        self.delete_later(inner);
-    }
-
-    pub(crate) fn drop_image(&self, inner: &Arc<ImageInner>) {
-        //self.inner.image_ids.lock().unwrap().remove(inner.id);
-        //self.inner.tracker.lock().unwrap().images.remove(inner.id);
-        self.delete_later(inner);
-    }
-
-    pub(crate) fn drop_image_view(&self, inner: &Arc<ImageViewInner>) {
-        //self.inner.image_view_ids.lock().unwrap().remove(inner.id);
-        self.delete_later(inner);
-    }
-
-    fn delete_later<R: Resource>(&self, resource: &Arc<R>) {
-        // Otherwise, add it to the list of dropped resources. This list is cleaned-up in TODO.
-        self.inner.dropped_resources.lock().unwrap().insert(resource.clone());
+        // otherwise move it to the deferred deletion list
+        self.inner
+            .dropped_resources
+            .lock()
+            .unwrap()
+            .push((submission_index, Box::new(object)));
     }
 
     pub(crate) unsafe fn free_memory(&self, allocation: &mut ResourceAllocation) {
@@ -464,37 +413,12 @@ impl Device {
         };
 
         let mut tracker = self.inner.tracker.lock().unwrap();
-        let mut image_ids = self.inner.image_ids.lock().unwrap();
+        /*let mut image_ids = self.inner.image_ids.lock().unwrap();
         let mut buffer_ids = self.inner.buffer_ids.lock().unwrap();
-        let mut image_view_ids = self.inner.image_view_ids.lock().unwrap();
+        let mut image_view_ids = self.inner.image_view_ids.lock().unwrap();*/
         let mut dropped_resources = self.inner.dropped_resources.lock().unwrap();
 
-        // FIXME: we should also make sure that there's no pending reference to the resource in an unsubmitted command stream,
-        // otherwise the resource will be destroyed on submission
-        dropped_resources.images.retain(|id, image| {
-            if image.last_submission_index.load(Ordering::Relaxed) <= last_completed_submission_index {
-                image_ids.remove(*id);
-                false
-            } else {
-                true
-            }
-        });
-        dropped_resources.buffers.retain(|id, buffer| {
-            if buffer.last_submission_index.load(Ordering::Relaxed) <= last_completed_submission_index {
-                buffer_ids.remove(*id);
-                false
-            } else {
-                true
-            }
-        });
-        dropped_resources.image_views.retain(|id, image_view| {
-            if image_view.last_submission_index.load(Ordering::Relaxed) <= last_completed_submission_index {
-                image_view_ids.remove(*id);
-                false
-            } else {
-                true
-            }
-        });
+        dropped_resources.retain(|(submission, object)| *submission > last_completed_submission_index);
 
         // process all completed submissions, oldest to newest
         //let mut active_submissions = tracker.active_submissions.lock().unwrap();

@@ -22,7 +22,7 @@ use crate::{
     is_write_access, platform_impl, Arguments, ArgumentsLayout, BufferAccess, BufferInner, BufferUsage, CommandPool,
     CommandStream, CompareOp, ComputePipeline, ComputePipelineCreateInfo, Error, GraphicsPipeline,
     GraphicsPipelineCreateInfo, ImageAccess, ImageInner, ImageView, ImageViewInfo, ImageViewInner,
-    PreRasterizationShaders, ResourceMaps, Sampler, SamplerCreateInfo, ShaderCode, ShaderStage, Size3D, Swapchain,
+    PreRasterizationShaders, Sampler, SamplerCreateInfo, ShaderCode, ShaderStage, Size3D, Swapchain,
 };
 
 mod init;
@@ -97,6 +97,11 @@ impl DeviceTracker {
     }
 }
 
+trait DeleteLater {}
+impl<T> DeleteLater for T {}
+
+// FIXME: Mutexes are useless here since this is wrapped in Rc and can't be sent across threads.
+// Just use RefCells
 pub(crate) struct DeviceInner {
     /// Underlying vulkan device
     device: ash::Device,
@@ -119,14 +124,16 @@ pub(crate) struct DeviceInner {
     physical_device_properties: vk::PhysicalDeviceProperties2,
 
     // We don't need to hold strong refs here, we just need an ID for them.
-    image_ids: Mutex<SlotMap<ImageId, Arc<ImageInner>>>,
-    buffer_ids: Mutex<SlotMap<BufferId, Arc<BufferInner>>>,
-    image_view_ids: Mutex<SlotMap<ImageViewId, Arc<ImageViewInner>>>,
+    pub(crate) image_ids: Mutex<SlotMap<ImageId, ()>>,
+    pub(crate) buffer_ids: Mutex<SlotMap<BufferId, ()>>,
+    pub(crate) image_view_ids: Mutex<SlotMap<ImageViewId, ()>>,
     groups: Mutex<ResourceGroupMap>,
     // Command pools per queue and thread.
     free_command_pools: Mutex<Vec<CommandPool>>,
-    // resources for which the user reference has dropped, but which may still be in use by the GPU.
-    dropped_resources: Mutex<ResourceMaps>,
+
+    /// Resources that have a zero user reference count and that should be ready for deletion soon,
+    /// but we're waiting for the GPU to finish using them.
+    dropped_resources: Mutex<Vec<(u64, Box<dyn DeleteLater>)>>,
     pub(crate) tracker: Mutex<DeviceTracker>,
 
     deletion_lists: Mutex<Vec<DeferredDeletionList>>,
@@ -134,6 +141,7 @@ pub(crate) struct DeviceInner {
     compiler: shaderc::Compiler,
 }
 
+/// Errors during device creation.
 #[derive(thiserror::Error, Debug)]
 pub enum DeviceCreateError {
     #[error(transparent)]
@@ -207,6 +215,7 @@ impl ResourceAllocation {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
 #[derive(Debug)]
 enum DeferredDeletionObject {
     Sampler(vk::Sampler),
@@ -473,6 +482,8 @@ impl Device {
         }
     }*/
 
+    //pub fn create_
+
     pub fn create_sampler(&self, info: &SamplerCreateInfo) -> Sampler {
         if let Some(sampler) = self.inner.sampler_cache.lock().unwrap().get(info) {
             return sampler.clone();
@@ -580,27 +591,32 @@ impl Device {
             set_layouts.push(self.create_descriptor_set_layout(layout));
         }
 
-        let pc_range = match bind_point {
-            vk::PipelineBindPoint::GRAPHICS => vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS
-                    | vk::ShaderStageFlags::MESH_EXT
-                    | vk::ShaderStageFlags::TASK_EXT,
-                offset: 0,
-                size: push_constants_size as u32,
-            },
-            vk::PipelineBindPoint::COMPUTE => vk::PushConstantRange {
-                stage_flags: vk::ShaderStageFlags::COMPUTE,
-                offset: 0,
-                size: push_constants_size as u32,
-            },
-            _ => unimplemented!(),
+        let pc_range = if push_constants_size != 0 {
+            Some(match bind_point {
+                vk::PipelineBindPoint::GRAPHICS => vk::PushConstantRange {
+                    stage_flags: vk::ShaderStageFlags::ALL_GRAPHICS
+                        | vk::ShaderStageFlags::MESH_EXT
+                        | vk::ShaderStageFlags::TASK_EXT,
+                    offset: 0,
+                    size: push_constants_size as u32,
+                },
+                vk::PipelineBindPoint::COMPUTE => vk::PushConstantRange {
+                    stage_flags: vk::ShaderStageFlags::COMPUTE,
+                    offset: 0,
+                    size: push_constants_size as u32,
+                },
+                _ => unimplemented!(),
+            })
+        } else {
+            None
         };
+        let pc_range = pc_range.as_slice();
 
         let create_info = vk::PipelineLayoutCreateInfo {
             set_layout_count: set_layouts.len() as u32,
             p_set_layouts: set_layouts.as_ptr(),
-            push_constant_range_count: 1,
-            p_push_constant_ranges: &pc_range,
+            push_constant_range_count: pc_range.len() as u32,
+            p_push_constant_ranges: pc_range.as_ptr(),
             ..Default::default()
         };
 

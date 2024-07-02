@@ -18,7 +18,7 @@ impl<'a> BlitCommandEncoder<'a> {
 
     pub fn fill_buffer(&mut self, buffer: &BufferRangeUntyped, data: u32) {
         // TODO: track buffer ranges
-        self.stream.use_buffer(&buffer.buffer.inner, BufferAccess::COPY_DST);
+        self.stream.use_buffer(&buffer.buffer, BufferAccess::COPY_DST);
 
         self.stream.flush_barriers();
 
@@ -36,7 +36,7 @@ impl<'a> BlitCommandEncoder<'a> {
 
     // TODO specify subresources
     pub fn clear_image(&mut self, image: &Image, clear_color_value: ClearColorValue) {
-        self.stream.use_image(&image.inner, ImageAccess::COPY_DST);
+        self.stream.use_image(image, ImageAccess::COPY_DST);
 
         self.stream.flush_barriers();
 
@@ -64,8 +64,8 @@ impl<'a> BlitCommandEncoder<'a> {
         destination: ImageCopyView<'_>,
         copy_size: vk::Extent3D,
     ) {
-        self.stream.use_image(&source.image.inner, ImageAccess::COPY_SRC);
-        self.stream.use_image(&destination.image.inner, ImageAccess::COPY_DST);
+        self.stream.use_image(&source.image, ImageAccess::COPY_SRC);
+        self.stream.use_image(&destination.image, ImageAccess::COPY_DST);
 
         // TODO: this is not required for multi-planar formats
         assert_eq!(source.aspect, destination.aspect);
@@ -109,8 +109,8 @@ impl<'a> BlitCommandEncoder<'a> {
         destination: ImageCopyView<'_>,
         copy_size: vk::Extent3D,
     ) {
-        self.stream.use_buffer(&source.buffer.inner, BufferAccess::COPY_SRC);
-        self.stream.use_image(&destination.image.inner, ImageAccess::COPY_DST);
+        self.stream.use_buffer(&source.buffer, BufferAccess::COPY_SRC);
+        self.stream.use_image(&destination.image, ImageAccess::COPY_DST);
 
         let regions = [vk::BufferImageCopy {
             buffer_offset: source.layout.offset,
@@ -151,8 +151,8 @@ impl<'a> BlitCommandEncoder<'a> {
         dst_region: Rect3D,
         filter: vk::Filter,
     ) {
-        self.stream.use_image(&src.inner, ImageAccess::COPY_SRC);
-        self.stream.use_image(&dst.inner, ImageAccess::COPY_DST);
+        self.stream.use_image(&src, ImageAccess::COPY_SRC);
+        self.stream.use_image(&dst, ImageAccess::COPY_DST);
 
         let blits = [vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers {

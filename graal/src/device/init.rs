@@ -11,7 +11,7 @@ use tracing::debug;
 
 use crate::{
     instance::{get_vulkan_entry, get_vulkan_instance, vk_khr_surface},
-    platform_impl, vk, ResourceMaps,
+    platform_impl, vk,
 };
 
 use super::{CommandStream, Device, DeviceCreateError, DeviceInner, DeviceTracker, QueueFamilyConfig, QueueShared};
@@ -284,7 +284,7 @@ impl Device {
                 groups: Mutex::new(Default::default()),
                 free_command_pools: Mutex::new(Default::default()),
                 image_view_ids: Mutex::new(Default::default()),
-                dropped_resources: Mutex::new(ResourceMaps::new()),
+                dropped_resources: Mutex::new(vec![]),
             }),
         })
     }

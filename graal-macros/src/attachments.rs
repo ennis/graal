@@ -210,7 +210,7 @@ pub(crate) fn derive_attachments(input: proc_macro::TokenStream) -> syn::Result<
                     unreachable!()
                 };
                 quote! {
-                     #CRATE::AsAttachment::as_attachment(&#CRATE::AttachmentOverride(
+                     #CRATE::ColorAttachment::from(#CRATE::AttachmentOverride(
                         self.#field_name,
                         #load_op,
                         #store_op,

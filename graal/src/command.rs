@@ -18,7 +18,7 @@ pub use render::RenderEncoder;
 use crate::{
     device::{ActiveSubmission, QueueShared},
     make_buffer_barrier, make_image_barrier, map_image_access_to_layout, vk, vk_ext_debug_utils, ArgumentKind,
-    Arguments, Attachments, BufferAccess, BufferId, BufferInner, CommandPool, Device, Format, Image, ImageAccess,
+    Arguments, BufferAccess, BufferId, BufferInner, BufferUntyped, CommandPool, Device, Format, Image, ImageAccess,
     ImageId, ImageInner, ImageType, ImageUsage, ImageView, ImageViewId, ImageViewInner, Size3D, Swapchain,
     SwapchainImage, VertexInput,
 };
@@ -208,16 +208,17 @@ pub struct CommandStream {
     /// Current command buffer.
     command_buffer: Option<vk::CommandBuffer>,
 
+    // TODO: hold a strong ref to the resources here, drop them only once the command stream is flushed.
     pub(crate) tracked_buffers: FxHashMap<BufferId, CommandBufferBufferState>,
     pub(crate) tracked_images: FxHashMap<ImageId, CommandBufferImageState>,
-    pub(crate) tracked_image_views: FxHashMap<ImageViewId, Arc<ImageViewInner>>,
+    pub(crate) tracked_image_views: FxHashMap<ImageViewId, ImageView>,
 
     pending_image_barriers: Vec<vk::ImageMemoryBarrier2>,
     pending_buffer_barriers: Vec<vk::BufferMemoryBarrier2>,
 }
 
 pub(crate) struct CommandBufferImageState {
-    pub image: Arc<ImageInner>,
+    pub image: Image,
     pub handle: vk::Image,
     pub format: vk::Format,
     pub first_state: ImageAccess,
@@ -225,7 +226,7 @@ pub(crate) struct CommandBufferImageState {
 }
 
 pub(crate) struct CommandBufferBufferState {
-    pub buffer: Arc<BufferInner>,
+    pub buffer: BufferUntyped,
     pub handle: vk::Buffer,
     pub first_state: BufferAccess,
     pub last_state: BufferAccess,
@@ -365,8 +366,9 @@ impl CommandStream {
         }
     }
 
-    pub(crate) fn use_image(&mut self, image: &Arc<ImageInner>, access: ImageAccess) {
-        if let Some(entry) = self.tracked_images.get_mut(&image.id) {
+    pub(crate) fn use_image(&mut self, image: &Image, access: ImageAccess) {
+        let id = image.id();
+        if let Some(entry) = self.tracked_images.get_mut(&id) {
             if entry.last_state != access || !access.all_ordered() {
                 self.pending_image_barriers.push(make_image_barrier(
                     entry.handle,
@@ -378,7 +380,7 @@ impl CommandStream {
             entry.last_state = access;
         } else {
             self.tracked_images.insert(
-                image.id,
+                id,
                 CommandBufferImageState {
                     image: image.clone(),
                     handle: image.handle,
@@ -390,8 +392,9 @@ impl CommandStream {
         }
     }
 
-    pub(crate) fn use_buffer(&mut self, buffer: &Arc<BufferInner>, access: BufferAccess) {
-        if let Some(entry) = self.tracked_buffers.get_mut(&buffer.id) {
+    pub(crate) fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
+        let id = buffer.id();
+        if let Some(entry) = self.tracked_buffers.get_mut(&id) {
             if entry.last_state != access || !access.all_ordered() {
                 self.pending_buffer_barriers
                     .push(make_buffer_barrier(entry.handle, entry.last_state, access));
@@ -399,7 +402,7 @@ impl CommandStream {
             entry.last_state = access;
         } else {
             self.tracked_buffers.insert(
-                buffer.id,
+                id,
                 CommandBufferBufferState {
                     buffer: buffer.clone(),
                     handle: buffer.handle,
@@ -411,9 +414,8 @@ impl CommandStream {
     }
 
     pub(crate) fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
-        self.use_image(&image_view.inner.image, state);
-        self.tracked_image_views
-            .insert(image_view.inner.id, image_view.inner.clone());
+        self.use_image(image_view.image(), state);
+        self.tracked_image_views.insert(image_view.id(), image_view.clone());
     }
 
     pub(crate) fn create_command_buffer_raw(&mut self) -> vk::CommandBuffer {
@@ -536,29 +538,21 @@ impl CommandStream {
         )?;
 
         // FIXME we are doing nothing with the semaphore!
+        // FIXME: why not register swapchain images once when creating the swap chain?
         let handle = swapchain.images[image_index as usize];
-        let inner = self.device.register_swapchain_image(handle, swapchain.format.format);
+        let image =
+            self.device
+                .register_swapchain_image(handle, swapchain.format.format, swapchain.width, swapchain.height);
 
         Ok(SwapchainImage {
             swapchain: swapchain.handle,
-            image: Image {
-                inner,
-                handle,
-                usage: ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT,
-                type_: ImageType::Image2D,
-                format: swapchain.format.format,
-                size: Size3D {
-                    width: swapchain.width,
-                    height: swapchain.height,
-                    depth: 1,
-                },
-            },
+            image,
             index: image_index,
         })
     }
 
     pub fn present(&mut self, swapchain_image: &SwapchainImage) -> VkResult<bool> {
-        self.use_image(&swapchain_image.image.inner, ImageAccess::PRESENT);
+        self.use_image(&swapchain_image.image, ImageAccess::PRESENT);
         self.flush_barriers();
 
         // Signal a semaphore when rendering is finished
@@ -651,7 +645,7 @@ impl CommandStream {
             state.buffer.set_last_submission_index(submission_index);
             let last_access = tracker
                 .buffers
-                .insert(state.buffer.id, state.last_state)
+                .insert(state.buffer.id(), state.last_state)
                 .unwrap_or(BufferAccess::empty());
 
             if last_access != state.first_state || !state.first_state.all_ordered() {
@@ -663,7 +657,7 @@ impl CommandStream {
             state.image.set_last_submission_index(submission_index);
             let last_access = tracker
                 .images
-                .insert(state.image.id, state.last_state)
+                .insert(state.image.id(), state.last_state)
                 .unwrap_or(ImageAccess::UNINITIALIZED);
 
             if last_access != state.first_state || !state.first_state.all_ordered() {

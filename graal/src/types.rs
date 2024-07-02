@@ -760,7 +760,7 @@ pub struct ColorBlendState {
 
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ColorTargetState {
-    /// If `None`, blending is disabled.
+    pub format: vk::Format,
     pub blend_equation: Option<ColorBlendEquation>,
     pub color_write_mask: ColorWriteMask,
 }

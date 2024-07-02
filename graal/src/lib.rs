@@ -9,7 +9,7 @@ mod tracker;
 mod types;
 pub mod util;
 
-use ash::vk::Handle;
+use ash::vk::{DescriptorPool, Handle};
 use fxhash::FxHashMap;
 use std::{
     borrow::Cow,
@@ -21,7 +21,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc,
     },
 };
@@ -172,6 +172,58 @@ impl Sampler {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct ArgumentBufferDesc {
+    pub static_uniform_buffers_count: u32,
+    pub static_storage_buffers_count: u32,
+    pub static_sampled_images_count: u32,
+    pub static_storage_images_count: u32,
+    pub static_samplers_count: u32,
+    pub max_indexed_storage_buffers_count: u32,
+    pub max_indexed_sampled_images_count: u32,
+    pub max_indexed_storage_images_count: u32,
+}
+
+impl Default for ArgumentBufferDesc {
+    fn default() -> Self {
+        ArgumentBufferDesc {
+            static_uniform_buffers_count: 16,
+            static_storage_buffers_count: 32,
+            static_sampled_images_count: 32,
+            static_storage_images_count: 32,
+            static_samplers_count: 16,
+            max_indexed_storage_buffers_count: 4096,
+            max_indexed_sampled_images_count: 4096,
+            max_indexed_storage_images_count: 4096,
+        }
+    }
+}
+
+/*
+pub struct ArgumentBuffer {
+    inner: Arc<ArgumentBufferInner>,
+}
+
+#[derive(Debug)]
+struct ArgumentBufferInner {
+    device: Device,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
+    user_ref_count: AtomicU32,
+    last_submission_index: AtomicU64,
+}
+
+impl Drop for ArgumentBuffer {
+    fn drop(&mut self) {
+        if self.inner.user_ref_count.fetch_sub(1, Ordering::Relaxed) == 1 {
+            // this was the last user reference to the argument buffer
+            self.inner.device.drop_resource(&self.inner);
+        }
+    }
+}*/
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 /// Allocates command buffers in a `vk::CommandPool` and allows re-use of freed command buffers.
 #[derive(Debug)]
 struct CommandPool {
@@ -228,6 +280,7 @@ impl CommandPool {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/*
 struct ResourceMapsWithAccess {
     pub buffers: FxHashMap<BufferId, (Arc<BufferInner>, BufferAccess)>,
     pub images: FxHashMap<ImageId, (Arc<ImageInner>, ImageAccess)>,
@@ -242,8 +295,9 @@ impl ResourceMapsWithAccess {
             image_views: FxHashMap::default(),
         }
     }
-}
+}*/
 
+/*
 #[derive(Default)]
 struct ResourceMaps {
     pub buffers: FxHashMap<BufferId, Arc<BufferInner>>,
@@ -265,7 +319,7 @@ impl ResourceMaps {
     fn insert<R: Resource>(&mut self, resource: Arc<R>) {
         R::insert(self, resource)
     }
-}
+}*/
 
 fn make_buffer_barrier(buffer: vk::Buffer, src: BufferAccess, dst: BufferAccess) -> vk::BufferMemoryBarrier2 {
     let (src_stage_mask, src_access_mask) = map_buffer_access_to_barrier(src);
@@ -313,17 +367,20 @@ fn make_image_barrier(
     }
 }
 
+/*
 trait Resource {
     type Id;
     fn insert(maps: &mut ResourceMaps, resource: Arc<Self>);
     fn remove(&self, maps: &mut ResourceMaps);
     fn submission_index(&self) -> u64;
-}
+}*/
 
 #[derive(Debug)]
 struct BufferInner {
     device: Device,
     id: BufferId,
+    /// Number of user references to this image (via `graal::Image`)
+    user_ref_count: AtomicU32,
     last_submission_index: AtomicU64,
     allocation: ResourceAllocation,
     group: Option<GroupId>,
@@ -331,6 +388,7 @@ struct BufferInner {
     device_address: vk::DeviceAddress,
 }
 
+/*
 impl Resource for BufferInner {
     type Id = BufferId;
 
@@ -345,13 +403,9 @@ impl Resource for BufferInner {
     fn submission_index(&self) -> u64 {
         self.last_submission_index.load(Ordering::Relaxed)
     }
-}
+}*/
 
-impl BufferInner {
-    fn set_last_submission_index(&self, submission_index: u64) {
-        self.last_submission_index.store(submission_index, Ordering::Release);
-    }
-}
+impl BufferInner {}
 
 impl Drop for BufferInner {
     fn drop(&mut self) {
@@ -360,6 +414,8 @@ impl Drop for BufferInner {
         // resource here.
         unsafe {
             debug!("dropping buffer {:?} (handle: {:?})", self.id, self.handle);
+            // retire the ID
+            self.device.inner.buffer_ids.lock().unwrap().remove(self.id);
             self.device.free_memory(&mut self.allocation);
             self.device.destroy_buffer(self.handle, None);
         }
@@ -369,28 +425,46 @@ impl Drop for BufferInner {
 /// Wrapper around a Vulkan buffer.
 #[derive(Debug)]
 pub struct BufferUntyped {
-    inner: Arc<BufferInner>,
+    inner: Option<Arc<BufferInner>>,
     handle: vk::Buffer,
     size: u64,
     usage: BufferUsage,
     mapped_ptr: Option<NonNull<c_void>>,
 }
 
+impl Clone for BufferUntyped {
+    fn clone(&self) -> Self {
+        BufferUntyped {
+            inner: self.inner.clone(),
+            handle: self.handle,
+            size: self.size,
+            usage: self.usage,
+            mapped_ptr: self.mapped_ptr,
+        }
+    }
+}
+
 impl Drop for BufferUntyped {
     fn drop(&mut self) {
-        self.inner.device.drop_buffer(&self.inner)
+        if let Some(inner) = Arc::into_inner(self.inner.take().unwrap()) {
+            let last_submission_index = inner.last_submission_index.load(Ordering::Relaxed);
+            inner.device.clone().delete_later(last_submission_index, inner);
+        }
     }
 }
 
 impl BufferUntyped {
     pub fn set_label(&self, label: &str) {
-        self.inner
-            .device
-            .set_debug_object_name(vk::ObjectType::BUFFER, self.handle.as_raw(), label, None);
+        self.inner.as_ref().unwrap().device.set_debug_object_name(
+            vk::ObjectType::BUFFER,
+            self.handle.as_raw(),
+            label,
+            None,
+        );
     }
 
     pub(crate) fn id(&self) -> BufferId {
-        self.inner.id
+        self.inner.as_ref().unwrap().id
     }
 
     /// Returns the size of the buffer in bytes.
@@ -410,12 +484,20 @@ impl BufferUntyped {
 
     /// Returns the device on which the buffer was created.
     pub fn device(&self) -> &Device {
-        &self.inner.device
+        &self.inner.as_ref().unwrap().device
     }
 
     /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
     pub fn mapped_data(&self) -> Option<*mut u8> {
         self.mapped_ptr.map(|ptr| ptr.as_ptr() as *mut u8)
+    }
+
+    pub(crate) fn set_last_submission_index(&self, submission_index: u64) {
+        self.inner
+            .as_ref()
+            .unwrap()
+            .last_submission_index
+            .store(submission_index, Ordering::Release);
     }
 }
 
@@ -423,6 +505,8 @@ impl BufferUntyped {
 struct ImageInner {
     device: Device,
     id: ImageId,
+    // Number of user references to this image (via `graal::Image`)
+    //user_ref_count: AtomicU32,
     last_submission_index: AtomicU64,
     allocation: ResourceAllocation,
     group: Option<GroupId>,
@@ -431,12 +515,7 @@ struct ImageInner {
     swapchain_image: bool,
 }
 
-impl ImageInner {
-    fn set_last_submission_index(&self, submission_index: u64) {
-        self.last_submission_index.store(submission_index, Ordering::Release);
-    }
-}
-
+/*
 impl Resource for ImageInner {
     type Id = ImageId;
 
@@ -451,13 +530,14 @@ impl Resource for ImageInner {
     fn submission_index(&self) -> u64 {
         self.last_submission_index.load(Ordering::Relaxed)
     }
-}
+}*/
 
 impl Drop for ImageInner {
     fn drop(&mut self) {
         if !self.swapchain_image {
             unsafe {
                 debug!("dropping image {:?} (handle: {:?})", self.id, self.handle);
+                self.device.inner.image_ids.lock().unwrap().remove(self.id);
                 self.device.free_memory(&mut self.allocation);
                 self.device.destroy_image(self.handle, None);
             }
@@ -468,7 +548,7 @@ impl Drop for ImageInner {
 /// Wrapper around a Vulkan image.
 #[derive(Debug)]
 pub struct Image {
-    inner: Arc<ImageInner>,
+    inner: Option<Arc<ImageInner>>,
     handle: vk::Image,
     usage: ImageUsage,
     type_: ImageType,
@@ -476,17 +556,36 @@ pub struct Image {
     size: Size3D,
 }
 
+impl Clone for Image {
+    fn clone(&self) -> Self {
+        Image {
+            inner: self.inner.clone(),
+            handle: self.handle,
+            usage: self.usage,
+            type_: self.type_,
+            format: self.format,
+            size: self.size,
+        }
+    }
+}
+
 impl Drop for Image {
     fn drop(&mut self) {
-        self.inner.device.drop_image(&self.inner)
+        if let Some(inner) = Arc::into_inner(self.inner.take().unwrap()) {
+            let last_submission_index = inner.last_submission_index.load(Ordering::Relaxed);
+            inner.device.clone().delete_later(last_submission_index, inner);
+        }
     }
 }
 
 impl Image {
     pub fn set_label(&self, label: &str) {
-        self.inner
-            .device
-            .set_debug_object_name(vk::ObjectType::IMAGE, self.handle.as_raw(), label, None);
+        self.inner.as_ref().unwrap().device.set_debug_object_name(
+            vk::ObjectType::IMAGE,
+            self.handle.as_raw(),
+            label,
+            None,
+        );
     }
 
     /// Returns the `vk::ImageType` of the image.
@@ -522,12 +621,16 @@ impl Image {
     }
 
     pub fn id(&self) -> ImageId {
-        self.inner.id
+        self.inner.as_ref().unwrap().id
     }
 
     /// Returns the image handle.
     pub fn handle(&self) -> vk::Image {
         self.handle
+    }
+
+    pub fn device(&self) -> &Device {
+        &self.inner.as_ref().unwrap().device
     }
 
     /// Creates an image view for the base mip level of this image,
@@ -556,52 +659,50 @@ impl Image {
     }
 
     /// Creates an `ImageView` object.
-    fn create_view(&self, info: &ImageViewInfo) -> ImageView {
-        self.inner.device.create_image_view(self, info)
+    pub(crate) fn create_view(&self, info: &ImageViewInfo) -> ImageView {
+        self.inner.as_ref().unwrap().device.create_image_view(self, info)
+    }
+
+    pub(crate) fn set_last_submission_index(&self, submission_index: u64) {
+        self.inner
+            .as_ref()
+            .unwrap()
+            .last_submission_index
+            .store(submission_index, Ordering::Release);
     }
 }
 
 #[derive(Debug)]
 struct ImageViewInner {
-    image: Arc<ImageInner>,
+    // Don't hold Arc<ImageInner> here
+    //
+    // 1. create the image view
+    // 2. use it in a submission (#1)
+    // 3. use the image in a later submission (#2)
+    // 4. drop the image ref -> not added to the deferred deletion list because the image view still holds a reference
+    // ImageView now holds the last ref
+    // 5. drop the ImageView -> image view added to the deferred deletion list
+    // 6. ImageView deleted when #1 finishes, along with the image since it holds the last ref,
+    //    but the image might still be in use by #2!
+    image: Image,
     id: ImageViewId,
     handle: vk::ImageView,
     last_submission_index: AtomicU64,
 }
 
-impl ImageViewInner {
-    fn set_last_submission_index(&self, submission_index: u64) {
-        self.last_submission_index.store(submission_index, Ordering::Release);
-    }
-}
-
-impl Resource for ImageViewInner {
-    type Id = ImageViewId;
-
-    fn insert(maps: &mut ResourceMaps, resource: Arc<Self>) {
-        maps.image_views.insert(resource.id, resource);
-    }
-
-    fn remove(&self, maps: &mut ResourceMaps) {
-        maps.image_views.remove(&self.id);
-    }
-
-    fn submission_index(&self) -> u64 {
-        self.last_submission_index.load(Ordering::Relaxed)
-    }
-}
-
 impl Drop for ImageViewInner {
     fn drop(&mut self) {
         unsafe {
-            self.image.device.destroy_image_view(self.handle, None);
+            self.image.device().inner.image_view_ids.lock().unwrap().remove(self.id);
+            self.image.device().destroy_image_view(self.handle, None);
         }
     }
 }
 
+/// A view over an image subresource or subresource range.
 #[derive(Debug)]
 pub struct ImageView {
-    inner: Arc<ImageViewInner>,
+    inner: Option<Arc<ImageViewInner>>,
     image: ImageId,
     image_handle: vk::Image,
     handle: vk::ImageView,
@@ -610,9 +711,27 @@ pub struct ImageView {
     size: Size3D,
 }
 
+impl Clone for ImageView {
+    fn clone(&self) -> Self {
+        //self.inner.user_ref_count.fetch_add(1, Ordering::Relaxed);
+        ImageView {
+            inner: self.inner.clone(),
+            image: self.image,
+            image_handle: self.image_handle,
+            handle: self.handle,
+            format: self.format,
+            original_format: self.original_format,
+            size: self.size,
+        }
+    }
+}
+
 impl Drop for ImageView {
     fn drop(&mut self) {
-        self.inner.image.device.drop_image_view(&self.inner)
+        if let Some(inner) = Arc::into_inner(self.inner.take().unwrap()) {
+            let last_submission_index = inner.last_submission_index.load(Ordering::Relaxed);
+            inner.image.device().clone().delete_later(last_submission_index, inner);
+        }
     }
 }
 
@@ -639,31 +758,39 @@ impl ImageView {
     }
 
     pub fn set_label(&self, label: &str) {
-        self.inner
-            .image
-            .device
+        self.image()
+            .device()
             .set_debug_object_name(vk::ObjectType::IMAGE_VIEW, self.handle.as_raw(), label, None);
     }
 
-    fn image_handle(&self) -> vk::Image {
+    pub fn image(&self) -> &Image {
+        &self.inner.as_ref().unwrap().image
+    }
+
+    pub(crate) fn id(&self) -> ImageViewId {
+        self.inner.as_ref().unwrap().id
+    }
+
+    pub(crate) fn image_handle(&self) -> vk::Image {
         self.image_handle
     }
 
-    fn original_format(&self) -> vk::Format {
+    pub(crate) fn original_format(&self) -> vk::Format {
         self.original_format
     }
 
-    fn image_id(&self) -> ImageId {
+    pub(crate) fn image_id(&self) -> ImageId {
         self.image.clone()
     }
-}
 
-/*
-/// Wrapper around a descriptor buffer
-pub struct ArgumentBufferUntyped {
-    descriptor_buffer: BufferUntyped,
-    tracker: ArgumentBufferTracker,
-}*/
+    pub(crate) fn set_last_submission_index(&self, submission_index: u64) {
+        self.inner
+            .as_ref()
+            .unwrap()
+            .last_submission_index
+            .store(submission_index, Ordering::Release);
+    }
+}
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -1179,14 +1306,67 @@ impl<'a, T> BufferRange<'a, [T]> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Describes a color, depth, or stencil attachment.
-pub struct Attachment<'a> {
-    pub image_view: &'a ImageView,
+#[derive(Clone)]
+pub struct ColorAttachment {
+    pub image_view: ImageView,
     pub load_op: vk::AttachmentLoadOp,
     pub store_op: vk::AttachmentStoreOp,
-    pub clear_value: Option<vk::ClearValue>,
+    pub clear_value: [f64; 4],
 }
 
-impl<'a> Attachment<'a> {
+impl ColorAttachment {
+    pub(crate) fn get_vk_clear_color_value(&self) -> vk::ClearColorValue {
+        match format_numeric_type(self.image_view.format) {
+            FormatNumericType::UInt => vk::ClearColorValue {
+                uint32: [
+                    self.clear_value[0] as u32,
+                    self.clear_value[1] as u32,
+                    self.clear_value[2] as u32,
+                    self.clear_value[3] as u32,
+                ],
+            },
+            FormatNumericType::SInt => vk::ClearColorValue {
+                int32: [
+                    self.clear_value[0] as i32,
+                    self.clear_value[1] as i32,
+                    self.clear_value[2] as i32,
+                    self.clear_value[3] as i32,
+                ],
+            },
+            FormatNumericType::Float => vk::ClearColorValue {
+                float32: [
+                    self.clear_value[0] as f32,
+                    self.clear_value[1] as f32,
+                    self.clear_value[2] as f32,
+                    self.clear_value[3] as f32,
+                ],
+            },
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct DepthStencilAttachment {
+    pub image_view: ImageView,
+    pub depth_load_op: vk::AttachmentLoadOp,
+    pub depth_store_op: vk::AttachmentStoreOp,
+    pub stencil_load_op: vk::AttachmentLoadOp,
+    pub stencil_store_op: vk::AttachmentStoreOp,
+    pub depth_clear_value: f64,
+    pub stencil_clear_value: u32,
+}
+
+impl DepthStencilAttachment {
+    pub(crate) fn get_vk_clear_depth_stencil_value(&self) -> vk::ClearDepthStencilValue {
+        vk::ClearDepthStencilValue {
+            depth: self.depth_clear_value as f32,
+            stencil: self.stencil_clear_value,
+        }
+    }
+}
+
+/*
+impl<'a> ColorAttachment<'a> {
     /// Sets `load_op` to CLEAR, and sets the clear color of this attachment.
     pub fn clear_color(mut self, color: [f32; 4]) -> Self {
         self.load_op = vk::AttachmentLoadOp::CLEAR;
@@ -1242,31 +1422,58 @@ impl<'a> Attachment<'a> {
         self.store_op = vk::AttachmentStoreOp::DONT_CARE;
         self
     }
-}
+}*/
 
+/*
 pub trait Attachments {
     /// Returns an iterator over the color attachments in this object.
-    fn color_attachments(&self) -> impl Iterator<Item = Attachment<'_>> + '_;
+    fn color_attachments(&self) -> impl Iterator<Item = ColorAttachment>;
 
     /// Returns the depth attachment.
-    fn depth_stencil_attachment(&self) -> Option<Attachment>;
-}
+    fn depth_stencil_attachment(&self) -> Option<DepthStencilAttachment>;
+}*/
 
+/*
 /// Types that describe a color, depth, or stencil attachment to a rendering operation.
-pub trait AsAttachment<'a> {
+pub trait AsColorAttachment {
     /// Returns an object describing the attachment.
-    fn as_attachment(&self) -> Attachment<'a>;
+    fn as_attachment(&self) -> ColorAttachment;
 }
 
 /// References to images can be used as attachments.
-impl<'a> AsAttachment<'a> for &'a ImageView {
-    fn as_attachment(&self) -> Attachment<'a> {
-        Attachment {
-            image_view: self,
+impl AsColorAttachment for ImageView {
+    fn as_attachment(&self) -> ColorAttachment {
+        ColorAttachment {
+            image_view: self.clone(),
             load_op: Default::default(),
             store_op: Default::default(),
             clear_value: None,
         }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct DynamicAttachments {
+    pub color_attachments: Vec<ColorAttachment>,
+    pub depth_attachment: Option<DepthStencilAttachment>,
+}
+
+impl DynamicAttachments {
+    pub fn new() -> Self {
+        Self {
+            color_attachments: Vec::new(),
+            depth_attachment: None,
+        }
+    }
+}
+
+impl Attachments for DynamicAttachments {
+    fn color_attachments(&self) -> impl Iterator<Item = ColorAttachment> {
+        self.color_attachments.iter()
+    }
+
+    fn depth_stencil_attachment(&self) -> Option<DepthStencilAttachment> {
+        self.depth_attachment.as_ref()
     }
 }
 
@@ -1292,7 +1499,7 @@ impl<'a, A: AsAttachment<'a>> AsAttachment<'a> for AttachmentOverride<A> {
         }
         desc
     }
-}
+}*/
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 #[derive(Copy, Clone, Debug)]
@@ -1345,9 +1552,17 @@ impl<'a> ShaderEntryPoint<'a> {
             entry_point: "main",
         }
     }
+
+    pub fn from_spirv(spirv: &'a [u32], entry_point: &'a str) -> ShaderEntryPoint<'a> {
+        Self {
+            code: ShaderCode::Spirv(spirv),
+            entry_point,
+        }
+    }
 }
 
 /// Specifies the shaders of a graphics pipeline.
+#[derive(Copy, Clone, Debug)]
 pub enum PreRasterizationShaders<'a> {
     /// Shaders of the primitive shading pipeline (the classic vertex, tessellation, geometry and fragment shaders).
     PrimitiveShading {
@@ -1397,6 +1612,7 @@ impl<'a> PreRasterizationShaders<'a> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct GraphicsPipelineCreateInfo<'a> {
     pub layout: PipelineLayoutDescriptor<'a>,
     pub vertex_input: VertexInputState<'a>,
@@ -1407,6 +1623,7 @@ pub struct GraphicsPipelineCreateInfo<'a> {
     pub fragment_output: FragmentOutputInterfaceDescriptor<'a>,
 }
 
+#[derive(Copy, Clone, Debug)]
 pub struct ComputePipelineCreateInfo<'a> {
     pub layout: PipelineLayoutDescriptor<'a>,
     pub compute_shader: ShaderEntryPoint<'a>,
@@ -1543,6 +1760,67 @@ pub fn aspects_for_format(fmt: vk::Format) -> vk::ImageAspectFlags {
         vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL
     } else {
         vk::ImageAspectFlags::COLOR
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
+pub enum FormatNumericType {
+    SInt,
+    UInt,
+    Float,
+}
+
+pub fn format_numeric_type(fmt: vk::Format) -> FormatNumericType {
+    match fmt {
+        vk::Format::R8_UINT
+        | vk::Format::R8G8_UINT
+        | vk::Format::R8G8B8_UINT
+        | vk::Format::R8G8B8A8_UINT
+        | vk::Format::R16_UINT
+        | vk::Format::R16G16_UINT
+        | vk::Format::R16G16B16_UINT
+        | vk::Format::R16G16B16A16_UINT
+        | vk::Format::R32_UINT
+        | vk::Format::R32G32_UINT
+        | vk::Format::R32G32B32_UINT
+        | vk::Format::R32G32B32A32_UINT
+        | vk::Format::R64_UINT
+        | vk::Format::R64G64_UINT
+        | vk::Format::R64G64B64_UINT
+        | vk::Format::R64G64B64A64_UINT => FormatNumericType::UInt,
+
+        vk::Format::R8_SINT
+        | vk::Format::R8G8_SINT
+        | vk::Format::R8G8B8_SINT
+        | vk::Format::R8G8B8A8_SINT
+        | vk::Format::R16_SINT
+        | vk::Format::R16G16_SINT
+        | vk::Format::R16G16B16_SINT
+        | vk::Format::R16G16B16A16_SINT
+        | vk::Format::R32_SINT
+        | vk::Format::R32G32_SINT
+        | vk::Format::R32G32B32_SINT
+        | vk::Format::R32G32B32A32_SINT
+        | vk::Format::R64_SINT
+        | vk::Format::R64G64_SINT
+        | vk::Format::R64G64B64_SINT
+        | vk::Format::R64G64B64A64_SINT => FormatNumericType::SInt,
+
+        vk::Format::R16_SFLOAT
+        | vk::Format::R16G16_SFLOAT
+        | vk::Format::R16G16B16_SFLOAT
+        | vk::Format::R16G16B16A16_SFLOAT
+        | vk::Format::R32_SFLOAT
+        | vk::Format::R32G32_SFLOAT
+        | vk::Format::R32G32B32_SFLOAT
+        | vk::Format::R32G32B32A32_SFLOAT
+        | vk::Format::R64_SFLOAT
+        | vk::Format::R64G64_SFLOAT
+        | vk::Format::R64G64B64_SFLOAT
+        | vk::Format::R64G64B64A64_SFLOAT => FormatNumericType::Float,
+
+        // TODO
+        _ => FormatNumericType::Float,
     }
 }
 

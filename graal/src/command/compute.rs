@@ -41,7 +41,7 @@ impl<'a> ComputeEncoder<'a> {
                     offset,
                     size,
                 } => {
-                    self.stream.use_buffer(&buffer.inner, access);
+                    self.stream.use_buffer(&buffer, access);
                     descriptor_writes.push(DescriptorWrite::Buffer {
                         binding: arg.binding,
                         descriptor_type: arg.descriptor_type,
