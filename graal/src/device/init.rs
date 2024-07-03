@@ -204,7 +204,7 @@ impl Device {
                     ..Default::default()
                 };
                 let semaphore_create_info = vk::SemaphoreCreateInfo {
-                    p_next: &mut timeline_create_info as *mut _ as *mut c_void,
+                    p_next: &timeline_create_info as *const _ as *const c_void,
                     ..Default::default()
                 };
                 let timeline = device

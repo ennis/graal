@@ -3,7 +3,7 @@ use std::{
     borrow::Cow,
     cell::Cell,
     collections::{HashMap, VecDeque},
-    ffi::{c_char, CString},
+    ffi::{c_char, c_void, CString},
     fmt,
     ops::Deref,
     ptr,
@@ -19,10 +19,11 @@ use crate::{
     compile_shader,
     device::resource::ResourceGroup,
     instance::{vk_ext_debug_utils, vk_khr_surface},
-    is_write_access, platform_impl, Arguments, ArgumentsLayout, BufferAccess, BufferInner, BufferUsage, CommandPool,
-    CommandStream, CompareOp, ComputePipeline, ComputePipelineCreateInfo, Error, GraphicsPipeline,
-    GraphicsPipelineCreateInfo, ImageAccess, ImageInner, ImageView, ImageViewInfo, ImageViewInner,
-    PreRasterizationShaders, Sampler, SamplerCreateInfo, ShaderCode, ShaderStage, Size3D, Swapchain,
+    is_write_access, platform_impl, ArgumentBuffer, ArgumentBufferDesc, Arguments, ArgumentsLayout, BufferAccess,
+    BufferInner, BufferRange, BufferRangeUntyped, BufferUsage, CommandPool, CommandStream, CompareOp, ComputePipeline,
+    ComputePipelineCreateInfo, Error, GraphicsPipeline, GraphicsPipelineCreateInfo, ImageAccess, ImageInner, ImageView,
+    ImageViewInfo, ImageViewInner, PreRasterizationShaders, Sampler, SamplerCreateInfo, ShaderCode, ShaderStage,
+    Size3D, Swapchain,
 };
 
 mod init;
@@ -139,6 +140,108 @@ pub(crate) struct DeviceInner {
     deletion_lists: Mutex<Vec<DeferredDeletionList>>,
     sampler_cache: Mutex<HashMap<SamplerCreateInfo, Sampler>>,
     compiler: shaderc::Compiler,
+
+    /// VkDescriptorSetLayouts for universal argument buffers.
+    pub(crate) argbuf_layouts: ArgumentBufferLayouts,
+}
+
+pub const STATIC_UNIFORM_BUFFERS_COUNT: u32 = 16;
+pub const STATIC_STORAGE_BUFFERS_COUNT: u32 = 32;
+pub const STATIC_SAMPLED_IMAGES_COUNT: u32 = 32;
+pub const STATIC_STORAGE_IMAGES_COUNT: u32 = 32;
+pub const STATIC_SAMPLERS_COUNT: u32 = 32;
+pub const MAX_INDEXED_STORAGE_BUFFERS_COUNT: u32 = 4096;
+pub const MAX_INDEXED_SAMPLED_IMAGES_COUNT: u32 = 4096;
+pub const MAX_INDEXED_STORAGE_IMAGES_COUNT: u32 = 4096;
+
+pub const UNIFORM_BUFFERS_SET: u32 = 0;
+pub const STORAGE_BUFFERS_SET: u32 = 1;
+pub const SAMPLED_IMAGES_SET: u32 = 2;
+pub const STORAGE_IMAGES_SET: u32 = 3;
+pub const SAMPLERS_SET: u32 = 4;
+
+pub(crate) struct ArgumentBufferLayouts {
+    pub(crate) ubo: vk::DescriptorSetLayout,
+    pub(crate) ssbo: vk::DescriptorSetLayout,
+    pub(crate) texture: vk::DescriptorSetLayout,
+    pub(crate) image: vk::DescriptorSetLayout,
+    pub(crate) sampler: vk::DescriptorSetLayout,
+}
+
+unsafe fn create_argbuf_layouts(device: &ash::Device) -> ArgumentBufferLayouts {
+    let sets = [
+        (vk::DescriptorType::UNIFORM_BUFFER, STATIC_UNIFORM_BUFFERS_COUNT, None),
+        (
+            vk::DescriptorType::STORAGE_BUFFER,
+            STATIC_STORAGE_BUFFERS_COUNT,
+            Some(MAX_INDEXED_STORAGE_BUFFERS_COUNT),
+        ),
+        (
+            vk::DescriptorType::SAMPLED_IMAGE,
+            STATIC_SAMPLED_IMAGES_COUNT,
+            Some(MAX_INDEXED_SAMPLED_IMAGES_COUNT),
+        ),
+        (
+            vk::DescriptorType::STORAGE_IMAGE,
+            STATIC_STORAGE_IMAGES_COUNT,
+            Some(MAX_INDEXED_STORAGE_IMAGES_COUNT),
+        ),
+        (vk::DescriptorType::SAMPLER, STATIC_SAMPLERS_COUNT, None),
+    ];
+
+    let mut layouts = vec![];
+
+    for (descriptor_type, binding_count, max_indexed_count) in sets {
+        let mut bindings = vec![];
+        let mut flags = vec![];
+
+        bindings.extend((0..binding_count).map(|i| vk::DescriptorSetLayoutBinding {
+            binding: i,
+            descriptor_type,
+            descriptor_count: 1,
+            stage_flags: vk::ShaderStageFlags::ALL,
+            p_immutable_samplers: ptr::null(),
+        }));
+        flags.extend((0..binding_count).map(|_| vk::DescriptorBindingFlags::empty()));
+
+        if let Some(max_indexed_count) = max_indexed_count {
+            bindings.push(vk::DescriptorSetLayoutBinding {
+                binding: bindings.len() as u32,
+                descriptor_type,
+                descriptor_count: max_indexed_count,
+                stage_flags: vk::ShaderStageFlags::ALL,
+                p_immutable_samplers: ptr::null(),
+            });
+            flags.push(vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT);
+        }
+
+        let dslbfci = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
+            binding_count: flags.len() as u32,
+            p_binding_flags: flags.as_ptr(),
+            ..Default::default()
+        };
+
+        let mut dslci = vk::DescriptorSetLayoutCreateInfo {
+            p_next: &dslbfci as *const _ as *const c_void,
+            flags: Default::default(),
+            binding_count: bindings.len() as u32,
+            p_bindings: bindings.as_ptr(),
+            ..Default::default()
+        };
+
+        let layout = device
+            .create_descriptor_set_layout(&dslci, None)
+            .expect("failed to create descriptor set layout");
+        layouts.push(layout);
+    }
+
+    ArgumentBufferLayouts {
+        ubo: layouts[0],
+        ssbo: layouts[1],
+        texture: layouts[2],
+        image: layouts[3],
+        sampler: layouts[4],
+    }
 }
 
 /// Errors during device creation.
@@ -464,23 +567,24 @@ impl Device {
             .unwrap();
     }
 
-    /*// Problem: need to know the descriptor layout to create the descriptor buffer
-    pub fn create_argument_buffer_untyped(&self, arguments_layout: &ArgumentsLayout) -> ArgumentBufferUntyped {
-        // Build descriptor set layout
-        // FIXME: obviously it's not good to re-create the layout every time, but I really don't want the application
-        // to manage the lifetime of DescriptorSetLayouts when they could clearly be statically associated to argument types.
+    /// Creates a universal argument buffer.
+    pub fn create_argument_buffer(
+        &self,
+        uniform_buffer_bindings: &[(u32, BufferRangeUntyped)],
+        storage_buffer_bindings: &[BufferRangeUntyped],
+        sampled_image_bindings: &[BufferRangeUntyped],
+    ) -> ArgumentBuffer {
+        let mut bindings = [vk::Des];
 
-        let layout = self.create_descriptor_set_layout(arguments_layout);
+        let dsci = vk::DescriptorSetLayoutCreateInfo {
+            flags: Default::default(),
+            binding_count: desc.bindings.len() as u32,
+            p_bindings: desc.bindings.as_ptr(),
+            ..Default::default()
+        };
 
-        unsafe {
-            let buffer_size = self.ext_descriptor_buffer().get_descriptor_set_layout_size(layout);
-            self.create_buffer(buffer_size, BufferUsage::UNIFORM_BUFFER, ResourceState::HostVisible)
-        }
-
-        unsafe {
-            self.destroy_descriptor_set_layout(layout, None);
-        }
-    }*/
+        unsafe { self.inner.device.create_descriptor_set_layout() }
+    }
 
     //pub fn create_
 
