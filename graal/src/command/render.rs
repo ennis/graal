@@ -1,35 +1,16 @@
 //! Render command encoders
-use std::{mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{mem, mem::MaybeUninit, ops::Range, ptr, slice};
 
-use ash::{vk, vk::Buffer};
+use ash::vk;
 use fxhash::FxHashMap;
 
 use crate::{
-    command::{do_cmd_push_constants, do_cmd_push_descriptor_sets, DescriptorWrite},
-    format_numeric_type, is_depth_and_stencil_format, ArgumentKind, Arguments, BufferAccess, BufferId, BufferInner,
-    BufferRangeUntyped, BufferUntyped, ClearColorValue, ColorAttachment, CommandStream, DepthStencilAttachment, Device,
-    FormatNumericType, GraphicsPipeline, Image, ImageAccess, ImageId, ImageInner, ImageView, ImageViewId,
-    ImageViewInner, IndexType, PrimitiveTopology, Rect2D, VertexBufferDescriptor,
+    is_depth_and_stencil_format, BufferAccess, BufferId, BufferRangeUntyped, BufferUntyped, ClearColorValue,
+    ColorAttachment, CommandStream, DepthStencilAttachment, Descriptor, Device, GpuResource, GraphicsPipeline, Image,
+    ImageAccess, ImageId, ImageView, ImageViewId, Rect2D,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/*
-struct ColorTarget {
-    image_view: vk::ImageView,
-    load_op: vk::AttachmentLoadOp,
-    store_op: vk::AttachmentStoreOp,
-    clear_value: Option<vk::ClearValue>,
-}
-
-struct DepthStencilTarget {
-    image_view: vk::ImageView,
-    format: vk::Format,
-    load_op: vk::AttachmentLoadOp,
-    store_op: vk::AttachmentStoreOp,
-    // TODO stencil_load_op, stencil_store_op
-    clear_value: Option<vk::ClearValue>,
-}*/
 
 /// A context object to submit commands to a command buffer after a pipeline has been bound to it.
 ///
@@ -50,7 +31,7 @@ impl<'a> RenderEncoder<'a> {
         self.stream.device()
     }
 
-    fn use_image(&mut self, image: &Image, access: ImageAccess) {
+    pub fn use_image(&mut self, image: &Image, access: ImageAccess) {
         let image_id = image.id();
         if let Some(entry) = self.used_images.get_mut(&image_id) {
             if entry.1 != access {
@@ -64,7 +45,7 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
-    fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
+    pub fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
         let buffer_id = buffer.id();
         if let Some(entry) = self.used_buffers.get_mut(&buffer_id) {
             if entry.1 != access {
@@ -78,73 +59,79 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
-    fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
+    pub fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
         let image_view_id = image_view.id();
         self.use_image(image_view.image(), state);
         self.used_image_views.insert(image_view_id, image_view.clone());
     }
 
-    pub fn bind_arguments<A: Arguments>(&mut self, set: u32, arguments: &A) {
+    /// Marks the resource as being in use by the current submission.
+    ///
+    /// This will prevent the resource from being destroyed until the current submission is
+    /// either complete or cancelled.
+    pub fn reference_resource<R: GpuResource>(&mut self, resource: &R) {
+        self.stream.reference_resource(resource);
+    }
+
+    /// Binds a descriptor set (`vkCmdBindDescriptorSets`).
+    ///
+    /// # Safety
+    ///
+    /// The caller is responsible for ensuring that the descriptor set is compatible with the
+    /// currently bound pipeline, and that the descriptor set is not destroyed while it is still
+    /// in use by the GPU.
+    pub unsafe fn bind_descriptor_set(&mut self, index: u32, set: vk::DescriptorSet) {
+        self.stream.device.cmd_bind_descriptor_sets(
+            self.command_buffer,
+            vk::PipelineBindPoint::GRAPHICS,
+            self.pipeline_layout,
+            index,
+            &[set],
+            &[],
+        )
+    }
+
+    /// Specifies descriptors for subsequent draw calls with `vkCmdPushDescriptorSetKHR`.
+    pub fn push_descriptors(&mut self, set: u32, bindings: &[(u32, Descriptor)]) {
         assert!(
             self.pipeline_layout != vk::PipelineLayout::null(),
             "encoder must have a pipeline bound before binding arguments"
         );
 
-        let mut descriptor_writes = vec![];
-        for arg in arguments.arguments() {
-            match arg.kind {
-                ArgumentKind::Image { image_view, access } => {
-                    self.use_image_view(image_view, access);
-                    descriptor_writes.push(DescriptorWrite::Image {
-                        binding: arg.binding,
-                        descriptor_type: arg.descriptor_type,
-                        image_view: image_view.handle(),
-                        format: image_view.format(),
-                        access,
-                    });
-                }
-                ArgumentKind::Buffer {
-                    buffer,
-                    access,
-                    offset,
-                    size,
-                } => {
-                    self.use_buffer(buffer, access);
-                    descriptor_writes.push(DescriptorWrite::Buffer {
-                        binding: arg.binding,
-                        descriptor_type: arg.descriptor_type,
-                        buffer: buffer.handle(),
-                        access,
-                        offset,
-                        size,
-                    });
-                }
-                ArgumentKind::Sampler { sampler } => {
-                    descriptor_writes.push(DescriptorWrite::Sampler {
-                        binding: arg.binding,
-                        descriptor_type: arg.descriptor_type,
-                        sampler: sampler.handle(),
-                    });
-                }
-            }
-        }
-
-        let device = self.stream.device();
-
         unsafe {
-            do_cmd_push_descriptor_sets(
-                device,
+            self.stream.do_cmd_push_descriptor_set(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
                 set,
-                descriptor_writes.as_slice(),
+                bindings,
             );
         }
     }
 
+    /// Binds a graphics pipeline.
+    ///
+    /// Calling this function invalidates all descriptor & push constant state set by previous calls
+    /// to `push_descriptors`, `bind_descriptor_set`, and `push_constants`.
     pub fn bind_graphics_pipeline(&mut self, pipeline: &GraphicsPipeline) {
+        // Note about pipeline compatibility:
+        //
+        // Calling CmdBindPipeline doesn't really invalidate descriptor sets or push constants,
+        // but they are only valid for this pipeline if its layout is "compatible" with the layout
+        // used previously.
+        // There is a notion of "partial compatibility", in which the first N descriptor set bindings
+        // stay valid if the pipeline layouts have the same N first descriptor set layouts.
+        // However, partial compatibility requires that layouts have the *same push constants ranges*
+        // which is far too restrictive for our use cases
+        // (bindless, with pass-specific parameters in push constants).
+        //
+        // So, don't bother with this insanity and rebind everything between pipeline changes.
+        // Hopefully vkCmdBindDescriptorSets is cheap enough. I'm pretty sure it doesn't do much
+        // if the sets are already bound
+        // (for reference, see https://gitlab.freedesktop.org/mesa/mesa/-/blob/main/src/nouveau/vulkan/nvk_cmd_buffer.c?ref_type=heads#L648)
+
         // SAFETY: TBD
+        // TODO: there's no way to ensure that the pipeline lives long enough
         unsafe {
             self.stream.device.cmd_bind_pipeline(
                 self.command_buffer,
@@ -157,23 +144,32 @@ impl<'a> RenderEncoder<'a> {
     }
 
     /// Binds a vertex buffer.
-    pub fn bind_vertex_buffer(&mut self, vertex_buffer: &VertexBufferDescriptor) {
-        self.use_buffer(&vertex_buffer.buffer_range.buffer, BufferAccess::VERTEX);
+    ///
+    /// # Arguments
+    /// * `binding` vertex buffer binding index
+    /// * `buffer_range` vertex buffer range
+    /// * `stride` size in bytes between vertices in the buffer
+    pub fn bind_vertex_buffer(&mut self, binding: u32, buffer_range: BufferRangeUntyped) {
+        self.reference_resource(&buffer_range.buffer);
         unsafe {
             self.stream.device.cmd_bind_vertex_buffers2(
                 self.command_buffer,
-                vertex_buffer.binding,
-                &[vertex_buffer.buffer_range.buffer.handle],
-                &[vertex_buffer.buffer_range.offset as vk::DeviceSize],
-                None, // FIXME vertex buffer strides
-                None, // FIXME vertex buffer sizes
+                binding,
+                &[buffer_range.buffer.handle],
+                &[buffer_range.offset as vk::DeviceSize],
+                None,
+                None,
             );
         }
     }
 
-    // TODO typed version
-    pub fn bind_index_buffer(&mut self, index_type: IndexType, index_buffer: BufferRangeUntyped) {
-        self.use_buffer(&index_buffer.buffer, BufferAccess::INDEX);
+    /// Binds an index buffer.
+    ///
+    /// # Arguments
+    /// * `index_type` type of indices in the index buffer
+    /// * `index_buffer` index buffer range
+    pub fn bind_index_buffer(&mut self, index_type: vk::IndexType, index_buffer: BufferRangeUntyped) {
+        self.reference_resource(&index_buffer.buffer);
         unsafe {
             self.stream.device.cmd_bind_index_buffer(
                 self.command_buffer,
@@ -185,13 +181,14 @@ impl<'a> RenderEncoder<'a> {
     }
 
     /// Binds push constants.
-    pub fn bind_push_constants<P>(&mut self, data: &P)
+    ///
+    /// Push constants stay valid until the bound pipeline is changed.
+    pub fn push_constants<P>(&mut self, data: &P)
     where
-        P: Copy + ?Sized,
+        P: Copy,
     {
         unsafe {
-            do_cmd_push_constants(
-                self.stream.device(),
+            self.stream.do_cmd_push_constants(
                 self.command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.pipeline_layout,
@@ -199,8 +196,23 @@ impl<'a> RenderEncoder<'a> {
             );
         }
     }
+    /// Binds push constants.
+    ///
+    /// Push constants stay valid until the bound pipeline is changed.
 
-    pub fn set_primitive_topology(&mut self, topology: PrimitiveTopology) {
+    pub fn push_constants_slice(&mut self, data: &[u8]) {
+        unsafe {
+            self.stream.do_cmd_push_constants(
+                self.command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                slice::from_raw_parts(data.as_ptr() as *const MaybeUninit<u8>, mem::size_of_val(data)),
+            );
+        }
+    }
+
+    /// Sets the primitive topology.
+    pub fn set_primitive_topology(&mut self, topology: vk::PrimitiveTopology) {
         unsafe {
             self.stream
                 .device
@@ -208,6 +220,7 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
+    /// Sets the viewport.
     pub fn set_viewport(&mut self, x: f32, y: f32, width: f32, height: f32, min_depth: f32, max_depth: f32) {
         unsafe {
             self.stream.device.cmd_set_viewport(
@@ -225,6 +238,7 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
+    /// Sets the scissor rectangle.
     pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
         unsafe {
             self.stream.device.cmd_set_scissor(
@@ -378,29 +392,32 @@ impl<'a> Drop for RenderEncoder<'a> {
     }
 }
 
+/// Parameters of `CommandStream::begin_rendering`
+pub struct RenderPassDescriptor<'a> {
+    /// The color attachments to use for the render pass.
+    pub color_attachments: &'a [ColorAttachment],
+    /// The depth/stencil attachment to use for the render pass.
+    pub depth_stencil_attachment: Option<DepthStencilAttachment>,
+}
+
 impl CommandStream {
-    /// Start a rendering pass
+    /// Starts a rendering pass.
+    ///
+    /// The render area is set to cover the entire size of the attachments.
+    /// The initial viewport and scissor rects are set to cover the entire render area.
     ///
     /// # Arguments
     ///
     /// * `attachments` - The attachments to use for the render pass
-    pub fn begin_rendering(
-        &mut self,
-        color_attachments: &[ColorAttachment],
-        depth_stencil_attachment: Option<DepthStencilAttachment>,
-    ) -> RenderEncoder {
-        // collect attachments
-        //let color_attachments: Vec<_> = attachments.color_attachments().collect();
-        //let depth_stencil_attachment = attachments.depth_stencil_attachment();
-
+    pub fn begin_rendering(&mut self, desc: RenderPassDescriptor) -> RenderEncoder {
         // determine render area
         let render_area = {
             // FIXME validate that all attachments have the same size
             // FIXME validate that all images are 2D
             let extent;
-            if let Some(color) = color_attachments.first() {
+            if let Some(color) = desc.color_attachments.first() {
                 extent = color.image_view.size();
-            } else if let Some(ref depth) = depth_stencil_attachment {
+            } else if let Some(ref depth) = desc.depth_stencil_attachment {
                 extent = depth.image_view.size();
             } else {
                 panic!("render_area must be specified if no attachments are specified");
@@ -416,7 +433,8 @@ impl CommandStream {
         };
 
         // Begin render pass
-        let mut color_attachment_infos: Vec<_> = color_attachments
+        let color_attachment_infos: Vec<_> = desc
+            .color_attachments
             .iter()
             .map(|a| {
                 vk::RenderingAttachmentInfo {
@@ -438,7 +456,7 @@ impl CommandStream {
         let stencil_attachment;
         let p_depth_attachment;
         let p_stencil_attachment;
-        if let Some(ref depth) = depth_stencil_attachment {
+        if let Some(ref depth) = desc.depth_stencil_attachment {
             depth_attachment = vk::RenderingAttachmentInfo {
                 image_view: depth.image_view.handle,
                 // TODO different layouts
@@ -507,16 +525,26 @@ impl CommandStream {
         // Register resource uses.
         // We could also do that after encoding the pass.
         // It doesn't matter much except we can report usage conflicts earlier.
-        for color in color_attachments.iter() {
+        for color in desc.color_attachments.iter() {
             encoder.use_image_view(&color.image_view, ImageAccess::COLOR_TARGET);
         }
-        if let Some(ref depth) = depth_stencil_attachment {
+        if let Some(ref depth) = desc.depth_stencil_attachment {
             // TODO we don't know whether the depth attachment will be written to
             encoder.use_image_view(
                 &depth.image_view,
                 ImageAccess::DEPTH_STENCIL_READ | ImageAccess::DEPTH_STENCIL_WRITE,
             );
         }
+
+        encoder.set_viewport(
+            0.0,
+            0.0,
+            render_area.extent.width as f32,
+            render_area.extent.height as f32,
+            0.0,
+            1.0,
+        );
+        encoder.set_scissor(0, 0, render_area.extent.width, render_area.extent.height);
 
         encoder
     }

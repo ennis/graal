@@ -166,11 +166,11 @@ pub(crate) fn derive_arguments(input: proc_macro::TokenStream) -> syn::Result<To
             if binding_index == 0 {
                 has_binding_zero = true;
             }
-            let ty = &f.ty;
+            //let ty = &f.ty;
 
             let mut descriptor_type = quote!();
             let mut access = quote!();
-            let shader_stages: u32 = 0xFF;
+            //let shader_stages: u32 = 0xFF;
 
             /*
             /// The index buffer used for drawing.

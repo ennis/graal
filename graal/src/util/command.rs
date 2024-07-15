@@ -15,8 +15,7 @@ impl CommandStreamExt for CommandStream {
         let width = image.image.size().width;
         let height = image.image.size().height;
 
-        let mut encoder = self.begin_blit();
-        encoder.copy_buffer_to_image(
+        self.copy_buffer_to_image(
             ImageCopyBuffer {
                 buffer: &staging_buffer.untyped,
                 layout: ImageDataLayout {
@@ -32,7 +31,6 @@ impl CommandStreamExt for CommandStream {
                 depth: size.depth,
             },
         );
-        encoder.finish();
     }
 
     fn create_image_with_data(&mut self, create_info: &ImageCreateInfo, data: &[u8]) -> Image {

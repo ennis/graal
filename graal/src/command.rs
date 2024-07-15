@@ -1,26 +1,24 @@
-use ash::prelude::VkResult;
 use std::{
     ffi::{c_char, c_void, CString},
     mem,
     mem::MaybeUninit,
-    ops::{Deref, DerefMut},
+    ops::Deref,
     ptr,
     sync::Arc,
     time::Duration,
 };
 
+use ash::{prelude::VkResult, vk::Handle};
 use fxhash::FxHashMap;
 
-pub use blit::BlitCommandEncoder;
 pub use compute::ComputeEncoder;
-pub use render::RenderEncoder;
+pub use render::{RenderEncoder, RenderPassDescriptor};
 
 use crate::{
     device::{ActiveSubmission, QueueShared},
-    make_buffer_barrier, make_image_barrier, map_image_access_to_layout, vk, vk_ext_debug_utils, ArgumentKind,
-    Arguments, BufferAccess, BufferId, BufferInner, BufferUntyped, CommandPool, Device, Format, Image, ImageAccess,
-    ImageId, ImageInner, ImageType, ImageUsage, ImageView, ImageViewId, ImageViewInner, Size3D, Swapchain,
-    SwapchainImage, VertexInput,
+    make_buffer_barrier, make_image_barrier, vk, vk_ext_debug_utils, BufferAccess, BufferId, BufferUntyped,
+    CommandPool, Descriptor, Device, GpuResource, Image, ImageAccess, ImageId, ImageView, ImageViewId, Swapchain,
+    SwapchainImage,
 };
 
 mod blit;
@@ -29,169 +27,9 @@ mod render;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-enum DescriptorWrite {
-    Image {
-        binding: u32,
-        descriptor_type: vk::DescriptorType,
-        image_view: vk::ImageView,
-        format: Format,
-        access: ImageAccess,
-    },
-    Buffer {
-        binding: u32,
-        descriptor_type: vk::DescriptorType,
-        buffer: vk::Buffer,
-        access: BufferAccess,
-        offset: u64,
-        size: u64,
-    },
-    Sampler {
-        binding: u32,
-        descriptor_type: vk::DescriptorType,
-        sampler: vk::Sampler,
-    },
-}
-
 union DescriptorBufferOrImage {
     image: vk::DescriptorImageInfo,
     buffer: vk::DescriptorBufferInfo,
-}
-
-unsafe fn do_cmd_push_descriptor_sets(
-    device: &Device,
-    command_buffer: vk::CommandBuffer,
-    bind_point: vk::PipelineBindPoint,
-    pipeline_layout: vk::PipelineLayout,
-    set: u32,
-    desc_writes: &[DescriptorWrite],
-) {
-    let mut descriptors = Vec::with_capacity(desc_writes.len());
-    let mut descriptor_writes = Vec::with_capacity(desc_writes.len());
-
-    for dw in desc_writes {
-        match *dw {
-            DescriptorWrite::Buffer {
-                binding,
-                descriptor_type,
-                buffer,
-                offset,
-                size,
-                access: _,
-            } => {
-                descriptors.push(DescriptorBufferOrImage {
-                    buffer: vk::DescriptorBufferInfo {
-                        buffer,
-                        offset,
-                        range: size,
-                    },
-                });
-                descriptor_writes.push(vk::WriteDescriptorSet {
-                    // ignored for push descriptors
-                    dst_binding: binding,
-                    dst_array_element: 0,
-                    descriptor_count: 1,
-                    descriptor_type,
-                    p_buffer_info: &descriptors.last().unwrap().buffer,
-                    ..Default::default()
-                });
-            }
-            DescriptorWrite::Image {
-                binding,
-                descriptor_type,
-                image_view,
-                access,
-                format,
-            } => {
-                let image_layout = map_image_access_to_layout(access, format);
-                descriptors.push(DescriptorBufferOrImage {
-                    image: vk::DescriptorImageInfo {
-                        sampler: Default::default(),
-                        image_view,
-                        image_layout,
-                    },
-                });
-                descriptor_writes.push(vk::WriteDescriptorSet {
-                    // ignored for push descriptors
-                    dst_binding: binding,
-                    dst_array_element: 0,
-                    descriptor_count: 1,
-                    descriptor_type,
-                    p_image_info: &descriptors.last().unwrap().image,
-                    ..Default::default()
-                });
-            }
-            DescriptorWrite::Sampler {
-                sampler,
-                binding,
-                descriptor_type,
-            } => {
-                descriptors.push(DescriptorBufferOrImage {
-                    image: vk::DescriptorImageInfo {
-                        sampler,
-                        image_view: Default::default(),
-                        image_layout: Default::default(),
-                    },
-                });
-                descriptor_writes.push(vk::WriteDescriptorSet {
-                    dst_binding: binding,
-                    dst_array_element: 0,
-                    descriptor_count: 1,
-                    descriptor_type,
-                    p_image_info: &descriptors.last().unwrap().image,
-                    ..Default::default()
-                });
-            }
-        }
-    }
-
-    // TODO inline uniforms
-    unsafe {
-        device.khr_push_descriptor().cmd_push_descriptor_set(
-            command_buffer,
-            bind_point,
-            pipeline_layout,
-            set,
-            &descriptor_writes,
-        );
-    }
-}
-
-/// Binds push constants.
-fn do_cmd_push_constants(
-    device: &Device,
-    command_buffer: vk::CommandBuffer,
-    bind_point: vk::PipelineBindPoint,
-    pipeline_layout: vk::PipelineLayout,
-    data: &[MaybeUninit<u8>],
-) {
-    let size = mem::size_of_val(data);
-
-    // Minimum push constant size guaranteed by Vulkan is 128 bytes.
-    assert!(size <= 128, "push constant size must be <= 128 bytes");
-    assert!(size % 4 == 0, "push constant size must be a multiple of 4 bytes");
-
-    // None of the relevant drivers on desktop care about the actual stages,
-    // only if it's graphics, compute, or ray tracing.
-    let stages = match bind_point {
-        vk::PipelineBindPoint::GRAPHICS => {
-            vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT
-        }
-        vk::PipelineBindPoint::COMPUTE => vk::ShaderStageFlags::COMPUTE,
-        _ => panic!("unsupported bind point"),
-    };
-
-    // Use the raw function pointer because the wrapper takes a `&[u8]` slice which we can't
-    // get from `&[MaybeUninit<u8>]` safely (even if we won't read uninitialized data).
-    unsafe {
-        (device.deref().fp_v1_0().cmd_push_constants)(
-            command_buffer,
-            pipeline_layout,
-            stages,
-            0,
-            size as u32,
-            data as *const _ as *const c_void,
-        );
-    }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -199,8 +37,14 @@ fn do_cmd_push_constants(
 ///
 pub struct CommandStream {
     pub(crate) device: Device,
+    /// The queue on which we're submitting work.
+    ///
+    /// NOTE: for now, and most likely for the foreseeable future, we assume that
+    /// there's only one command stream, so we can assume that we have exclusive access to
+    /// the queue.
     queue: Arc<QueueShared>,
     command_pool: CommandPool,
+    submission_index: u64,
     /// Binary semaphores for which we've submitted a wait operation.
     semaphores: Vec<UnsignaledSemaphore>,
     /// Command buffers waiting to be submitted.
@@ -208,7 +52,7 @@ pub struct CommandStream {
     /// Current command buffer.
     command_buffer: Option<vk::CommandBuffer>,
 
-    // TODO: hold a strong ref to the resources here, drop them only once the command stream is flushed.
+    // Resources referenced in the current command buffer
     pub(crate) tracked_buffers: FxHashMap<BufferId, CommandBufferBufferState>,
     pub(crate) tracked_images: FxHashMap<ImageId, CommandBufferImageState>,
     pub(crate) tracked_image_views: FxHashMap<ImageViewId, ImageView>,
@@ -230,6 +74,15 @@ pub(crate) struct CommandBufferBufferState {
     pub handle: vk::Buffer,
     pub first_state: BufferAccess,
     pub last_state: BufferAccess,
+}
+
+/// Describes how a resource will be used during a render or compute pass.
+///
+/// For now this library deals only with whole resources.
+#[derive(Clone)]
+pub enum ResourceUse<'a> {
+    Image(&'a Image, ImageAccess),
+    Buffer(&'a BufferUntyped, BufferAccess),
 }
 
 /// A wrapper around a signaled binary semaphore.
@@ -297,10 +150,12 @@ pub struct SemaphoreWait {
 
 impl CommandStream {
     pub(super) fn new(device: Device, command_pool: CommandPool, queue: Arc<QueueShared>) -> CommandStream {
+        //let submission_index = device.inner.tracker.lock().
         CommandStream {
             device,
             queue,
             command_pool,
+            submission_index: 1,
             semaphores: vec![],
             command_buffers_to_submit: vec![],
             command_buffer: None,
@@ -312,6 +167,167 @@ impl CommandStream {
         }
     }
 
+    unsafe fn do_cmd_push_descriptor_set(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        pipeline_layout: vk::PipelineLayout,
+        set: u32,
+        bindings: &[(u32, Descriptor)],
+    ) {
+        let mut descriptors = Vec::with_capacity(bindings.len());
+        let mut descriptor_writes = Vec::with_capacity(bindings.len());
+
+        for (binding, descriptor) in bindings {
+            match *descriptor {
+                Descriptor::SampledImage { ref image_view, layout } => {
+                    self.reference_resource(image_view);
+                    descriptors.push(DescriptorBufferOrImage {
+                        image: vk::DescriptorImageInfo {
+                            sampler: Default::default(),
+                            image_view: image_view.handle(),
+                            image_layout: layout,
+                        },
+                    });
+                    descriptor_writes.push(vk::WriteDescriptorSet {
+                        dst_binding: *binding,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: vk::DescriptorType::SAMPLED_IMAGE,
+                        p_image_info: &descriptors.last().unwrap().image,
+                        ..Default::default()
+                    });
+                }
+                Descriptor::StorageImage { ref image_view, layout } => {
+                    self.reference_resource(image_view);
+                    descriptors.push(DescriptorBufferOrImage {
+                        image: vk::DescriptorImageInfo {
+                            sampler: Default::default(),
+                            image_view: image_view.handle(),
+                            image_layout: layout,
+                        },
+                    });
+                    descriptor_writes.push(vk::WriteDescriptorSet {
+                        dst_binding: *binding,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_IMAGE,
+                        p_image_info: &descriptors.last().unwrap().image,
+                        ..Default::default()
+                    });
+                }
+                Descriptor::UniformBuffer {
+                    ref buffer,
+                    offset,
+                    size,
+                } => {
+                    self.reference_resource(buffer);
+                    descriptors.push(DescriptorBufferOrImage {
+                        buffer: vk::DescriptorBufferInfo {
+                            buffer: buffer.handle(),
+                            offset,
+                            range: size,
+                        },
+                    });
+                    descriptor_writes.push(vk::WriteDescriptorSet {
+                        dst_binding: *binding,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: vk::DescriptorType::UNIFORM_BUFFER,
+                        p_buffer_info: &descriptors.last().unwrap().buffer,
+                        ..Default::default()
+                    });
+                }
+                Descriptor::StorageBuffer {
+                    ref buffer,
+                    offset,
+                    size,
+                } => {
+                    self.reference_resource(buffer);
+                    descriptors.push(DescriptorBufferOrImage {
+                        buffer: vk::DescriptorBufferInfo {
+                            buffer: buffer.handle(),
+                            offset,
+                            range: size,
+                        },
+                    });
+                    descriptor_writes.push(vk::WriteDescriptorSet {
+                        dst_binding: *binding,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: vk::DescriptorType::STORAGE_BUFFER,
+                        p_buffer_info: &descriptors.last().unwrap().buffer,
+                        ..Default::default()
+                    });
+                }
+                Descriptor::Sampler { ref sampler } => {
+                    descriptors.push(DescriptorBufferOrImage {
+                        image: vk::DescriptorImageInfo {
+                            sampler: sampler.handle(),
+                            image_view: Default::default(),
+                            image_layout: Default::default(),
+                        },
+                    });
+                    descriptor_writes.push(vk::WriteDescriptorSet {
+                        dst_binding: *binding,
+                        dst_array_element: 0,
+                        descriptor_count: 1,
+                        descriptor_type: vk::DescriptorType::SAMPLER,
+                        p_image_info: &descriptors.last().unwrap().image,
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+
+        unsafe {
+            self.device.khr_push_descriptor().cmd_push_descriptor_set(
+                command_buffer,
+                bind_point,
+                pipeline_layout,
+                set,
+                &descriptor_writes,
+            );
+        }
+    }
+
+    /// Binds push constants.
+    fn do_cmd_push_constants(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        pipeline_layout: vk::PipelineLayout,
+        data: &[MaybeUninit<u8>],
+    ) {
+        let size = mem::size_of_val(data);
+
+        // Minimum push constant size guaranteed by Vulkan is 128 bytes.
+        assert!(size <= 128, "push constant size must be <= 128 bytes");
+        assert!(size % 4 == 0, "push constant size must be a multiple of 4 bytes");
+
+        // None of the relevant drivers on desktop care about the actual stages,
+        // only if it's graphics, compute, or ray tracing.
+        let stages = match bind_point {
+            vk::PipelineBindPoint::GRAPHICS => {
+                vk::ShaderStageFlags::ALL_GRAPHICS | vk::ShaderStageFlags::MESH_EXT | vk::ShaderStageFlags::TASK_EXT
+            }
+            vk::PipelineBindPoint::COMPUTE => vk::ShaderStageFlags::COMPUTE,
+            _ => panic!("unsupported bind point"),
+        };
+
+        // Use the raw function pointer because the wrapper takes a `&[u8]` slice which we can't
+        // get from `&[MaybeUninit<u8>]` safely (even if we won't read uninitialized data).
+        unsafe {
+            (self.device.deref().fp_v1_0().cmd_push_constants)(
+                command_buffer,
+                pipeline_layout,
+                stages,
+                0,
+                size as u32,
+                data as *const _ as *const c_void,
+            );
+        }
+    }
     /// Returns the device associated with this queue.
     pub fn device(&self) -> &Device {
         &self.device
@@ -346,6 +362,10 @@ impl CommandStream {
         self.pop_debug_group();
     }
 
+    pub fn reference_resource<R: GpuResource>(&mut self, resource: &R) {
+        resource.set_last_submission_index(self.submission_index);
+    }
+
     /// Creates a new, or returns an existing, binary semaphore that is in the unsignaled state,
     /// or for which we've submitted a wait operation on this queue and that will eventually be unsignaled.
     pub fn get_or_create_semaphore(&mut self) -> UnsignaledSemaphore {
@@ -366,7 +386,8 @@ impl CommandStream {
         }
     }
 
-    pub(crate) fn use_image(&mut self, image: &Image, access: ImageAccess) {
+    pub fn use_image(&mut self, image: &Image, access: ImageAccess) {
+        self.reference_resource(image);
         let id = image.id();
         if let Some(entry) = self.tracked_images.get_mut(&id) {
             if entry.last_state != access || !access.all_ordered() {
@@ -392,7 +413,8 @@ impl CommandStream {
         }
     }
 
-    pub(crate) fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
+    pub fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
+        self.reference_resource(buffer);
         let id = buffer.id();
         if let Some(entry) = self.tracked_buffers.get_mut(&id) {
             if entry.last_state != access || !access.all_ordered() {
@@ -413,9 +435,9 @@ impl CommandStream {
         }
     }
 
-    pub(crate) fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
+    pub fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
+        self.reference_resource(image_view);
         self.use_image(image_view.image(), state);
-        self.tracked_image_views.insert(image_view.id(), image_view.clone());
     }
 
     pub(crate) fn create_command_buffer_raw(&mut self) -> vk::CommandBuffer {
@@ -432,6 +454,8 @@ impl CommandStream {
                     },
                 )
                 .unwrap();
+            self.device
+                .set_object_name(cb, &format!("command buffer at submission {}", self.submission_index));
         }
         cb
     }
@@ -508,28 +532,46 @@ impl CommandStream {
         swapchain: &Swapchain,
         timeout: Duration,
     ) -> Result<SwapchainImage, vk::Result> {
-        let image_available = self.get_or_create_semaphore();
+        // We can't use `get_or_create_semaphore` because according to the spec the semaphore
+        // passed to `vkAcquireNextImage` must not have any pending operations, whereas
+        // `get_or_create_semaphore` only guarantees that a wait operation has been submitted
+        // on the semaphore (not that the wait has completed).
+        let semaphore = {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo { ..Default::default() }, None)
+                .expect("vkCreateSemaphore failed")
+        };
         let (image_index, _suboptimal) = match self.device.khr_swapchain().acquire_next_image(
             swapchain.handle,
             timeout.as_nanos() as u64,
-            image_available.0,
+            semaphore,
             vk::Fence::null(),
         ) {
             Ok(result) => result,
             Err(err) => {
-                // recycle the semaphore before returning
-                self.semaphores.push(image_available);
+                // delete the semaphore before returning
+                unsafe {
+                    self.device.destroy_semaphore(semaphore, None);
+                }
                 return Err(err);
             }
         };
 
+        // Schedule deletion of the semaphore after the wait is over
+        let device_clone = self.device.clone();
+        self.device.call_later(self.submission_index, move || {
+            // SAFETY: the semaphore is not used after this point
+            unsafe {
+                device_clone.destroy_semaphore(semaphore, None);
+            }
+        });
+
         // Wait for the image to be available.
-        // TODO this could be fused with the next submission
         self.flush(
             &[SemaphoreWait {
                 kind: SemaphoreWaitKind::Binary {
-                    semaphore: image_available.0,
-                    transfer_ownership: true,
+                    semaphore,
+                    transfer_ownership: false,
                 },
                 // This is overly pessimistic, but we don't know what the user will do with the image at this point.
                 dst_stage: vk::PipelineStageFlags::ALL_COMMANDS,
@@ -537,7 +579,6 @@ impl CommandStream {
             &[],
         )?;
 
-        // FIXME we are doing nothing with the semaphore!
         // FIXME: why not register swapchain images once when creating the swap chain?
         let handle = swapchain.images[image_index as usize];
         let image =
@@ -557,46 +598,16 @@ impl CommandStream {
 
         // Signal a semaphore when rendering is finished
         let render_finished = self.get_or_create_semaphore().0;
+        unsafe {
+            self.device
+                .set_object_name(render_finished, "render finished semaphore");
+        }
         self.flush(
             &[],
             &[SemaphoreSignal::Binary {
                 semaphore: render_finished,
             }],
         )?;
-
-        /*// if necessary, insert an image layout transition command buffer
-        let transition_cbuf;
-        let mut tracker = self.device.inner.tracker.lock().unwrap();
-        if let Some(access) = tracker.images.get_mut(swapchain_image.image.id()) {
-            if *access != ImageAccess::PRESENT {
-                let barrier = make_image_barrier(
-                    swapchain_image.image.handle,
-                    swapchain_image.image.format,
-                    *access,
-                    ImageAccess::PRESENT,
-                );
-                transition_cbuf = self.create_command_buffer_raw();
-                self.device.cmd_pipeline_barrier2(
-                    transition_cbuf,
-                    &vk::DependencyInfo {
-                        dependency_flags: Default::default(),
-                        memory_barrier_count: 0,
-                        p_memory_barriers: ptr::null(),
-                        buffer_memory_barrier_count: 0,
-                        p_buffer_memory_barriers: ptr::null(),
-                        image_memory_barrier_count: 1,
-                        p_image_memory_barriers: &barrier,
-                        ..Default::default()
-                    },
-                );
-                self.device.end_command_buffer(transition_cbuf).unwrap();
-                submit_info.command_buffer_count = 1;
-                submit_info.p_command_buffers = &transition_cbuf;
-                *access = ImageAccess::PRESENT;
-            }
-        } else {
-            panic!("image not found in tracker");
-        }*/
 
         // present the swapchain image
         let present_info = vk::PresentInfoKHR {
@@ -630,36 +641,26 @@ impl CommandStream {
         // The complete list of command buffers to submit, including fixup command buffers between the ones passed to this function.
         let mut command_buffers = mem::take(&mut self.command_buffers_to_submit);
 
-        // Increment the global submission index and get the index of this submission
-        tracker.last_submission_index += 1;
-        let submission_index = tracker.last_submission_index;
-
         // Update the state of each resource used by the command buffer in the device tracker,
         // and insert pipeline barriers if necessary.
-        //
-        // At the same time, set the "last submission index" of each used resource to the index of this submission.
         let mut buffer_barriers = Vec::new();
         let mut image_barriers = Vec::new();
 
         for (_, state) in self.tracked_buffers.drain() {
-            state.buffer.set_last_submission_index(submission_index);
             let last_access = tracker
                 .buffers
                 .insert(state.buffer.id(), state.last_state)
                 .unwrap_or(BufferAccess::empty());
-
             if last_access != state.first_state || !state.first_state.all_ordered() {
                 buffer_barriers.push(make_buffer_barrier(state.handle, last_access, state.first_state));
             }
         }
 
         for (_, state) in self.tracked_images.drain() {
-            state.image.set_last_submission_index(submission_index);
             let last_access = tracker
                 .images
                 .insert(state.image.id(), state.last_state)
                 .unwrap_or(ImageAccess::UNINITIALIZED);
-
             if last_access != state.first_state || !state.first_state.all_ordered() {
                 image_barriers.push(make_image_barrier(
                     state.handle,
@@ -668,11 +669,6 @@ impl CommandStream {
                     state.first_state,
                 ));
             }
-        }
-
-        for (_, image_view) in self.tracked_image_views.drain() {
-            // Just set the submission index, there's a separate entry in `tracked_images` for the underlying image.
-            image_view.set_last_submission_index(submission_index);
         }
 
         // If we need a pipeline barrier before submitting the command buffers, we insert a "fixup" command buffer
@@ -725,7 +721,13 @@ impl CommandStream {
         let mut d3d12_fence_submit = false;
 
         signal_semaphores.push(self.queue.timeline);
-        signal_semaphore_values.push(submission_index);
+
+        // FIXME (!!!) if there are concurrent command streams, there is no guarantee that
+        // they will be submitted in the order they were created. This means that`submission_index`
+        // below is not necessarily increasing.
+        //
+        // TODO: probably disallow concurrent command streams entirely
+        signal_semaphore_values.push(self.submission_index);
 
         // setup semaphore signal operations
         for signal in signals.iter() {
@@ -828,10 +830,14 @@ impl CommandStream {
         );
 
         tracker.active_submissions.push_back(ActiveSubmission {
-            index: submission_index,
+            index: self.submission_index,
             queue: self.queue.index,
             command_pools: vec![retired_command_pool],
         });
+
+        // get the index of the next submission
+        // TODO: just store the submission locally and assume that there's only one CommandStream
+        self.submission_index = self.device.next_submission_index();
 
         result
     }

@@ -32,7 +32,7 @@ features = [
     "dxgi1_3",
     "dxgiformat",
     "dxgitype",
-    "wtypesbase" ]
+    "wtypesbase"]
 
 [dev-dependencies]
 winit = "0.29.4"

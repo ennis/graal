@@ -11,23 +11,25 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use ash::vk;
-use slotmap::{Key, SecondaryMap, SlotMap};
-use tracing::error;
-
 use crate::{
-    compile_shader,
-    device::resource::ResourceGroup,
+    compile_shader, get_vulkan_entry, get_vulkan_instance,
     instance::{vk_ext_debug_utils, vk_khr_surface},
-    is_write_access, platform_impl, ArgumentBuffer, ArgumentBufferDesc, Arguments, ArgumentsLayout, BufferAccess,
-    BufferInner, BufferRange, BufferRangeUntyped, BufferUsage, CommandPool, CommandStream, CompareOp, ComputePipeline,
-    ComputePipelineCreateInfo, Error, GraphicsPipeline, GraphicsPipelineCreateInfo, ImageAccess, ImageInner, ImageView,
-    ImageViewInfo, ImageViewInner, PreRasterizationShaders, Sampler, SamplerCreateInfo, ShaderCode, ShaderStage,
-    Size3D, Swapchain,
+    is_depth_and_stencil_format, is_write_access, platform_impl, BufferAccess, BufferInner, BufferUntyped, BufferUsage,
+    CommandPool, CommandStream, ComputePipeline, ComputePipelineCreateInfo, DescriptorSetLayout, Error,
+    GraphicsPipeline, GraphicsPipelineCreateInfo, Image, ImageAccess, ImageCreateInfo, ImageInner, ImageType,
+    ImageUsage, ImageView, ImageViewInfo, ImageViewInner, MemoryLocation, PreRasterizationShaders, Sampler,
+    SamplerCreateInfo, ShaderCode, ShaderStage, Size3D, Swapchain,
 };
 
-mod init;
-mod resource;
+use ash::vk;
+use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
+use slotmap::{SecondaryMap, SlotMap};
+use std::{
+    ffi::CStr,
+    mem,
+    sync::atomic::{AtomicU32, AtomicU64},
+};
+use tracing::{debug, error};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -40,6 +42,14 @@ pub struct Device {
 impl fmt::Debug for Device {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.debug_struct("Device").finish_non_exhaustive()
+    }
+}
+
+impl Deref for Device {
+    type Target = ash::Device;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner.device
     }
 }
 
@@ -68,19 +78,8 @@ pub(crate) struct ActiveSubmission {
     pub command_pools: Vec<CommandPool>,
 }
 
-impl ActiveSubmission {
-    pub(crate) fn new(index: u64, queue: u32, command_pools: Vec<CommandPool>) -> ActiveSubmission {
-        ActiveSubmission {
-            index,
-            queue,
-            command_pools,
-        }
-    }
-}
-
 pub(crate) struct DeviceTracker {
     pub active_submissions: VecDeque<ActiveSubmission>,
-    pub last_submission_index: u64,
     pub buffers: SecondaryMap<BufferId, BufferAccess>,
     pub images: SecondaryMap<ImageId, ImageAccess>,
 }
@@ -89,7 +88,6 @@ impl DeviceTracker {
     fn new() -> DeviceTracker {
         DeviceTracker {
             active_submissions: VecDeque::new(),
-            last_submission_index: 0,
             buffers: SecondaryMap::new(),
             images: SecondaryMap::new(),
             //retired_command_pools: Vec::new(),
@@ -98,8 +96,23 @@ impl DeviceTracker {
     }
 }
 
+/// Dummy trait for `Device::delete_later`
 trait DeleteLater {}
 impl<T> DeleteLater for T {}
+
+/// Helper struct for deleting vulkan objects.
+///
+/// TODO doc
+pub struct Defer<F: FnMut()>(F);
+
+impl<F> Drop for Defer<F>
+where
+    F: FnMut(),
+{
+    fn drop(&mut self) {
+        self.0()
+    }
+}
 
 // FIXME: Mutexes are useless here since this is wrapped in Rc and can't be sent across threads.
 // Just use RefCells
@@ -117,7 +130,7 @@ pub(crate) struct DeviceInner {
     vk_khr_push_descriptor: ash::extensions::khr::PushDescriptor,
     vk_ext_mesh_shader: ash::extensions::ext::MeshShader,
     vk_ext_extended_dynamic_state3: ash::extensions::ext::ExtendedDynamicState3,
-    vk_ext_descriptor_buffer: ash::extensions::ext::DescriptorBuffer,
+    //vk_ext_descriptor_buffer: ash::extensions::ext::DescriptorBuffer,
 
     // physical device properties
     physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
@@ -132,118 +145,15 @@ pub(crate) struct DeviceInner {
     // Command pools per queue and thread.
     free_command_pools: Mutex<Vec<CommandPool>>,
 
+    next_submission_index: AtomicU64,
     /// Resources that have a zero user reference count and that should be ready for deletion soon,
     /// but we're waiting for the GPU to finish using them.
     dropped_resources: Mutex<Vec<(u64, Box<dyn DeleteLater>)>>,
     pub(crate) tracker: Mutex<DeviceTracker>,
 
-    deletion_lists: Mutex<Vec<DeferredDeletionList>>,
     sampler_cache: Mutex<HashMap<SamplerCreateInfo, Sampler>>,
     compiler: shaderc::Compiler,
-
-    /// VkDescriptorSetLayouts for universal argument buffers.
-    pub(crate) argbuf_layouts: ArgumentBufferLayouts,
 }
-
-pub const STATIC_UNIFORM_BUFFERS_COUNT: u32 = 16;
-pub const STATIC_STORAGE_BUFFERS_COUNT: u32 = 32;
-pub const STATIC_SAMPLED_IMAGES_COUNT: u32 = 32;
-pub const STATIC_STORAGE_IMAGES_COUNT: u32 = 32;
-pub const STATIC_SAMPLERS_COUNT: u32 = 32;
-pub const MAX_INDEXED_STORAGE_BUFFERS_COUNT: u32 = 4096;
-pub const MAX_INDEXED_SAMPLED_IMAGES_COUNT: u32 = 4096;
-pub const MAX_INDEXED_STORAGE_IMAGES_COUNT: u32 = 4096;
-
-pub const UNIFORM_BUFFERS_SET: u32 = 0;
-pub const STORAGE_BUFFERS_SET: u32 = 1;
-pub const SAMPLED_IMAGES_SET: u32 = 2;
-pub const STORAGE_IMAGES_SET: u32 = 3;
-pub const SAMPLERS_SET: u32 = 4;
-
-pub(crate) struct ArgumentBufferLayouts {
-    pub(crate) ubo: vk::DescriptorSetLayout,
-    pub(crate) ssbo: vk::DescriptorSetLayout,
-    pub(crate) texture: vk::DescriptorSetLayout,
-    pub(crate) image: vk::DescriptorSetLayout,
-    pub(crate) sampler: vk::DescriptorSetLayout,
-}
-
-unsafe fn create_argbuf_layouts(device: &ash::Device) -> ArgumentBufferLayouts {
-    let sets = [
-        (vk::DescriptorType::UNIFORM_BUFFER, STATIC_UNIFORM_BUFFERS_COUNT, None),
-        (
-            vk::DescriptorType::STORAGE_BUFFER,
-            STATIC_STORAGE_BUFFERS_COUNT,
-            Some(MAX_INDEXED_STORAGE_BUFFERS_COUNT),
-        ),
-        (
-            vk::DescriptorType::SAMPLED_IMAGE,
-            STATIC_SAMPLED_IMAGES_COUNT,
-            Some(MAX_INDEXED_SAMPLED_IMAGES_COUNT),
-        ),
-        (
-            vk::DescriptorType::STORAGE_IMAGE,
-            STATIC_STORAGE_IMAGES_COUNT,
-            Some(MAX_INDEXED_STORAGE_IMAGES_COUNT),
-        ),
-        (vk::DescriptorType::SAMPLER, STATIC_SAMPLERS_COUNT, None),
-    ];
-
-    let mut layouts = vec![];
-
-    for (descriptor_type, binding_count, max_indexed_count) in sets {
-        let mut bindings = vec![];
-        let mut flags = vec![];
-
-        bindings.extend((0..binding_count).map(|i| vk::DescriptorSetLayoutBinding {
-            binding: i,
-            descriptor_type,
-            descriptor_count: 1,
-            stage_flags: vk::ShaderStageFlags::ALL,
-            p_immutable_samplers: ptr::null(),
-        }));
-        flags.extend((0..binding_count).map(|_| vk::DescriptorBindingFlags::empty()));
-
-        if let Some(max_indexed_count) = max_indexed_count {
-            bindings.push(vk::DescriptorSetLayoutBinding {
-                binding: bindings.len() as u32,
-                descriptor_type,
-                descriptor_count: max_indexed_count,
-                stage_flags: vk::ShaderStageFlags::ALL,
-                p_immutable_samplers: ptr::null(),
-            });
-            flags.push(vk::DescriptorBindingFlags::VARIABLE_DESCRIPTOR_COUNT);
-        }
-
-        let dslbfci = vk::DescriptorSetLayoutBindingFlagsCreateInfo {
-            binding_count: flags.len() as u32,
-            p_binding_flags: flags.as_ptr(),
-            ..Default::default()
-        };
-
-        let mut dslci = vk::DescriptorSetLayoutCreateInfo {
-            p_next: &dslbfci as *const _ as *const c_void,
-            flags: Default::default(),
-            binding_count: bindings.len() as u32,
-            p_bindings: bindings.as_ptr(),
-            ..Default::default()
-        };
-
-        let layout = device
-            .create_descriptor_set_layout(&dslci, None)
-            .expect("failed to create descriptor set layout");
-        layouts.push(layout);
-    }
-
-    ArgumentBufferLayouts {
-        ubo: layouts[0],
-        ssbo: layouts[1],
-        texture: layouts[2],
-        image: layouts[3],
-        sampler: layouts[4],
-    }
-}
-
 /// Errors during device creation.
 #[derive(thiserror::Error, Debug)]
 pub enum DeviceCreateError {
@@ -257,11 +167,39 @@ pub struct QueueFamilyConfig {
     pub count: u32,
 }
 
-impl Deref for Device {
-    type Target = ash::Device;
+pub(crate) struct QueueShared {
+    /// Family index.
+    pub family: u32,
+    /// Index within queues of the same family (see vkGetDeviceQueue).
+    pub index_in_family: u32,
+    pub index: u32,
+    pub queue: vk::Queue,
+    pub timeline: vk::Semaphore,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner.device
+pub(crate) struct ResourceGroup {
+    // The timeline values that a pass needs to wait for to ensure an execution dependency between the pass
+    // and all writers of the resources in the group.
+    //pub(crate) wait: TimelineValues,
+    // ignored if waiting on multiple queues
+    pub(crate) src_stage_mask: vk::PipelineStageFlags2,
+    pub(crate) dst_stage_mask: vk::PipelineStageFlags2,
+    // ignored if waiting on multiple queues
+    pub(crate) src_access_mask: vk::AccessFlags2,
+    pub(crate) dst_access_mask: vk::AccessFlags2,
+}
+
+pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
+    match count {
+        0 => vk::SampleCountFlags::TYPE_1,
+        1 => vk::SampleCountFlags::TYPE_1,
+        2 => vk::SampleCountFlags::TYPE_2,
+        4 => vk::SampleCountFlags::TYPE_4,
+        8 => vk::SampleCountFlags::TYPE_8,
+        16 => vk::SampleCountFlags::TYPE_16,
+        32 => vk::SampleCountFlags::TYPE_32,
+        64 => vk::SampleCountFlags::TYPE_64,
+        _ => panic!("unsupported number of samples"),
     }
 }
 
@@ -277,24 +215,6 @@ slotmap::new_key_type! {
 
     /// Identifies a resource group.
     pub struct GroupId;
-}
-
-// TODO: move this to a separate module?
-#[derive(Debug)]
-pub struct ResourceRegistrationInfo<'a> {
-    pub name: &'a str,
-}
-
-#[derive(Debug)]
-pub struct ImageRegistrationInfo<'a> {
-    pub resource: ResourceRegistrationInfo<'a>,
-    pub handle: vk::Image,
-    pub format: vk::Format,
-}
-
-#[derive(Debug)]
-pub struct BufferRegistrationInfo<'a> {
-    pub resource: ResourceRegistrationInfo<'a>,
 }
 
 /// Describes how a resource got its memory.
@@ -314,49 +234,6 @@ pub enum ResourceAllocation {
 impl ResourceAllocation {
     fn is_external(&self) -> bool {
         matches!(self, ResourceAllocation::External)
-    }
-}
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-#[derive(Debug)]
-enum DeferredDeletionObject {
-    Sampler(vk::Sampler),
-    DescriptorSetLayout(vk::DescriptorSetLayout),
-    PipelineLayout(vk::PipelineLayout),
-    Pipeline(vk::Pipeline),
-    Semaphore(vk::Semaphore),
-    Shader(vk::ShaderEXT),
-}
-
-impl From<vk::Sampler> for DeferredDeletionObject {
-    fn from(sampler: vk::Sampler) -> Self {
-        DeferredDeletionObject::Sampler(sampler)
-    }
-}
-impl From<vk::PipelineLayout> for DeferredDeletionObject {
-    fn from(layout: vk::PipelineLayout) -> Self {
-        DeferredDeletionObject::PipelineLayout(layout)
-    }
-}
-impl From<vk::Pipeline> for DeferredDeletionObject {
-    fn from(pipeline: vk::Pipeline) -> Self {
-        DeferredDeletionObject::Pipeline(pipeline)
-    }
-}
-impl From<vk::Semaphore> for DeferredDeletionObject {
-    fn from(semaphore: vk::Semaphore) -> Self {
-        DeferredDeletionObject::Semaphore(semaphore)
-    }
-}
-impl From<vk::DescriptorSetLayout> for DeferredDeletionObject {
-    fn from(layout: vk::DescriptorSetLayout) -> Self {
-        DeferredDeletionObject::DescriptorSetLayout(layout)
-    }
-}
-impl From<vk::ShaderEXT> for DeferredDeletionObject {
-    fn from(shader: vk::ShaderEXT) -> Self {
-        DeferredDeletionObject::Shader(shader)
     }
 }
 
@@ -384,29 +261,462 @@ pub unsafe fn create_device_and_command_stream(
     Ok((device, command_stream))
 }
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
-struct DeferredDeletionList {
-    // Timestamp that we should wait for on each queue before deleting the objects.
-    timestamps: Vec<u64>,
-    // Objects to delete.
-    objects: Vec<DeferredDeletionObject>,
-}
-
-pub(crate) struct QueueShared {
-    /// Family index.
-    pub family: u32,
-    /// Index within queues of the same family (see vkGetDeviceQueue).
-    pub index_in_family: u32,
-    pub index: u32,
-    pub queue: vk::Queue,
-    pub timeline: vk::Semaphore,
-    pub next_submission_timestamp: Cell<u64>,
-    pub free_command_pools: Mutex<Vec<CommandPool>>,
-}
-
 type ResourceGroupMap = SlotMap<GroupId, ResourceGroup>;
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+struct PhysicalDeviceAndProperties {
+    physical_device: vk::PhysicalDevice,
+    properties: vk::PhysicalDeviceProperties,
+    //features: vk::PhysicalDeviceFeatures,
+}
+
+/// Chooses a present mode among a list of supported modes.
+pub(super) fn get_preferred_present_mode(available_present_modes: &[vk::PresentModeKHR]) -> vk::PresentModeKHR {
+    if available_present_modes.contains(&vk::PresentModeKHR::MAILBOX) {
+        vk::PresentModeKHR::MAILBOX
+    } else if available_present_modes.contains(&vk::PresentModeKHR::IMMEDIATE) {
+        vk::PresentModeKHR::IMMEDIATE
+    } else {
+        vk::PresentModeKHR::FIFO
+    }
+}
+
+/// Computes the preferred swap extent.
+pub(super) fn get_preferred_swap_extent(
+    framebuffer_size: (u32, u32),
+    capabilities: &vk::SurfaceCapabilitiesKHR,
+) -> vk::Extent2D {
+    if capabilities.current_extent.width != u32::MAX {
+        capabilities.current_extent
+    } else {
+        vk::Extent2D {
+            width: framebuffer_size
+                .0
+                .clamp(capabilities.min_image_extent.width, capabilities.max_image_extent.width),
+            height: framebuffer_size.1.clamp(
+                capabilities.min_image_extent.height,
+                capabilities.max_image_extent.height,
+            ),
+        }
+    }
+}
+
+unsafe fn select_physical_device(instance: &ash::Instance) -> PhysicalDeviceAndProperties {
+    let physical_devices = instance
+        .enumerate_physical_devices()
+        .expect("failed to enumerate physical devices");
+    if physical_devices.is_empty() {
+        panic!("no device with vulkan support");
+    }
+
+    let mut selected_phy = None;
+    let mut selected_phy_properties = Default::default();
+    //let mut selected_phy_features = Default::default();
+    for phy in physical_devices {
+        let props = instance.get_physical_device_properties(phy);
+        let _features = instance.get_physical_device_features(phy);
+        if props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU {
+            selected_phy = Some(phy);
+            selected_phy_properties = props;
+            //selected_phy_features = features;
+        }
+    }
+    // TODO fallbacks
+
+    PhysicalDeviceAndProperties {
+        physical_device: selected_phy.expect("no suitable physical device"),
+        properties: selected_phy_properties,
+        //features: selected_phy_features,
+    }
+}
+
+unsafe fn find_queue_family(
+    phy: vk::PhysicalDevice,
+    vk_khr_surface: &ash::extensions::khr::Surface,
+    queue_families: &[vk::QueueFamilyProperties],
+    flags: vk::QueueFlags,
+    present_surface: Option<vk::SurfaceKHR>,
+) -> u32 {
+    let mut best_queue_family: Option<u32> = None;
+    let mut best_flags = 0u32;
+    let mut index = 0u32;
+    for queue_family in queue_families {
+        if queue_family.queue_flags.contains(flags) {
+            // matches the intended usage
+            // if present_surface != nullptr, check that it also supports presentation
+            // to the given surface
+            if let Some(surface) = present_surface {
+                if !vk_khr_surface
+                    .get_physical_device_surface_support(phy, index, surface)
+                    .unwrap()
+                {
+                    // does not support presentation, skip it
+                    continue;
+                }
+            }
+
+            if let Some(ref mut i) = best_queue_family {
+                // there was already a queue for the specified usage,
+                // change it only if it is more specialized.
+                // to determine if it is more specialized, count number of bits (XXX sketchy?)
+                if queue_family.queue_flags.as_raw().count_ones() < best_flags.count_ones() {
+                    *i = index;
+                    best_flags = queue_family.queue_flags.as_raw();
+                }
+            } else {
+                best_queue_family = Some(index);
+                best_flags = queue_family.queue_flags.as_raw();
+            }
+        }
+        index += 1;
+    }
+
+    best_queue_family.expect("could not find a compatible queue")
+}
+
+const DEVICE_EXTENSIONS: &[&str] = &[
+    "VK_KHR_swapchain",
+    //"VK_KHR_dynamic_rendering",   // promoted to core in 1.3
+    "VK_KHR_push_descriptor",
+    "VK_EXT_extended_dynamic_state3",
+    "VK_EXT_line_rasterization",
+    "VK_EXT_mesh_shader",
+    "VK_EXT_conservative_rasterization",
+    "VK_EXT_fragment_shader_interlock", //"VK_EXT_descriptor_buffer",
+];
+
+impl Device {
+    fn find_compatible_memory_type_internal(
+        &self,
+        memory_type_bits: u32,
+        memory_properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        for i in 0..self.inner.physical_device_memory_properties.memory_type_count {
+            if memory_type_bits & (1 << i) != 0
+                && self.inner.physical_device_memory_properties.memory_types[i as usize]
+                    .property_flags
+                    .contains(memory_properties)
+            {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    /// Returns the index of the first memory type compatible with the specified memory type bitmask and additional memory property flags.
+    pub(crate) fn find_compatible_memory_type(
+        &self,
+        memory_type_bits: u32,
+        required_memory_properties: vk::MemoryPropertyFlags,
+        preferred_memory_properties: vk::MemoryPropertyFlags,
+    ) -> Option<u32> {
+        // first, try required+preferred, otherwise fallback on just required
+        self.find_compatible_memory_type_internal(
+            memory_type_bits,
+            required_memory_properties | preferred_memory_properties,
+        )
+        .or_else(|| self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties))
+    }
+
+    /*/// Returns whether this device is compatible for presentation on the specified surface.
+    ///
+    /// More precisely, it checks that the graphics queue created for this device can present to the given surface.
+    pub unsafe fn is_compatible_for_presentation(&self, surface: vk::SurfaceKHR) -> bool {
+        vk_khr_surface()
+            .get_physical_device_surface_support(self.inner.physical_device, self.graphics_queue().1, surface)
+            .unwrap()
+    }*/
+
+    // TODO: enabled features?
+    pub unsafe fn from_existing(
+        physical_device: vk::PhysicalDevice,
+        device: vk::Device,
+        queue_config: &[QueueFamilyConfig],
+    ) -> Result<Device, DeviceCreateError> {
+        let entry = get_vulkan_entry();
+        let instance = get_vulkan_instance();
+        let device = ash::Device::load(instance.fp_v1_0(), device);
+
+        let mut queues = vec![];
+
+        // fetch queues and create the timeline semaphore for all of them
+        for cfg in queue_config.iter() {
+            for i in 0..cfg.count {
+                let queue = device.get_device_queue(cfg.family_index, i);
+
+                // create timeline semaphore
+                let timeline_create_info = vk::SemaphoreTypeCreateInfo {
+                    semaphore_type: vk::SemaphoreType::TIMELINE,
+                    initial_value: 0,
+                    ..Default::default()
+                };
+                let semaphore_create_info = vk::SemaphoreCreateInfo {
+                    p_next: &timeline_create_info as *const _ as *const c_void,
+                    ..Default::default()
+                };
+                let timeline = device
+                    .create_semaphore(&semaphore_create_info, None)
+                    .expect("failed to queue timeline semaphore");
+
+                let global_index = queues.len() as u32;
+                queues.push(Arc::new(QueueShared {
+                    family: cfg.family_index,
+                    index_in_family: i,
+                    index: global_index,
+                    queue,
+                    timeline,
+                }));
+            }
+        }
+
+        // Create the GPU memory allocator
+        let allocator_create_desc = gpu_allocator::vulkan::AllocatorCreateDesc {
+            physical_device,
+            debug_settings: Default::default(),
+            device: device.clone(),     // not cheap!
+            instance: instance.clone(), // not cheap!
+            buffer_device_address: true,
+            allocation_sizes: Default::default(),
+        };
+
+        let allocator =
+            gpu_allocator::vulkan::Allocator::new(&allocator_create_desc).expect("failed to create GPU allocator");
+
+        // Extensions
+        let vk_khr_swapchain = ash::extensions::khr::Swapchain::new(instance, &device);
+        let vk_ext_shader_object = ash::extensions::ext::ShaderObject::new(instance, &device);
+        let vk_khr_push_descriptor = ash::extensions::khr::PushDescriptor::new(instance, &device);
+        let vk_ext_extended_dynamic_state3 = ash::extensions::ext::ExtendedDynamicState3::new(instance, &device);
+        let vk_ext_mesh_shader = ash::extensions::ext::MeshShader::new(instance, &device);
+        //let vk_ext_descriptor_buffer = ash::extensions::ext::DescriptorBuffer::new(instance, &device);
+        let physical_device_memory_properties = instance.get_physical_device_memory_properties(physical_device);
+        let platform_extensions = platform_impl::PlatformExtensions::load(entry, instance, &device);
+
+        let mut physical_device_descriptor_buffer_properties =
+            vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
+        let mut physical_device_properties = vk::PhysicalDeviceProperties2 {
+            p_next: &mut physical_device_descriptor_buffer_properties as *mut _ as *mut c_void,
+            ..Default::default()
+        };
+
+        instance.get_physical_device_properties2(physical_device, &mut physical_device_properties);
+
+        // Create the shader compiler instance
+        let compiler = shaderc::Compiler::new().expect("failed to create the shader compiler");
+
+        Ok(Device {
+            inner: Rc::new(DeviceInner {
+                device,
+                platform_extensions,
+                physical_device,
+                physical_device_properties,
+                physical_device_descriptor_buffer_properties,
+                physical_device_memory_properties,
+                queues,
+                allocator: Mutex::new(allocator),
+                vk_khr_swapchain,
+                vk_ext_shader_object,
+                vk_khr_push_descriptor,
+                vk_ext_mesh_shader,
+                vk_ext_extended_dynamic_state3,
+                //vk_ext_descriptor_buffer,
+                image_ids: Mutex::new(Default::default()),
+                buffer_ids: Mutex::new(Default::default()),
+                tracker: Mutex::new(DeviceTracker::new()),
+                sampler_cache: Mutex::new(Default::default()),
+                compiler,
+                groups: Mutex::new(Default::default()),
+                free_command_pools: Mutex::new(Default::default()),
+                image_view_ids: Mutex::new(Default::default()),
+                dropped_resources: Mutex::new(vec![]),
+                next_submission_index: AtomicU64::new(1),
+            }),
+        })
+    }
+
+    /// Creates a new `Device` that can render to the specified `present_surface` if one is specified.
+    ///
+    /// Also creates queues as requested.
+    pub unsafe fn new(present_surface: Option<vk::SurfaceKHR>) -> Result<Device, DeviceCreateError> {
+        let instance = get_vulkan_instance();
+        let vk_khr_surface = vk_khr_surface();
+
+        let phy = select_physical_device(instance);
+        let queue_family_properties = instance.get_physical_device_queue_family_properties(phy.physical_device);
+        let graphics_queue_family = find_queue_family(
+            phy.physical_device,
+            &vk_khr_surface,
+            &queue_family_properties,
+            vk::QueueFlags::GRAPHICS,
+            present_surface,
+        );
+
+        debug!(
+            "Selected physical device: {:?}",
+            CStr::from_ptr(phy.properties.device_name.as_ptr())
+        );
+
+        // ------ Setup device create info ------
+        let queue_priorities = [1.0f32];
+        let device_queue_create_infos = &[vk::DeviceQueueCreateInfo {
+            flags: Default::default(),
+            queue_family_index: graphics_queue_family,
+            queue_count: 1,
+            p_queue_priorities: queue_priorities.as_ptr(),
+            ..Default::default()
+        }];
+
+        let mut fragment_shader_interlock_features = vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT {
+            //p_next: &mut timeline_features as *mut _ as *mut c_void,
+            fragment_shader_pixel_interlock: vk::TRUE,
+            ..Default::default()
+        };
+
+        /*let mut descriptor_buffer_features = vk::PhysicalDeviceDescriptorBufferFeaturesEXT {
+            p_next: &mut fragment_shader_interlock_features as *mut _ as *mut c_void,
+            descriptor_buffer: vk::TRUE,
+            ..Default::default()
+        };*/
+
+        let mut mesh_shader_features = vk::PhysicalDeviceMeshShaderFeaturesEXT {
+            p_next: &mut fragment_shader_interlock_features as *mut _ as *mut c_void,
+            task_shader: vk::TRUE,
+            mesh_shader: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut ext_dynamic_state = vk::PhysicalDeviceExtendedDynamicState3FeaturesEXT {
+            p_next: &mut mesh_shader_features as *mut _ as *mut c_void,
+            extended_dynamic_state3_tessellation_domain_origin: vk::TRUE,
+            extended_dynamic_state3_depth_clamp_enable: vk::TRUE,
+            extended_dynamic_state3_polygon_mode: vk::TRUE,
+            extended_dynamic_state3_rasterization_samples: vk::TRUE,
+            extended_dynamic_state3_sample_mask: vk::TRUE,
+            extended_dynamic_state3_alpha_to_coverage_enable: vk::TRUE,
+            extended_dynamic_state3_alpha_to_one_enable: vk::TRUE,
+            extended_dynamic_state3_logic_op_enable: vk::TRUE,
+            extended_dynamic_state3_color_blend_enable: vk::TRUE,
+            extended_dynamic_state3_color_blend_equation: vk::TRUE,
+            extended_dynamic_state3_color_write_mask: vk::TRUE,
+            extended_dynamic_state3_rasterization_stream: vk::TRUE,
+            extended_dynamic_state3_conservative_rasterization_mode: vk::TRUE,
+            extended_dynamic_state3_extra_primitive_overestimation_size: vk::TRUE,
+            extended_dynamic_state3_depth_clip_enable: vk::TRUE,
+            extended_dynamic_state3_sample_locations_enable: vk::TRUE,
+            extended_dynamic_state3_color_blend_advanced: vk::TRUE,
+            extended_dynamic_state3_provoking_vertex_mode: vk::TRUE,
+            extended_dynamic_state3_line_rasterization_mode: vk::TRUE,
+            extended_dynamic_state3_line_stipple_enable: vk::TRUE,
+            extended_dynamic_state3_depth_clip_negative_one_to_one: vk::TRUE,
+            extended_dynamic_state3_viewport_w_scaling_enable: vk::TRUE,
+            extended_dynamic_state3_viewport_swizzle: vk::TRUE,
+            extended_dynamic_state3_coverage_to_color_enable: vk::TRUE,
+            extended_dynamic_state3_coverage_to_color_location: vk::TRUE,
+            extended_dynamic_state3_coverage_modulation_mode: vk::TRUE,
+            extended_dynamic_state3_coverage_modulation_table_enable: vk::TRUE,
+            extended_dynamic_state3_coverage_modulation_table: vk::TRUE,
+            extended_dynamic_state3_coverage_reduction_mode: vk::TRUE,
+            extended_dynamic_state3_representative_fragment_test_enable: vk::TRUE,
+            extended_dynamic_state3_shading_rate_image_enable: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut line_rasterization_features = vk::PhysicalDeviceLineRasterizationFeaturesEXT {
+            p_next: &mut ext_dynamic_state as *mut _ as *mut c_void,
+            bresenham_lines: vk::TRUE,
+            smooth_lines: vk::TRUE,
+            rectangular_lines: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut vk13_features = vk::PhysicalDeviceVulkan13Features {
+            p_next: &mut line_rasterization_features as *mut _ as *mut c_void,
+            synchronization2: vk::TRUE,
+            dynamic_rendering: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut vk12_features = vk::PhysicalDeviceVulkan12Features {
+            p_next: &mut vk13_features as *mut _ as *mut c_void,
+            descriptor_indexing: vk::TRUE,
+            descriptor_binding_variable_descriptor_count: vk::TRUE,
+            descriptor_binding_partially_bound: vk::TRUE,
+            shader_uniform_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
+            shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
+            shader_storage_image_array_non_uniform_indexing: vk::TRUE,
+            runtime_descriptor_array: vk::TRUE,
+            buffer_device_address: vk::TRUE,
+            buffer_device_address_capture_replay: vk::TRUE,
+            timeline_semaphore: vk::TRUE,
+            storage_buffer8_bit_access: vk::TRUE,
+            shader_int8: vk::TRUE,
+            scalar_block_layout: vk::TRUE,
+            ..Default::default()
+        };
+
+        let mut features2 = vk::PhysicalDeviceFeatures2 {
+            p_next: &mut vk12_features as *mut _ as *mut c_void,
+            features: vk::PhysicalDeviceFeatures {
+                tessellation_shader: vk::TRUE,
+                fill_mode_non_solid: vk::TRUE,
+                sampler_anisotropy: vk::TRUE,
+                shader_int16: vk::TRUE,
+                shader_int64: vk::TRUE,
+                shader_storage_image_extended_formats: vk::TRUE,
+                fragment_stores_and_atomics: vk::TRUE,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Convert extension strings into C-strings
+        let c_device_extensions: Vec<_> = DEVICE_EXTENSIONS
+            .iter()
+            .chain(platform_impl::PlatformExtensions::names().iter())
+            .map(|&s| CString::new(s).unwrap())
+            .collect();
+
+        let device_extensions: Vec<_> = c_device_extensions.iter().map(|s| s.as_ptr()).collect();
+
+        let device_create_info = vk::DeviceCreateInfo {
+            p_next: &mut features2 as *mut _ as *mut c_void,
+            flags: Default::default(),
+            queue_create_info_count: device_queue_create_infos.len() as u32,
+            p_queue_create_infos: device_queue_create_infos.as_ptr(),
+            enabled_extension_count: device_extensions.len() as u32,
+            pp_enabled_extension_names: device_extensions.as_ptr(),
+            p_enabled_features: ptr::null(),
+            ..Default::default()
+        };
+
+        // ------ Create device ------
+        let device: ash::Device = instance
+            .create_device(phy.physical_device, &device_create_info, None)
+            .expect("could not create vulkan device");
+
+        let queue_config = [QueueFamilyConfig {
+            family_index: graphics_queue_family,
+            count: 1,
+        }];
+
+        Self::from_existing(phy.physical_device, device.handle(), &queue_config)
+    }
+
+    /// Returns the physical device that this device was created on.
+    pub fn physical_device(&self) -> vk::PhysicalDevice {
+        self.inner.physical_device
+    }
+
+    /// Returns the physical device properties.
+    pub fn physical_device_properties(&self) -> &vk::PhysicalDeviceProperties2 {
+        &self.inner.physical_device_properties
+    }
+
+    pub fn create_command_stream(&self, queue_index: usize) -> CommandStream {
+        let command_pool = self.get_or_create_command_pool(self.inner.queues[queue_index].family);
+        CommandStream::new(self.clone(), command_pool, self.inner.queues[queue_index].clone())
+    }
+}
 
 impl Device {
     pub fn weak(&self) -> WeakDevice {
@@ -437,37 +747,425 @@ impl Device {
         &self.inner.vk_ext_mesh_shader
     }
 
-    pub fn ext_descriptor_buffer(&self) -> &ash::extensions::ext::DescriptorBuffer {
+    /*pub fn ext_descriptor_buffer(&self) -> &ash::extensions::ext::DescriptorBuffer {
         &self.inner.vk_ext_descriptor_buffer
+    }*/
+
+    /// Helper function to associate a debug name to a vulkan object.
+    ///
+    /// # Arguments
+    /// * `handle` - the handle to the object
+    /// * `name` - the name to associate with the object
+    ///
+    /// # Safety
+    /// The handle must be a valid vulkan object handle.
+    pub unsafe fn set_object_name<H: vk::Handle>(&self, handle: H, name: &str) {
+        let object_name = CString::new(name).unwrap();
+        vk_ext_debug_utils()
+            .set_debug_utils_object_name(
+                self.inner.device.handle(),
+                &vk::DebugUtilsObjectNameInfoEXT {
+                    object_type: H::TYPE,
+                    object_handle: handle.as_raw(),
+                    p_object_name: object_name.as_ptr(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
     }
 
-    /// Helper function to associate a debug name to a vulkan handle.
-    pub(crate) fn set_debug_object_name(
-        &self,
-        object_type: vk::ObjectType,
-        object_handle: u64,
-        name: &str,
-        serial: Option<u64>,
-    ) {
-        unsafe {
-            let name = if let Some(serial) = serial {
-                format!("{}@{}", name, serial)
-            } else {
-                name.to_string()
-            };
-            let object_name = CString::new(name.as_str()).unwrap();
+    pub(crate) fn next_submission_index(&self) -> u64 {
+        self.inner
+            .next_submission_index
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
 
-            vk_ext_debug_utils()
-                .set_debug_utils_object_name(
-                    self.inner.device.handle(),
-                    &vk::DebugUtilsObjectNameInfoEXT {
-                        object_type,
-                        object_handle,
-                        p_object_name: object_name.as_ptr(),
-                        ..Default::default()
-                    },
-                )
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // BUFFERS
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// Creates a new buffer resource.
+    pub fn create_buffer(&self, usage: BufferUsage, memory_location: MemoryLocation, byte_size: u64) -> BufferUntyped {
+        assert!(byte_size > 0, "buffer size must be greater than zero");
+
+        // create the buffer object first
+        let create_info = vk::BufferCreateInfo {
+            flags: Default::default(),
+            size: byte_size,
+            usage: usage.to_vk_buffer_usage_flags() | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: ptr::null(),
+            ..Default::default()
+        };
+        let handle = unsafe {
+            self.inner
+                .device
+                .create_buffer(&create_info, None)
+                .expect("failed to create buffer")
+        };
+
+        // get its memory requirements
+        let mem_req = unsafe { self.inner.device.get_buffer_memory_requirements(handle) };
+
+        let allocation_create_desc = AllocationCreateDesc {
+            name: "",
+            requirements: mem_req,
+            location: memory_location,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        };
+        let allocation = self
+            .inner
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&allocation_create_desc)
+            .expect("failed to allocate device memory");
+        unsafe {
+            self.inner
+                .device
+                .bind_buffer_memory(handle, allocation.memory(), allocation.offset())
                 .unwrap();
+        }
+        let mapped_ptr = allocation.mapped_ptr();
+        let allocation = ResourceAllocation::Allocation { allocation };
+
+        let device_address = unsafe {
+            self.get_buffer_device_address(&vk::BufferDeviceAddressInfo {
+                buffer: handle,
+                ..Default::default()
+            })
+        };
+
+        let id = self.inner.buffer_ids.lock().unwrap().insert(());
+        BufferUntyped {
+            inner: Some(Arc::new(BufferInner {
+                device: self.clone(),
+                id,
+                user_ref_count: AtomicU32::new(1),
+                last_submission_index: AtomicU64::new(0),
+                allocation,
+                group: None,
+                handle,
+                device_address,
+            })),
+            handle,
+            size: byte_size,
+            usage,
+            mapped_ptr,
+        }
+    }
+
+    /*/// Registers an existing buffer resource.
+    pub(crate) unsafe fn register_buffer(
+        &self,
+        allocation: ResourceAllocation,
+        handle: vk::Buffer,
+    ) -> Arc<BufferInner> {
+        let device_address = self.get_buffer_device_address(&vk::BufferDeviceAddressInfo {
+            buffer: handle,
+            ..Default::default()
+        });
+
+        let mut buffer_ids = self.inner.buffer_ids.lock().unwrap();
+        let id = buffer_ids.insert_with_key(|id| {
+            Arc::new(BufferInner {
+                device: self.clone(),
+                id,
+                user_ref_count: AtomicU32::new(1),
+                last_submission_index: AtomicU64::new(0),
+                allocation,
+                group: None,
+                handle,
+                device_address,
+            })
+        });
+        buffer_ids.get(id).unwrap().clone()
+    }*/
+
+    pub(crate) fn register_swapchain_image(
+        &self,
+        handle: vk::Image,
+        format: vk::Format,
+        width: u32,
+        height: u32,
+    ) -> Image {
+        let id = self.inner.image_ids.lock().unwrap().insert(());
+        Image {
+            inner: Some(Arc::new(ImageInner {
+                device: self.clone(),
+                id,
+                last_submission_index: AtomicU64::new(0),
+                allocation: ResourceAllocation::External,
+                group: None,
+                handle,
+                swapchain_image: true,
+                format,
+            })),
+            handle,
+            usage: ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT,
+            type_: ImageType::Image2D,
+            format,
+            size: Size3D {
+                width,
+                height,
+                depth: 1,
+            },
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // IMAGES
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// Creates a new image resource.
+    ///
+    /// Returns an `ImageInfo` struct containing the image resource ID and the vulkan image handle.
+    ///
+    /// # Notes
+    /// The image might not have any device memory attached when this function returns.
+    /// This is because graal may delay the allocation and binding of device memory until the end of the
+    /// current frame (see `Context::end_frame`).
+    ///
+    /// # Examples
+    ///
+    pub fn create_image(&self, image_info: &ImageCreateInfo) -> Image {
+        let create_info = vk::ImageCreateInfo {
+            image_type: image_info.type_.into(),
+            format: image_info.format,
+            extent: vk::Extent3D {
+                width: image_info.width,
+                height: image_info.height,
+                depth: image_info.depth,
+            },
+            mip_levels: image_info.mip_levels,
+            array_layers: image_info.array_layers,
+            samples: get_vk_sample_count(image_info.samples),
+            tiling: vk::ImageTiling::OPTIMAL, // LINEAR tiling not used enough to be exposed
+            usage: image_info.usage.into(),
+            sharing_mode: vk::SharingMode::EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: ptr::null(),
+            ..Default::default()
+        };
+        let handle = unsafe {
+            self.inner
+                .device
+                .create_image(&create_info, None)
+                .expect("failed to create image")
+        };
+        let mem_req = unsafe { self.inner.device.get_image_memory_requirements(handle) };
+
+        let allocation_create_desc = AllocationCreateDesc {
+            name: "",
+            requirements: mem_req,
+            location: image_info.memory_location,
+            linear: true,
+            allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+        };
+        let allocation = self
+            .inner
+            .allocator
+            .lock()
+            .unwrap()
+            .allocate(&allocation_create_desc)
+            .expect("failed to allocate device memory");
+        unsafe {
+            self.inner
+                .device
+                .bind_image_memory(handle, allocation.memory(), allocation.offset() as u64)
+                .unwrap();
+        }
+
+        let id = self.inner.image_ids.lock().unwrap().insert(());
+
+        Image {
+            handle,
+            inner: Some(Arc::new(ImageInner {
+                device: self.clone(),
+                id,
+                last_submission_index: AtomicU64::new(0),
+                allocation: ResourceAllocation::Allocation { allocation },
+                group: None,
+                handle,
+                swapchain_image: false,
+                format: image_info.format,
+            })),
+            usage: image_info.usage,
+            type_: image_info.type_,
+            format: image_info.format,
+            size: Size3D {
+                width: image_info.width,
+                height: image_info.height,
+                depth: image_info.depth,
+            },
+        }
+    }
+
+    pub fn create_image_view(&self, image: &Image, info: &ImageViewInfo) -> ImageView {
+        // FIXME: support non-zero base mip level
+        if info.subresource_range.base_mip_level != 0 {
+            unimplemented!("non-zero base mip level");
+        }
+
+        let create_info = vk::ImageViewCreateInfo {
+            flags: vk::ImageViewCreateFlags::empty(),
+            image: image.handle,
+            view_type: info.view_type,
+            format: info.format,
+            components: vk::ComponentMapping {
+                r: info.component_mapping[0],
+                g: info.component_mapping[1],
+                b: info.component_mapping[2],
+                a: info.component_mapping[3],
+            },
+            subresource_range: vk::ImageSubresourceRange {
+                aspect_mask: info.subresource_range.aspect_mask,
+                base_mip_level: info.subresource_range.base_mip_level,
+                level_count: info.subresource_range.level_count,
+                base_array_layer: info.subresource_range.base_array_layer,
+                layer_count: info.subresource_range.layer_count,
+            },
+            ..Default::default()
+        };
+
+        // SAFETY: the device is valid, the create info is valid
+        let handle = unsafe {
+            self.inner
+                .device
+                .create_image_view(&create_info, None)
+                .expect("failed to create image view")
+        };
+
+        let id = self.inner.image_view_ids.lock().unwrap().insert(());
+
+        ImageView {
+            inner: Some(Arc::new(ImageViewInner {
+                image: image.clone(),
+                id,
+                handle,
+                last_submission_index: AtomicU64::new(0),
+            })),
+            image: image.id(),
+            handle,
+            image_handle: image.handle,
+            format: info.format,
+            original_format: image.format,
+            // TODO: size of mip level
+            size: image.size,
+        }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+    // RESOURCE GROUPS
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    /// Creates a resource group.
+    ///
+    /// Resource group hold a set of static resources that can be synchronized with as a group.
+    /// This is useful for large sets of long-lived static resources, like texture maps,
+    /// where it would be impractical to synchronize on each of them individually.
+    pub fn create_resource_group(
+        &self,
+        dst_stage_mask: vk::PipelineStageFlags2,
+        dst_access_mask: vk::AccessFlags2,
+    ) -> GroupId {
+        // resource groups are for read-only resources
+        assert!(!is_write_access(dst_access_mask));
+        self.inner.groups.lock().unwrap().insert(ResourceGroup {
+            //wait: Default::default(),
+            src_stage_mask: Default::default(),
+            dst_stage_mask,
+            src_access_mask: Default::default(),
+            dst_access_mask,
+        })
+    }
+
+    /// Destroys a resource group.
+    pub fn destroy_resource_group(&self, group_id: GroupId) {
+        self.inner.groups.lock().unwrap().remove(group_id);
+    }
+
+    pub fn delete_later<T: 'static>(&self, submission_index: u64, object: T) {
+        let queue_timeline = self.inner.queues[0].timeline;
+        let last_completed_submission_index = unsafe {
+            self.get_semaphore_counter_value(queue_timeline)
+                .expect("get_semaphore_counter_value failed")
+        };
+        if submission_index <= last_completed_submission_index {
+            // drop the object immediately if the submission has completed
+            return;
+        }
+
+        // otherwise move it to the deferred deletion list
+        self.inner
+            .dropped_resources
+            .lock()
+            .unwrap()
+            .push((submission_index, Box::new(object)));
+    }
+
+    pub fn call_later(&self, submission_index: u64, f: impl FnMut() + 'static) {
+        self.delete_later(submission_index, Defer(f))
+    }
+
+    pub(crate) unsafe fn free_memory(&self, allocation: &mut ResourceAllocation) {
+        match mem::replace(allocation, ResourceAllocation::External) {
+            ResourceAllocation::Allocation { allocation } => self
+                .inner
+                .allocator
+                .lock()
+                .unwrap()
+                .free(allocation)
+                .expect("failed to free memory"),
+            ResourceAllocation::DeviceMemory { device_memory } => unsafe {
+                self.inner.device.free_memory(device_memory, None);
+            },
+            ResourceAllocation::External => {
+                unreachable!()
+            }
+        }
+    }
+
+    // Cleanup expired resources.
+    pub fn cleanup(&self) {
+        // TODO multiple queues
+        let queue_timeline = self.inner.queues[0].timeline;
+        let last_completed_submission_index = unsafe {
+            self.get_semaphore_counter_value(queue_timeline)
+                .expect("get_semaphore_counter_value failed")
+        };
+
+        let mut tracker = self.inner.tracker.lock().unwrap();
+        /*let mut image_ids = self.inner.image_ids.lock().unwrap();
+        let mut buffer_ids = self.inner.buffer_ids.lock().unwrap();
+        let mut image_view_ids = self.inner.image_view_ids.lock().unwrap();*/
+        let mut dropped_resources = self.inner.dropped_resources.lock().unwrap();
+
+        dropped_resources.retain(|(submission, _object)| *submission > last_completed_submission_index);
+
+        // process all completed submissions, oldest to newest
+        //let mut active_submissions = tracker.active_submissions.lock().unwrap();
+        let mut free_command_pools = self.inner.free_command_pools.lock().unwrap();
+
+        loop {
+            let Some(submission) = tracker.active_submissions.front() else {
+                break;
+            };
+            if submission.index > last_completed_submission_index {
+                break;
+            }
+            debug!("cleaning up submission {}", submission.index);
+            let submission = tracker.active_submissions.pop_front().unwrap();
+            for mut command_pool in submission.command_pools {
+                // SAFETY: command buffers are not in use anymore
+                unsafe {
+                    command_pool.reset(&self.inner.device);
+                }
+                free_command_pools.push(command_pool);
+            }
         }
     }
 
@@ -518,8 +1216,8 @@ impl Device {
             .get_physical_device_surface_present_modes(phy, swapchain.surface)
             .unwrap();
 
-        let present_mode = init::get_preferred_present_mode(&present_modes);
-        let image_extent = init::get_preferred_swap_extent((width, height), &capabilities);
+        let present_mode = get_preferred_present_mode(&present_modes);
+        let image_extent = get_preferred_swap_extent((width, height), &capabilities);
         let image_count =
             if capabilities.max_image_count > 0 && capabilities.min_image_count + 1 > capabilities.max_image_count {
                 capabilities.max_image_count
@@ -566,27 +1264,6 @@ impl Device {
             .get_swapchain_images(swapchain.handle)
             .unwrap();
     }
-
-    /// Creates a universal argument buffer.
-    pub fn create_argument_buffer(
-        &self,
-        uniform_buffer_bindings: &[(u32, BufferRangeUntyped)],
-        storage_buffer_bindings: &[BufferRangeUntyped],
-        sampled_image_bindings: &[BufferRangeUntyped],
-    ) -> ArgumentBuffer {
-        let mut bindings = [vk::Des];
-
-        let dsci = vk::DescriptorSetLayoutCreateInfo {
-            flags: Default::default(),
-            binding_count: desc.bindings.len() as u32,
-            p_bindings: desc.bindings.as_ptr(),
-            ..Default::default()
-        };
-
-        unsafe { self.inner.device.create_descriptor_set_layout() }
-    }
-
-    //pub fn create_
 
     pub fn create_sampler(&self, info: &SamplerCreateInfo) -> Sampler {
         if let Some(sampler) = self.inner.sampler_cache.lock().unwrap().get(info) {
@@ -667,33 +1344,43 @@ impl Device {
         Ok(module)
     }
 
-    fn create_descriptor_set_layout(&self, arguments: &ArgumentsLayout) -> vk::DescriptorSetLayout {
+    /// FIXME: this should be a constructor of `DescriptorSetLayout`, because now we have two
+    /// functions with very similar names (`create_descriptor_set_layout` and `create_descriptor_set_layout_from_handle`)
+    /// that have totally different semantics (one returns a raw vulkan handle, the other returns a RAII wrapper `DescriptorSetLayout`).
+    pub fn create_descriptor_set_layout_from_handle(&self, handle: vk::DescriptorSetLayout) -> DescriptorSetLayout {
+        DescriptorSetLayout {
+            device: self.clone(),
+            last_submission_index: Some(Arc::new(Default::default())),
+            handle,
+        }
+    }
+
+    pub fn create_push_descriptor_set_layout(
+        &self,
+        bindings: &[vk::DescriptorSetLayoutBinding],
+    ) -> DescriptorSetLayout {
         let create_info = vk::DescriptorSetLayoutCreateInfo {
             flags: vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR,
-            binding_count: arguments.bindings.len() as u32,
-            p_bindings: arguments.bindings.as_ptr(),
+            binding_count: bindings.len() as u32,
+            p_bindings: bindings.as_ptr(),
             ..Default::default()
         };
-        let sl = unsafe {
+        let handle = unsafe {
             self.inner
                 .device
                 .create_descriptor_set_layout(&create_info, None)
                 .expect("failed to create descriptor set layout")
         };
-        sl
+        self.create_descriptor_set_layout_from_handle(handle)
     }
-
     /// Creates a pipeline layout object.
     fn create_pipeline_layout(
         &self,
         bind_point: vk::PipelineBindPoint,
-        arg_layouts: &[ArgumentsLayout],
+        descriptor_set_layouts: &[DescriptorSetLayout],
         push_constants_size: usize,
-    ) -> (Vec<vk::DescriptorSetLayout>, vk::PipelineLayout) {
-        let mut set_layouts = Vec::with_capacity(arg_layouts.len());
-        for layout in arg_layouts.iter() {
-            set_layouts.push(self.create_descriptor_set_layout(layout));
-        }
+    ) -> vk::PipelineLayout {
+        let layout_handles: Vec<_> = descriptor_set_layouts.iter().map(|layout| layout.handle).collect();
 
         let pc_range = if push_constants_size != 0 {
             Some(match bind_point {
@@ -717,8 +1404,8 @@ impl Device {
         let pc_range = pc_range.as_slice();
 
         let create_info = vk::PipelineLayoutCreateInfo {
-            set_layout_count: set_layouts.len() as u32,
-            p_set_layouts: set_layouts.as_ptr(),
+            set_layout_count: layout_handles.len() as u32,
+            p_set_layouts: layout_handles.as_ptr(),
             push_constant_range_count: pc_range.len() as u32,
             p_push_constant_ranges: pc_range.as_ptr(),
             ..Default::default()
@@ -731,15 +1418,14 @@ impl Device {
                 .expect("failed to create pipeline layout")
         };
 
-        (set_layouts, pipeline_layout)
+        pipeline_layout
     }
 
     pub fn create_compute_pipeline(&self, create_info: ComputePipelineCreateInfo) -> Result<ComputePipeline, Error> {
-        // ------ create pipeline layout from statically known information ------
-        let (descriptor_set_layouts, pipeline_layout) = self.create_pipeline_layout(
+        let pipeline_layout = self.create_pipeline_layout(
             vk::PipelineBindPoint::COMPUTE,
-            create_info.layout.arguments.as_ref(),
-            create_info.layout.push_constants_size,
+            create_info.set_layouts,
+            create_info.push_constants_size,
         );
 
         let compute_shader = self.create_shader_module(
@@ -748,8 +1434,8 @@ impl Device {
             create_info.compute_shader.entry_point,
         )?;
 
-        let create_info = vk::ComputePipelineCreateInfo {
-            flags: vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT,
+        let cpci = vk::ComputePipelineCreateInfo {
+            flags: vk::PipelineCreateFlags::empty(),
             stage: vk::PipelineShaderStageCreateInfo {
                 flags: Default::default(),
                 stage: vk::ShaderStageFlags::COMPUTE,
@@ -766,7 +1452,7 @@ impl Device {
             match self
                 .inner
                 .device
-                .create_compute_pipelines(vk::PipelineCache::null(), &[create_info], None)
+                .create_compute_pipelines(vk::PipelineCache::null(), &[cpci], None)
             {
                 Ok(pipelines) => pipelines[0],
                 Err(e) => {
@@ -775,19 +1461,21 @@ impl Device {
             }
         };
 
-        Ok(ComputePipeline::new(self.clone(), pipeline, pipeline_layout))
+        Ok(ComputePipeline {
+            device: self.clone(),
+            pipeline,
+            pipeline_layout,
+            descriptor_set_layouts: create_info.set_layouts.to_vec(),
+        })
     }
 
     /// Creates a graphics pipeline.
     pub fn create_graphics_pipeline(&self, create_info: GraphicsPipelineCreateInfo) -> Result<GraphicsPipeline, Error> {
-        // ------ create pipeline layout from statically known information ------
-        let (descriptor_set_layouts, pipeline_layout) = self.create_pipeline_layout(
+        let pipeline_layout = self.create_pipeline_layout(
             vk::PipelineBindPoint::GRAPHICS,
-            create_info.layout.arguments.as_ref(),
-            create_info.layout.push_constants_size,
+            create_info.set_layouts,
+            create_info.push_constants_size,
         );
-
-        // FIXME: delete descriptor_set_layouts
 
         // ------ Dynamic states ------
 
@@ -936,8 +1624,8 @@ impl Device {
 
         let fragment = self.create_shader_module(
             ShaderStage::Fragment,
-            &create_info.fragment_shader.code,
-            create_info.fragment_shader.entry_point,
+            &create_info.fragment.shader.code,
+            create_info.fragment.shader.entry_point,
         )?;
         stages.push(vk::PipelineShaderStageCreateInfo {
             flags: Default::default(),
@@ -949,7 +1637,7 @@ impl Device {
         });
 
         let attachment_states: Vec<_> = create_info
-            .fragment_output
+            .fragment
             .color_targets
             .iter()
             .map(|target| match target.blend_equation {
@@ -971,17 +1659,16 @@ impl Device {
             })
             .collect();
 
-        // Rasterization state
+        /*// Rasterization state
         let line_rasterization_state = vk::PipelineRasterizationLineStateCreateInfoEXT {
             line_rasterization_mode: create_info.rasterization.line_rasterization.mode.into(),
             stippled_line_enable: vk::FALSE,
             line_stipple_factor: 0,
             line_stipple_pattern: 0,
             ..Default::default()
-        };
+        };*/
 
         let conservative_rasterization_state = vk::PipelineRasterizationConservativeStateCreateInfoEXT {
-            p_next: &line_rasterization_state as *const _ as *const _,
             conservative_rasterization_mode: create_info.rasterization.conservative_rasterization_mode.into(),
             //extra_primitive_overestimation_size: 0.1,
             ..Default::default()
@@ -1007,7 +1694,7 @@ impl Device {
             sample_shading_enable: vk::FALSE,
             min_sample_shading: 0.0,
             p_sample_mask: ptr::null(),
-            alpha_to_coverage_enable: create_info.fragment_output.multisample.alpha_to_coverage_enabled.into(),
+            alpha_to_coverage_enable: create_info.fragment.multisample.alpha_to_coverage_enabled.into(),
             alpha_to_one_enable: vk::FALSE,
             ..Default::default()
         };
@@ -1018,39 +1705,56 @@ impl Device {
             logic_op: Default::default(),
             attachment_count: attachment_states.len() as u32,
             p_attachments: attachment_states.as_ptr(),
-            blend_constants: create_info.fragment_output.blend_constants,
+            blend_constants: create_info.fragment.blend_constants,
             ..Default::default()
         };
 
-        let depth_stencil_state = vk::PipelineDepthStencilStateCreateInfo {
-            flags: Default::default(),
-            depth_test_enable: (create_info.depth_stencil.depth_compare_op != CompareOp::Always).into(),
-            depth_write_enable: create_info.depth_stencil.depth_write_enable.into(),
-            depth_compare_op: create_info.depth_stencil.depth_compare_op.into(),
-            stencil_test_enable: create_info.depth_stencil.stencil_state.is_enabled().into(),
-            front: create_info.depth_stencil.stencil_state.front.into(),
-            back: create_info.depth_stencil.stencil_state.back.into(),
-            depth_bounds_test_enable: vk::FALSE,
-            min_depth_bounds: 0.0,
-            max_depth_bounds: 0.0,
-            ..Default::default()
+        let depth_stencil_state = if let Some(ds) = create_info.depth_stencil {
+            vk::PipelineDepthStencilStateCreateInfo {
+                flags: Default::default(),
+                depth_test_enable: (ds.depth_compare_op != vk::CompareOp::ALWAYS).into(),
+                depth_write_enable: ds.depth_write_enable.into(),
+                depth_compare_op: ds.depth_compare_op,
+                stencil_test_enable: ds.stencil_state.is_enabled().into(),
+                front: ds.stencil_state.front.into(),
+                back: ds.stencil_state.back.into(),
+                depth_bounds_test_enable: vk::FALSE,
+                min_depth_bounds: 0.0,
+                max_depth_bounds: 0.0,
+                ..Default::default()
+            }
+        } else {
+            Default::default()
+        };
+
+        let color_attachment_formats = create_info
+            .fragment
+            .color_targets
+            .iter()
+            .map(|target| target.format)
+            .collect::<Vec<_>>();
+        let depth_attachment_format = create_info
+            .depth_stencil
+            .map(|ds| ds.format)
+            .unwrap_or(vk::Format::UNDEFINED);
+        let stencil_attachment_format = if is_depth_and_stencil_format(depth_attachment_format) {
+            depth_attachment_format
+        } else {
+            vk::Format::UNDEFINED
         };
 
         let rendering_info = vk::PipelineRenderingCreateInfo {
             view_mask: 0,
-            color_attachment_count: create_info.fragment_output.color_attachment_formats.len() as u32,
-            p_color_attachment_formats: create_info.fragment_output.color_attachment_formats.as_ptr(),
-            depth_attachment_format: create_info.fragment_output.depth_attachment_format.unwrap_or_default(),
-            stencil_attachment_format: create_info
-                .fragment_output
-                .stencil_attachment_format
-                .unwrap_or_default(),
+            color_attachment_count: color_attachment_formats.len() as u32,
+            p_color_attachment_formats: color_attachment_formats.as_ptr(),
+            depth_attachment_format,
+            stencil_attachment_format,
             ..Default::default()
         };
 
         let pipeline_create_info = vk::GraphicsPipelineCreateInfo {
             p_next: &rendering_info as *const _ as *const _,
-            flags: vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT,
+            flags: vk::PipelineCreateFlags::empty(),
             stage_count: stages.len() as u32,
             p_stages: stages.as_ptr(),
             p_vertex_input_state: &vertex_input_state,
@@ -1087,6 +1791,11 @@ impl Device {
             }
         };
 
-        Ok(GraphicsPipeline::new(self.clone(), pipeline, pipeline_layout))
+        Ok(GraphicsPipeline {
+            device: self.clone(),
+            pipeline,
+            pipeline_layout,
+            descriptor_set_layouts: create_info.set_layouts.to_vec(),
+        })
     }
 }

@@ -2,10 +2,7 @@ use std::{mem, mem::MaybeUninit, slice};
 
 use ash::vk;
 
-use crate::{
-    command::{do_cmd_push_constants, do_cmd_push_descriptor_sets, DescriptorWrite},
-    ArgumentKind, Arguments, CommandStream, ComputePipeline, Device,
-};
+use crate::{CommandStream, ComputePipeline, Descriptor, Device, GpuResource};
 
 /// A context object to submit commands to a command buffer after a pipeline has been bound to it.
 ///
@@ -21,56 +18,34 @@ impl<'a> ComputeEncoder<'a> {
         self.stream.device()
     }
 
-    pub fn bind_arguments<A: Arguments>(&mut self, set: u32, arguments: &A) {
-        let mut descriptor_writes = vec![];
-        for arg in arguments.arguments() {
-            match arg.kind {
-                ArgumentKind::Image { image_view, access } => {
-                    self.stream.use_image_view(image_view, access);
-                    descriptor_writes.push(DescriptorWrite::Image {
-                        binding: arg.binding,
-                        descriptor_type: arg.descriptor_type,
-                        image_view: image_view.handle(),
-                        format: image_view.format(),
-                        access,
-                    });
-                }
-                ArgumentKind::Buffer {
-                    buffer,
-                    access,
-                    offset,
-                    size,
-                } => {
-                    self.stream.use_buffer(&buffer, access);
-                    descriptor_writes.push(DescriptorWrite::Buffer {
-                        binding: arg.binding,
-                        descriptor_type: arg.descriptor_type,
-                        buffer: buffer.handle(),
-                        access,
-                        offset,
-                        size,
-                    });
-                }
-                ArgumentKind::Sampler { sampler } => {
-                    descriptor_writes.push(DescriptorWrite::Sampler {
-                        binding: arg.binding,
-                        descriptor_type: arg.descriptor_type,
-                        sampler: sampler.handle(),
-                    });
-                }
-            }
-        }
+    pub fn reference_resource<R: GpuResource>(&mut self, resource: &R) {
+        self.stream.reference_resource(resource);
+    }
 
-        let device = self.stream.device();
+    pub unsafe fn bind_descriptor_set(&mut self, index: u32, set: vk::DescriptorSet) {
+        self.stream.device.cmd_bind_descriptor_sets(
+            self.command_buffer,
+            vk::PipelineBindPoint::COMPUTE,
+            self.pipeline_layout,
+            index,
+            &[set],
+            &[],
+        )
+    }
+
+    pub fn push_descriptors(&mut self, set: u32, bindings: &[(u32, Descriptor)]) {
+        assert!(
+            self.pipeline_layout != vk::PipelineLayout::null(),
+            "encoder must have a pipeline bound before binding arguments"
+        );
 
         unsafe {
-            do_cmd_push_descriptor_sets(
-                device,
+            self.stream.do_cmd_push_descriptor_set(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 set,
-                descriptor_writes.as_slice(),
+                bindings,
             );
         }
     }
@@ -86,17 +61,31 @@ impl<'a> ComputeEncoder<'a> {
     }
 
     /// Binds push constants.
-    pub fn bind_push_constants<P>(&mut self, data: &P)
+    ///
+    /// Push constants stay valid until the bound pipeline is changed.
+    pub fn push_constants<P>(&mut self, data: &P)
     where
-        P: Copy + ?Sized,
+        P: Copy,
     {
         unsafe {
-            do_cmd_push_constants(
-                &self.stream.device,
+            self.stream.do_cmd_push_constants(
                 self.command_buffer,
                 vk::PipelineBindPoint::COMPUTE,
                 self.pipeline_layout,
                 slice::from_raw_parts(data as *const P as *const MaybeUninit<u8>, mem::size_of_val(data)),
+            );
+        }
+    }
+    /// Binds push constants.
+    ///
+    /// Push constants stay valid until the bound pipeline is changed.
+    pub fn push_constants_slice(&mut self, data: &[u8]) {
+        unsafe {
+            self.stream.do_cmd_push_constants(
+                self.command_buffer,
+                vk::PipelineBindPoint::COMPUTE,
+                self.pipeline_layout,
+                slice::from_raw_parts(data.as_ptr() as *const MaybeUninit<u8>, mem::size_of_val(data)),
             );
         }
     }

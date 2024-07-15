@@ -7,7 +7,7 @@ extern crate syn;
 
 use proc_macro2::{Span, TokenStream};
 use quote::{quote, ToTokens, TokenStreamExt};
-use syn::{spanned::Spanned, MetaList};
+use syn::{spanned::Spanned};
 
 mod arguments;
 mod attachments;
@@ -38,7 +38,7 @@ struct StageFlags {
 }
 
 impl StageFlags {
-    fn all() -> Self {
+    /*fn all() -> Self {
         Self {
             vertex: false,
             tess_control: false,
@@ -51,7 +51,7 @@ impl StageFlags {
             all: true,
             all_graphics: false,
         }
-    }
+    }*/
 
     /*fn all_graphics() -> Self {
         Self {
@@ -68,7 +68,7 @@ impl StageFlags {
         }
     }*/
 
-    fn from_meta_list(meta_list: &MetaList) -> syn::Result<StageFlags> {
+    /*fn from_meta_list(meta_list: &MetaList) -> syn::Result<StageFlags> {
         let mut stage_flags = StageFlags::default();
         meta_list.parse_nested_meta(|meta| {
             if meta.path.is_ident("vertex") {
@@ -117,7 +117,7 @@ impl StageFlags {
             return Err(syn::Error::new(meta_list.span(), "no shader stages specified"));
         }
         Ok(stage_flags)
-    }
+    }*/
 }
 
 impl ToTokens for StageFlags {

@@ -737,3 +737,216 @@ Strategies:
     - scanning the map is costly
 - When the last strong ref to the resource is being dropped, move it to the "deferred deletion" list in device
     - issue: difficult to reliably detect deletion of the last strong ref, because it's possible to form weak pointers
+
+# Ensuring the resources are available
+
+- Metal: useResource *inside* the RenderPass, only valid inside the RenderPass
+- Vulkan: vkCmdPipelineBarrier *outside* the RenderPass
+- D3D12: ???
+
+If we do it at the CommandStream level (before RenderPass), then it's not compatible with metal, if we do it inside a
+renderpass, then it's incompatible with vulkan (must retroactively insert vkCmdPipelineBarrier)
+
+# Remove encoders?
+
+Dynamically enter/exit render passes.
+If not inside a render pass, then vkBeginRendering with last set attachments?
+
+No: complicates implementation for no good reason.
+
+# Simplest impl for vulkan
+
+- Encoders:
+    - RenderEncoder
+    - ComputeEncoder (optional)
+    - BlitEncoder (optional)
+- use_resource() only outside encoders
+
+Problem: metal needs use_resource when using argument buffers, not only for synchronization but also to
+make sure that the resources used in an argument buffer is resident in GPU memory; and this must be done in the encoder,
+and only valid for the scope of the encoder; AAAAAAAARGH
+
+Two concerns:
+
+- ensuring that the command buffer holds a strong ref to referenced objects (images, buffers, image views, samplers)
+- ensuring that the access to resources are properly synchronized according to their intended usage in the pass (images,
+  buffers)
+
+Responsibilities:
+
+- argument buffers: holds strong refs, but they don't specify usages
+- individual arguments: holds strong refs + usages
+
+No need to specify explicit resource usage for blit operations.
+
+For render passes we'd like to know which resources are going to be used in advance because when `bind_arguments` is
+called we have already begun recording the render pass, and it's too late to emit a barrier.
+
+When specifying usages, we might also keep a strong ref here. But we'd need to specify stuff like samplers & image views
+which have no need for synchronization.
+
+Tracking usages manually is a big pain, but it's not for end-users.
+But the API requires specifying usages even if
+we know that the data is visible already.
+
+I.e.
+
+- allocate a vector
+- multiple for loops to add all kinds of possibly used resources
+- all of this for nothing on metal if argument buffers are not used, for nothing on vulkan if the resources are already
+  properly synchronized
+
+# Compromise
+
+Option 1: since argument buffers shouldn't automatically sync on all the resource they contain, add an API to explicitly
+declare that they will be used
+
+- Metal: useResource, useHeap
+- Vulkan: "antedated" pipeline barrier
+
+Option 2: to avoid antedated pipeline barriers, require syncs before entering a render pass
+
+- Vulkan: CmdPipelineBarrier
+- Metal: impossible, useResource is scoped to the current encoder
+
+Option 3: specify all syncs (tracked arguments & argument buffers) at the beginning of passes
+
+- Compatible with vulkan & metal
+- However, need to allocate a list of all used resources before encoding it, which is error-prone, and mostly useless on
+  Metal when not using argument buffers
+
+Issue with antedated pipeline barriers: before using resources in draw calls,
+we sometimes need to add a CmdPipelineBarrier, which must happen before CmdBeginRendering,
+but with the current API we don't know which resources are used until set_vertex_buffer, set_arguments, etc.
+which happens after the pass is opened.
+
+This leaves us with two options:
+
+- defer the actual recording of the render pass until we know all used resources; for this we need to create our own
+  temporary command list,
+  which is the kind of pointless busywork we'd like to avoid.
+- start a separate command buffer for the render pass; we can record the pass immediately, and append the
+  CmdPipelineBarrier to the
+  previous command buffer. Still this creates an extra command buffer that is unnecessary in theory.
+
+So, the compromise:
+
+- for render passes, specify used resources up-front
+
+```
+RenderPassDescriptor {
+  color: ...,
+  depth: ...,
+  resources: ...,
+}
+
+
+pass_builder.use_resource(...);
+pass_builder.bind_arguments(...);
+  
+
+```
+
+- for compute passes, don't bother with passes; put the dispatch alongside the rest of the parameters:
+
+```
+cmd.dispatch(ComputeDispatchDescriptor {
+  resources: ...,
+  argument_buffer: ...,
+  arguments: ...,
+  size: ...,
+});
+```
+
+Alternative:
+
+For render passes, specify:
+
+- used resources, common argument buffers at pass setup
+- individual arguments, push constants in encoder
+
+For compute passes, specify everything in one go.
+
+Other issues:
+
+- recording the uses of host-uploaded buffers (e.g. host-uploaded vertex & index buffers) is useless since host writes
+  are guaranteed to be visible.
+    - except, of course, on metal when using argument buffers?
+
+
+- resources that must be made resident
+- resources in arguments
+- objects in arguments
+
+What really fucks everything is the need to specify resource uses up-front, due to the way CmdPipelineBarrier must work
+on vulkan.
+
+Concepts:
+
+- Device
+- CommandStream
+- ArgumentSet (or ArgumentBuffer)
+
+## Main annoyances
+
+- having to collect resource uses before recording a render pass (on vulkan, to avoid splitting command buffers)
+- collecting resource uses for a pass if the backend doesn't need it (e.g. metal)
+- collecting resource uses when there is no synchronization necessary (e.g. on vulkan all host writes are automatically
+  visible)
+
+Basically, APIs need more data up-front, which makes it less flexible, with more work,
+and the additional data is wasted anyway when porting to other APIs.
+
+## Not the right level of abstraction?
+
+Store pre-built passes containing:
+
+- pipeline
+- referenced resources
+- bindings (non-dynamic)
+
+This way we don't have to collect referenced resources on each frame if the pipeline doesn't need it.
+
+## Idea 2: low-level render graph
+
+- CommandStream: where to submit commands
+- RenderPass: retained render pass object; holds all parameters
+- ComputePass: retained compute pass
+- BlitPass: ditto
+- RenderPlan: holds list of passes & resources
+
+What's different:
+
+- it doesn't infer resource usages
+- resources are allocated immediately
+- it isn't concerned with binding details
+
+Main issues:
+
+- dynamic buffers like CPU generated vertex data, or uniforms that are not push constants
+    - main use case: GUI: dynamic buffers & texture bindings that can change
+- one-off draws & dispatches
+- anything that depends on the current swapchain image
+
+```
+RenderPlanBuilder
+  .add_image(...);                // add to argument buffer 
+  .add_buffer(...);  
+  .push_render_pass(...);         // with recording callback  
+  .push_mesh_render_pass(...);
+  .push_compute_pass(...);   
+  .build() -> RenderPlan;    // infers necessary synchronization between passes
+
+RenderPlan
+  .import_buffer(...);
+```
+
+=> meh, the current command buffer API is here for a reason
+
+## Idea 3: write different implementations of the engine for vulkan & metal
+
+Probably the sanest idea.
+Consider graal as an implementation detail of the vulkan backend. So remove stuff that's not required by vulkan:
+
+- BlitEncoders: move to CommandStream
+- enums should typedef to vk types

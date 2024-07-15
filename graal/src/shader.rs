@@ -23,7 +23,7 @@ pub fn get_shader_compiler() -> &'static shaderc::Compiler {
 /// * `compile_options` - specifies compilation options. See [`shaderc::CompileOptions`] for more information.
 ///
 /// # Defines
-/// The following defines are added automatically depending the type of shader:
+/// The following defines are added automatically depending on the type of shader:
 /// * Vertex => `#define __VERTEX__`
 /// * Fragment => `#define __FRAGMENT__`
 /// * Geometry => `#define __GEOMETRY__`

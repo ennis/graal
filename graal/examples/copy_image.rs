@@ -59,8 +59,7 @@ fn load_image(cmd: &mut CommandStream, path: impl AsRef<Path>, usage: ImageUsage
             byte_size as usize,
         );
 
-        let mut encoder = cmd.begin_blit();
-        encoder.copy_buffer_to_image(
+        cmd.copy_buffer_to_image(
             ImageCopyBuffer {
                 buffer: &staging_buffer,
                 layout: ImageDataLayout {
@@ -141,8 +140,7 @@ fn main() {
                         let blit_h = image.size().height.min(swapchain_size.1);
 
                         unsafe {
-                            let mut encoder = cmd.begin_blit();
-                            encoder.blit_image(
+                            cmd.blit_image(
                                 &image,
                                 ImageSubresourceLayers {
                                     aspect_mask: vk::ImageAspectFlags::COLOR,
