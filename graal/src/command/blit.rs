@@ -2,18 +2,18 @@
 use ash::vk;
 
 use crate::{
-    BufferAccess, BufferRangeUntyped, ClearColorValue, CommandStream, Image, ImageAccess, ImageCopyBuffer,
-    ImageCopyView, ImageSubresourceLayers, Rect3D,
+    Barrier, BufferRangeUntyped, BufferUntyped, ClearColorValue, CommandStream, Image, ImageCopyBuffer, ImageCopyView,
+    ImageSubresourceLayers, Point3D, Rect3D,
 };
 
 impl CommandStream {
     pub fn fill_buffer(&mut self, buffer: &BufferRangeUntyped, data: u32) {
-        self.use_buffer(&buffer.buffer, BufferAccess::COPY_DST);
-        self.flush_barriers();
+        self.reference_resource(&buffer.buffer);
+        self.barrier(Barrier::new().transfer_write());
 
-        // SAFETY: FFI call and parameters are valid
         let cb = self.get_or_create_command_buffer();
         unsafe {
+            // SAFETY: FFI call and parameters are valid
             self.device
                 .cmd_fill_buffer(cb, buffer.buffer.handle, buffer.offset, buffer.size, data);
         }
@@ -21,12 +21,12 @@ impl CommandStream {
 
     // TODO specify subresources
     pub fn clear_image(&mut self, image: &Image, clear_color_value: ClearColorValue) {
-        self.use_image(image, ImageAccess::COPY_DST);
-        self.flush_barriers();
+        self.reference_resource(image);
+        self.barrier(Barrier::new().transfer_write_image(image));
 
-        // SAFETY: FFI call and parameters are valid
         let cb = self.get_or_create_command_buffer();
         unsafe {
+            // SAFETY: FFI call and parameters are valid
             self.device.cmd_clear_color_image(
                 cb,
                 image.handle,
@@ -49,11 +49,18 @@ impl CommandStream {
         destination: ImageCopyView<'_>,
         copy_size: vk::Extent3D,
     ) {
-        self.use_image(&source.image, ImageAccess::COPY_SRC);
-        self.use_image(&destination.image, ImageAccess::COPY_DST);
-
         // TODO: this is not required for multi-planar formats
         assert_eq!(source.aspect, destination.aspect);
+
+        // TODO barriers should automatically reference the resources in the command stream
+        self.reference_resource(source.image);
+        self.reference_resource(destination.image);
+
+        self.barrier(
+            Barrier::new()
+                .transfer_read_image(source.image)
+                .transfer_write_image(destination.image),
+        );
 
         let regions = [vk::ImageCopy {
             src_subresource: vk::ImageSubresourceLayers {
@@ -73,8 +80,6 @@ impl CommandStream {
             extent: copy_size,
         }];
 
-        self.flush_barriers();
-
         // SAFETY: FFI call and parameters are valid
         let cb = self.get_or_create_command_buffer();
         unsafe {
@@ -89,14 +94,49 @@ impl CommandStream {
         }
     }
 
+    /// Copies data from one buffer to another.
+    pub fn copy_buffer(
+        &mut self,
+        source: &BufferUntyped,
+        src_offset: u64,
+        destination: &BufferUntyped,
+        dst_offset: u64,
+        size: u64,
+    ) {
+        assert!(src_offset + size <= source.size);
+        assert!(dst_offset + size <= destination.size);
+
+        self.reference_resource(source);
+        self.reference_resource(destination);
+        self.barrier(Barrier::new().transfer_read().transfer_write());
+
+        // SAFETY: FFI call and parameters are valid
+        let cb = self.get_or_create_command_buffer();
+        unsafe {
+            self.device.cmd_copy_buffer(
+                cb,
+                source.handle(),
+                destination.handle(),
+                &[vk::BufferCopy {
+                    src_offset,
+                    dst_offset,
+                    size,
+                }],
+            );
+        }
+    }
+
+    /// Copies data from a buffer to an image.
     pub fn copy_buffer_to_image(
         &mut self,
         source: ImageCopyBuffer<'_>,
         destination: ImageCopyView<'_>,
         copy_size: vk::Extent3D,
     ) {
-        self.use_buffer(&source.buffer, BufferAccess::COPY_SRC);
-        self.use_image(&destination.image, ImageAccess::COPY_DST);
+        self.reference_resource(source.buffer);
+        self.reference_resource(destination.image);
+
+        self.barrier(Barrier::new().transfer_read().transfer_write_image(destination.image));
 
         let regions = [vk::BufferImageCopy {
             buffer_offset: source.layout.offset,
@@ -112,8 +152,6 @@ impl CommandStream {
             image_extent: copy_size,
         }];
 
-        self.flush_barriers();
-
         // SAFETY: FFI call and parameters are valid
         let cb = self.get_or_create_command_buffer();
         unsafe {
@@ -127,6 +165,45 @@ impl CommandStream {
         }
     }
 
+    /// Short-hand to `blit_image` for blitting the top-level mip level of an image.
+    pub fn blit_full_image_top_mip_level(&mut self, src: &Image, dst: &Image) {
+        let width = src.width() as i32;
+        let height = src.height() as i32;
+        self.blit_image(
+            &src,
+            ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            Rect3D {
+                min: Point3D { x: 0, y: 0, z: 0 },
+                max: Point3D {
+                    x: width,
+                    y: height,
+                    z: 1,
+                },
+            },
+            &dst,
+            ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            Rect3D {
+                min: Point3D { x: 0, y: 0, z: 0 },
+                max: Point3D {
+                    x: width,
+                    y: height,
+                    z: 1,
+                },
+            },
+            vk::Filter::NEAREST,
+        );
+    }
+
     // TODO the call-site verbosity of this method is ridiculous, fix that
     pub fn blit_image(
         &mut self,
@@ -138,8 +215,11 @@ impl CommandStream {
         dst_region: Rect3D,
         filter: vk::Filter,
     ) {
-        self.use_image(src, ImageAccess::COPY_SRC);
-        self.use_image(dst, ImageAccess::COPY_DST);
+        self.reference_resource(src);
+        self.reference_resource(dst);
+
+        self.barrier(Barrier::new().transfer_read_image(src).transfer_write_image(dst));
+
         let blits = [vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers {
                 aspect_mask: src_subresource.aspect_mask,
@@ -178,8 +258,6 @@ impl CommandStream {
                 },
             ],
         }];
-
-        self.flush_barriers();
 
         // SAFETY: command buffer is OK, params OK
         let cb = self.get_or_create_command_buffer();

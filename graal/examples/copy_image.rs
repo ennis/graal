@@ -1,7 +1,7 @@
 use image::DynamicImage;
 use std::{path::Path, ptr, time::Duration};
 
-use raw_window_handle::HasRawWindowHandle;
+use raw_window_handle::HasWindowHandle;
 use winit::{
     event::{Event, WindowEvent},
     event_loop::EventLoop,
@@ -9,11 +9,11 @@ use winit::{
 };
 
 use graal::{
-    vk, BufferCreateInfo, BufferUsage, CommandStream, Image, ImageCopyBuffer, ImageCopyView, ImageCreateInfo,
-    ImageDataLayout, ImageSubresourceLayers, ImageType, ImageUsage, MemoryLocation, Point3D, Rect3D,
+    vk, BufferUsage, CommandStream, Image, ImageCopyBuffer, ImageCopyView, ImageCreateInfo, ImageDataLayout,
+    ImageSubresourceLayers, ImageType, ImageUsage, MemoryLocation, Point3D, Rect3D,
 };
 
-fn load_image(cmd: &mut CommandStream, path: impl AsRef<Path>, usage: ImageUsage, mipmaps: bool) -> Image {
+fn load_image(cmd: &mut CommandStream, path: impl AsRef<Path>, usage: ImageUsage) -> Image {
     let path = path.as_ref();
     let device = cmd.device().clone();
 
@@ -95,7 +95,7 @@ fn main() {
     let event_loop = EventLoop::new().expect("failed to create event loop");
     let window = WindowBuilder::new().build(&event_loop).unwrap();
 
-    let surface = graal::get_vulkan_surface(window.raw_window_handle().unwrap());
+    let surface = graal::get_vulkan_surface(window.window_handle().unwrap().as_raw());
 
     let (device, mut cmd) =
         unsafe { graal::create_device_and_command_stream(Some(surface)).expect("failed to create device") };
@@ -108,7 +108,7 @@ fn main() {
     event_loop
         .run(move |event, event_loop| {
             match event {
-                Event::WindowEvent { window_id, event } => match event {
+                Event::WindowEvent { window_id: _, event } => match event {
                     WindowEvent::CloseRequested => {
                         println!("The close button was pressed; stopping");
                         event_loop.exit();
@@ -133,47 +133,44 @@ fn main() {
                             &mut cmd,
                             "data/yukari.png",
                             ImageUsage::TRANSFER_SRC | ImageUsage::SAMPLED,
-                            false,
                         );
 
                         let blit_w = image.size().width.min(swapchain_size.0);
                         let blit_h = image.size().height.min(swapchain_size.1);
 
-                        unsafe {
-                            cmd.blit_image(
-                                &image,
-                                ImageSubresourceLayers {
-                                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                                    mip_level: 0,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
+                        cmd.blit_image(
+                            &image,
+                            ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            },
+                            Rect3D {
+                                min: Point3D { x: 0, y: 0, z: 0 },
+                                max: Point3D {
+                                    x: blit_w as i32,
+                                    y: blit_h as i32,
+                                    z: 1,
                                 },
-                                Rect3D {
-                                    min: Point3D { x: 0, y: 0, z: 0 },
-                                    max: Point3D {
-                                        x: blit_w as i32,
-                                        y: blit_h as i32,
-                                        z: 1,
-                                    },
+                            },
+                            &swapchain_image.image,
+                            ImageSubresourceLayers {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                mip_level: 0,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            },
+                            Rect3D {
+                                min: Point3D { x: 0, y: 0, z: 0 },
+                                max: Point3D {
+                                    x: blit_w as i32,
+                                    y: blit_h as i32,
+                                    z: 1,
                                 },
-                                &swapchain_image.image,
-                                ImageSubresourceLayers {
-                                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                                    mip_level: 0,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                },
-                                Rect3D {
-                                    min: Point3D { x: 0, y: 0, z: 0 },
-                                    max: Point3D {
-                                        x: blit_w as i32,
-                                        y: blit_h as i32,
-                                        z: 1,
-                                    },
-                                },
-                                vk::Filter::NEAREST,
-                            );
-                        }
+                            },
+                            vk::Filter::NEAREST,
+                        );
 
                         cmd.present(&swapchain_image).unwrap();
                         device.cleanup();

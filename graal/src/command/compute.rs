@@ -2,7 +2,7 @@ use std::{mem, mem::MaybeUninit, slice};
 
 use ash::vk;
 
-use crate::{CommandStream, ComputePipeline, Descriptor, Device, GpuResource};
+use crate::{Barrier, CommandStream, ComputePipeline, Descriptor, Device, GpuResource};
 
 /// A context object to submit commands to a command buffer after a pipeline has been bound to it.
 ///
@@ -60,6 +60,10 @@ impl<'a> ComputeEncoder<'a> {
         // TODO: we need to hold a reference to the pipeline until the command buffers are submitted
     }
 
+    pub fn barrier(&mut self, barrier: Barrier) {
+        self.stream.barrier(barrier);
+    }
+
     /// Binds push constants.
     ///
     /// Push constants stay valid until the bound pipeline is changed.
@@ -91,7 +95,6 @@ impl<'a> ComputeEncoder<'a> {
     }
 
     pub fn dispatch(&mut self, group_count_x: u32, group_count_y: u32, group_count_z: u32) {
-        self.stream.flush_barriers();
         unsafe {
             self.stream
                 .device

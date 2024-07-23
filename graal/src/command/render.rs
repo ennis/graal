@@ -5,9 +5,8 @@ use ash::vk;
 use fxhash::FxHashMap;
 
 use crate::{
-    is_depth_and_stencil_format, BufferAccess, BufferId, BufferRangeUntyped, BufferUntyped, ClearColorValue,
-    ColorAttachment, CommandStream, DepthStencilAttachment, Descriptor, Device, GpuResource, GraphicsPipeline, Image,
-    ImageAccess, ImageId, ImageView, ImageViewId, Rect2D,
+    is_depth_and_stencil_format, Barrier, BufferRangeUntyped, ClearColorValue, ColorAttachment, CommandStream,
+    DepthStencilAttachment, Descriptor, Device, GpuResource, GraphicsPipeline, ImageView, ImageViewId, Rect2D,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -20,9 +19,6 @@ pub struct RenderEncoder<'a> {
     command_buffer: vk::CommandBuffer,
     render_area: vk::Rect2D,
     pipeline_layout: vk::PipelineLayout,
-
-    pub(crate) used_buffers: FxHashMap<BufferId, (BufferUntyped, BufferAccess)>,
-    pub(crate) used_images: FxHashMap<ImageId, (Image, ImageAccess)>,
     pub(crate) used_image_views: FxHashMap<ImageViewId, ImageView>,
 }
 
@@ -31,7 +27,7 @@ impl<'a> RenderEncoder<'a> {
         self.stream.device()
     }
 
-    pub fn use_image(&mut self, image: &Image, access: ImageAccess) {
+    /*pub fn use_image(&mut self, image: &Image, access: ImageAccess) {
         let image_id = image.id();
         if let Some(entry) = self.used_images.get_mut(&image_id) {
             if entry.1 != access {
@@ -43,9 +39,9 @@ impl<'a> RenderEncoder<'a> {
         } else {
             self.used_images.insert(image_id, (image.clone(), access));
         }
-    }
+    }*/
 
-    pub fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
+    /*pub fn use_buffer(&mut self, buffer: &BufferUntyped, access: BufferAccess) {
         let buffer_id = buffer.id();
         if let Some(entry) = self.used_buffers.get_mut(&buffer_id) {
             if entry.1 != access {
@@ -57,13 +53,13 @@ impl<'a> RenderEncoder<'a> {
         } else {
             self.used_buffers.insert(buffer_id, (buffer.clone(), access));
         }
-    }
+    }*/
 
-    pub fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
+    /*pub fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
         let image_view_id = image_view.id();
         self.use_image(image_view.image(), state);
         self.used_image_views.insert(image_view_id, image_view.clone());
-    }
+    }*/
 
     /// Marks the resource as being in use by the current submission.
     ///
@@ -238,6 +234,17 @@ impl<'a> RenderEncoder<'a> {
         }
     }
 
+    pub fn set_viewport_to_render_area(&mut self) {
+        self.set_viewport(
+            self.render_area.offset.x as f32,
+            self.render_area.offset.y as f32,
+            self.render_area.extent.width as f32,
+            self.render_area.extent.height as f32,
+            0.0,
+            1.0,
+        );
+    }
+
     /// Sets the scissor rectangle.
     pub fn set_scissor(&mut self, x: i32, y: i32, width: u32, height: u32) {
         unsafe {
@@ -250,6 +257,15 @@ impl<'a> RenderEncoder<'a> {
                 }],
             );
         }
+    }
+
+    pub fn set_scissor_to_render_area(&mut self) {
+        self.set_scissor(
+            self.render_area.offset.x,
+            self.render_area.offset.y,
+            self.render_area.extent.width,
+            self.render_area.extent.height,
+        );
     }
 
     pub fn clear_color(&mut self, attachment: u32, color: ClearColorValue) {
@@ -364,19 +380,18 @@ impl<'a> RenderEncoder<'a> {
     }
 
     fn do_finish(&mut self) {
-        for (_, (buffer, access)) in self.used_buffers.drain() {
+        /*for (_, (buffer, access)) in self.used_buffers.drain() {
             self.stream.use_buffer(&buffer, access);
         }
 
         for (_, (image, access)) in self.used_images.drain() {
             self.stream.use_image(&image, access);
-        }
+        }*/
 
         for (_, image_view) in self.used_image_views.drain() {
             self.stream.tracked_image_views.insert(image_view.id(), image_view);
         }
 
-        self.stream.flush_barriers();
         self.stream.close_command_buffer();
 
         unsafe {
@@ -393,11 +408,11 @@ impl<'a> Drop for RenderEncoder<'a> {
 }
 
 /// Parameters of `CommandStream::begin_rendering`
-pub struct RenderPassDescriptor<'a> {
+pub struct RenderPassInfo<'a> {
     /// The color attachments to use for the render pass.
-    pub color_attachments: &'a [ColorAttachment],
+    pub color_attachments: &'a [ColorAttachment<'a>],
     /// The depth/stencil attachment to use for the render pass.
-    pub depth_stencil_attachment: Option<DepthStencilAttachment>,
+    pub depth_stencil_attachment: Option<DepthStencilAttachment<'a>>,
 }
 
 impl CommandStream {
@@ -409,7 +424,7 @@ impl CommandStream {
     /// # Arguments
     ///
     /// * `attachments` - The attachments to use for the render pass
-    pub fn begin_rendering(&mut self, desc: RenderPassDescriptor) -> RenderEncoder {
+    pub fn begin_rendering(&mut self, desc: RenderPassInfo) -> RenderEncoder {
         // determine render area
         let render_area = {
             // FIXME validate that all attachments have the same size
@@ -441,8 +456,12 @@ impl CommandStream {
                     image_view: a.image_view.handle,
                     image_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
                     resolve_mode: vk::ResolveModeFlags::NONE,
-                    load_op: a.load_op,
-                    store_op: a.store_op,
+                    load_op: if a.clear_value.is_some() {
+                        vk::AttachmentLoadOp::CLEAR
+                    } else {
+                        vk::AttachmentLoadOp::LOAD
+                    },
+                    store_op: vk::AttachmentStoreOp::STORE,
                     clear_value: vk::ClearValue {
                         color: a.get_vk_clear_color_value(),
                     },
@@ -462,8 +481,12 @@ impl CommandStream {
                 // TODO different layouts
                 image_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                 resolve_mode: vk::ResolveModeFlags::NONE,
-                load_op: depth.depth_load_op,
-                store_op: depth.depth_store_op,
+                load_op: if depth.depth_clear_value.is_some() {
+                    vk::AttachmentLoadOp::CLEAR
+                } else {
+                    vk::AttachmentLoadOp::LOAD
+                },
+                store_op: vk::AttachmentStoreOp::STORE,
                 clear_value: vk::ClearValue {
                     depth_stencil: depth.get_vk_clear_depth_stencil_value(),
                 },
@@ -478,8 +501,12 @@ impl CommandStream {
                     // TODO different layouts
                     image_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
                     resolve_mode: vk::ResolveModeFlags::NONE,
-                    load_op: depth.stencil_load_op,
-                    store_op: depth.stencil_store_op,
+                    load_op: if depth.stencil_clear_value.is_some() {
+                        vk::AttachmentLoadOp::CLEAR
+                    } else {
+                        vk::AttachmentLoadOp::LOAD
+                    },
+                    store_op: vk::AttachmentStoreOp::STORE,
                     clear_value: vk::ClearValue {
                         depth_stencil: depth.get_vk_clear_depth_stencil_value(),
                     },
@@ -494,6 +521,22 @@ impl CommandStream {
             p_depth_attachment = ptr::null();
             p_stencil_attachment = ptr::null();
         };
+
+        // Register resource uses.
+        // We could also do that after encoding the pass.
+        // It doesn't matter much except we can report usage conflicts earlier.
+        let mut barrier = Barrier::new();
+        for color in desc.color_attachments.iter() {
+            self.reference_resource(color.image_view);
+            barrier = barrier.color_attachment_write(&color.image_view.image());
+        }
+        if let Some(ref depth) = desc.depth_stencil_attachment {
+            // TODO we don't know whether the depth attachment will be written to
+            self.reference_resource(depth.image_view);
+            barrier = barrier.depth_stencil_attachment_write(&depth.image_view.image());
+        }
+
+        self.barrier(barrier);
 
         let rendering_info = vk::RenderingInfo {
             flags: Default::default(),
@@ -517,24 +560,8 @@ impl CommandStream {
             command_buffer,
             render_area,
             pipeline_layout: Default::default(),
-            used_buffers: Default::default(),
-            used_images: Default::default(),
             used_image_views: Default::default(),
         };
-
-        // Register resource uses.
-        // We could also do that after encoding the pass.
-        // It doesn't matter much except we can report usage conflicts earlier.
-        for color in desc.color_attachments.iter() {
-            encoder.use_image_view(&color.image_view, ImageAccess::COLOR_TARGET);
-        }
-        if let Some(ref depth) = desc.depth_stencil_attachment {
-            // TODO we don't know whether the depth attachment will be written to
-            encoder.use_image_view(
-                &depth.image_view,
-                ImageAccess::DEPTH_STENCIL_READ | ImageAccess::DEPTH_STENCIL_WRITE,
-            );
-        }
 
         encoder.set_viewport(
             0.0,

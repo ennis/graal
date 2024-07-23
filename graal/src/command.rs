@@ -8,17 +8,17 @@ use std::{
     time::Duration,
 };
 
-use ash::{prelude::VkResult, vk::Handle};
+use ash::prelude::VkResult;
 use fxhash::FxHashMap;
 
 pub use compute::ComputeEncoder;
-pub use render::{RenderEncoder, RenderPassDescriptor};
+pub use render::{RenderEncoder, RenderPassInfo};
 
 use crate::{
+    aspects_for_format,
     device::{ActiveSubmission, QueueShared},
-    make_buffer_barrier, make_image_barrier, vk, vk_ext_debug_utils, BufferAccess, BufferId, BufferUntyped,
-    CommandPool, Descriptor, Device, GpuResource, Image, ImageAccess, ImageId, ImageView, ImageViewId, Swapchain,
-    SwapchainImage,
+    vk, vk_ext_debug_utils, BufferAccess, BufferUntyped, CommandPool, Descriptor, Device, GpuResource, Image,
+    ImageAccess, ImageId, ImageView, ImageViewId, MemoryAccess, Swapchain, SwapchainImage,
 };
 
 mod blit;
@@ -33,6 +33,98 @@ union DescriptorBufferOrImage {
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Describes a pipeline barrier.
+pub struct Barrier {
+    access: MemoryAccess,
+    transitions: Vec<(Image, MemoryAccess)>,
+}
+
+impl Barrier {
+    pub fn new() -> Self {
+        Barrier {
+            access: MemoryAccess::empty(),
+            transitions: vec![],
+        }
+    }
+
+    pub fn color_attachment_write(mut self, image: &Image) -> Self {
+        self.transitions
+            .push((image.clone(), MemoryAccess::COLOR_ATTACHMENT_WRITE));
+        self.access |= MemoryAccess::COLOR_ATTACHMENT_WRITE;
+        self
+    }
+
+    pub fn depth_stencil_attachment_write(mut self, image: &Image) -> Self {
+        self.transitions
+            .push((image.clone(), MemoryAccess::DEPTH_STENCIL_ATTACHMENT_WRITE));
+        self.access |= MemoryAccess::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        self
+    }
+
+    pub fn shader_storage_read(mut self) -> Self {
+        self.access |= MemoryAccess::SHADER_STORAGE_READ | MemoryAccess::ALL_STAGES;
+        self
+    }
+
+    pub fn shader_storage_write(mut self) -> Self {
+        self.access |= MemoryAccess::SHADER_STORAGE_WRITE | MemoryAccess::ALL_STAGES;
+        self
+    }
+
+    pub fn shader_read_image(mut self, image: &Image) -> Self {
+        self.transitions.push((
+            image.clone(),
+            MemoryAccess::SHADER_STORAGE_READ | MemoryAccess::ALL_STAGES,
+        ));
+        self.access |= MemoryAccess::SHADER_STORAGE_READ | MemoryAccess::ALL_STAGES;
+        self
+    }
+
+    pub fn shader_write_image(mut self, image: &Image) -> Self {
+        self.transitions.push((
+            image.clone(),
+            MemoryAccess::SHADER_STORAGE_WRITE | MemoryAccess::ALL_STAGES,
+        ));
+        self.access |= MemoryAccess::SHADER_STORAGE_WRITE | MemoryAccess::ALL_STAGES;
+        self
+    }
+
+    pub fn present(mut self, image: &Image) -> Self {
+        self.transitions.push((image.clone(), MemoryAccess::PRESENT));
+        self.access |= MemoryAccess::PRESENT;
+        self
+    }
+
+    pub fn sample_read_image(mut self, image: &Image) -> Self {
+        self.transitions
+            .push((image.clone(), MemoryAccess::SAMPLED_READ | MemoryAccess::ALL_STAGES));
+        self.access |= MemoryAccess::SAMPLED_READ | MemoryAccess::ALL_STAGES;
+        self
+    }
+
+    pub fn transfer_read(mut self) -> Self {
+        self.access |= MemoryAccess::TRANSFER_READ;
+        self
+    }
+
+    pub fn transfer_write(mut self) -> Self {
+        self.access |= MemoryAccess::TRANSFER_WRITE;
+        self
+    }
+
+    pub fn transfer_read_image(mut self, image: &Image) -> Self {
+        self.transitions.push((image.clone(), MemoryAccess::TRANSFER_READ));
+        self.access |= MemoryAccess::TRANSFER_READ;
+        self
+    }
+
+    pub fn transfer_write_image(mut self, image: &Image) -> Self {
+        self.transitions.push((image.clone(), MemoryAccess::TRANSFER_WRITE));
+        self.access |= MemoryAccess::TRANSFER_WRITE;
+        self
+    }
+}
 
 ///
 pub struct CommandStream {
@@ -52,28 +144,20 @@ pub struct CommandStream {
     /// Current command buffer.
     command_buffer: Option<vk::CommandBuffer>,
 
-    // Resources referenced in the current command buffer
-    pub(crate) tracked_buffers: FxHashMap<BufferId, CommandBufferBufferState>,
-    pub(crate) tracked_images: FxHashMap<ImageId, CommandBufferImageState>,
+    // Buffer writes that need to be made available
+    tracked_writes: MemoryAccess,
+    tracked_images: FxHashMap<ImageId, CommandBufferImageState>,
     pub(crate) tracked_image_views: FxHashMap<ImageViewId, ImageView>,
 
-    pending_image_barriers: Vec<vk::ImageMemoryBarrier2>,
-    pending_buffer_barriers: Vec<vk::BufferMemoryBarrier2>,
+    seen_initial_barrier: bool,
+    //initial_writes: MemoryAccess,
+    initial_access: MemoryAccess,
 }
 
 pub(crate) struct CommandBufferImageState {
     pub image: Image,
-    pub handle: vk::Image,
-    pub format: vk::Format,
-    pub first_state: ImageAccess,
-    pub last_state: ImageAccess,
-}
-
-pub(crate) struct CommandBufferBufferState {
-    pub buffer: BufferUntyped,
-    pub handle: vk::Buffer,
-    pub first_state: BufferAccess,
-    pub last_state: BufferAccess,
+    pub first_access: MemoryAccess,
+    pub last_access: MemoryAccess,
 }
 
 /// Describes how a resource will be used during a render or compute pass.
@@ -85,9 +169,9 @@ pub enum ResourceUse<'a> {
     Buffer(&'a BufferUntyped, BufferAccess),
 }
 
-/// A wrapper around a signaled binary semaphore.
-#[derive(Debug)]
-pub struct SignaledSemaphore(pub(crate) vk::Semaphore);
+// A wrapper around a signaled binary semaphore.
+//#[derive(Debug)]
+//pub struct SignaledSemaphore(pub(crate) vk::Semaphore);
 
 /// A wrapper around an unsignaled binary semaphore.
 #[derive(Debug)]
@@ -159,11 +243,11 @@ impl CommandStream {
             semaphores: vec![],
             command_buffers_to_submit: vec![],
             command_buffer: None,
-            tracked_buffers: Default::default(),
             tracked_images: Default::default(),
             tracked_image_views: Default::default(),
-            pending_image_barriers: vec![],
-            pending_buffer_barriers: vec![],
+            seen_initial_barrier: false,
+            initial_access: MemoryAccess::empty(),
+            tracked_writes: MemoryAccess::empty(),
         }
     }
 
@@ -328,6 +412,99 @@ impl CommandStream {
             );
         }
     }
+
+    /// Tells the command stream that an operation has made writes that are not available to
+    /// subsequent operations.
+    pub fn invalidate(&mut self, scope: MemoryAccess) {
+        self.tracked_writes |= scope;
+    }
+
+    /// Emits a pipeline barrier (if necessary) that ensures that all previous writes are
+    /// visible to subsequent operations for the given memory access type.
+    ///
+    /// Note that it's not possible to make only one specific type of write available. All pending
+    /// writes are made available unconditionally.
+    pub fn barrier(&mut self, barrier: Barrier) {
+        let mut global_memory_barrier = None;
+        let mut image_barriers = vec![];
+
+        if !self.seen_initial_barrier {
+            self.initial_access = barrier.access;
+            self.seen_initial_barrier = true;
+        } else {
+            let (src_stage_mask, src_access_mask) = self.tracked_writes.to_vk_scope_flags();
+            let (dst_stage_mask, dst_access_mask) = barrier.access.to_vk_scope_flags();
+            global_memory_barrier = Some(vk::MemoryBarrier2 {
+                src_access_mask,
+                dst_access_mask,
+                src_stage_mask,
+                dst_stage_mask,
+                ..Default::default()
+            });
+        }
+
+        for (image, access) in barrier.transitions {
+            if let Some(entry) = self.tracked_images.get_mut(&image.id()) {
+                if entry.last_access != access {
+                    let (src_stage_mask, src_access_mask) = entry.last_access.to_vk_scope_flags();
+                    let (dst_stage_mask, dst_access_mask) = access.to_vk_scope_flags();
+                    image_barriers.push(vk::ImageMemoryBarrier2 {
+                        src_stage_mask,
+                        src_access_mask,
+                        dst_stage_mask,
+                        dst_access_mask,
+                        image: image.handle(),
+                        old_layout: entry.last_access.to_vk_image_layout(image.format),
+                        new_layout: access.to_vk_image_layout(image.format),
+                        subresource_range: vk::ImageSubresourceRange {
+                            aspect_mask: aspects_for_format(image.format),
+                            base_mip_level: 0,
+                            level_count: vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        },
+                        ..Default::default()
+                    });
+                }
+                entry.last_access = access;
+            } else {
+                self.tracked_images.insert(
+                    image.id(),
+                    CommandBufferImageState {
+                        image: image.clone(),
+                        first_access: access,
+                        last_access: access,
+                    },
+                );
+            }
+        }
+
+        if global_memory_barrier.is_some() || !image_barriers.is_empty() {
+            // a global memory barrier is needed or there are image layout transitions
+            let command_buffer = self.get_or_create_command_buffer();
+            unsafe {
+                self.device.cmd_pipeline_barrier2(
+                    command_buffer,
+                    &vk::DependencyInfo {
+                        dependency_flags: Default::default(),
+                        memory_barrier_count: global_memory_barrier.iter().len() as u32,
+                        p_memory_barriers: global_memory_barrier
+                            .as_ref()
+                            .map(|b| b as *const vk::MemoryBarrier2)
+                            .unwrap_or(ptr::null()),
+                        buffer_memory_barrier_count: 0,
+                        p_buffer_memory_barriers: ptr::null(),
+                        image_memory_barrier_count: image_barriers.len() as u32,
+                        p_image_memory_barriers: image_barriers.as_ptr(),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
+        self.tracked_writes = barrier.access.write_flags();
+    }
+
     /// Returns the device associated with this queue.
     pub fn device(&self) -> &Device {
         &self.device
@@ -386,7 +563,7 @@ impl CommandStream {
         }
     }
 
-    pub fn use_image(&mut self, image: &Image, access: ImageAccess) {
+    /*pub fn use_image(&mut self, image: &Image, access: ImageAccess) {
         self.reference_resource(image);
         let id = image.id();
         if let Some(entry) = self.tracked_images.get_mut(&id) {
@@ -406,7 +583,7 @@ impl CommandStream {
                     image: image.clone(),
                     handle: image.handle,
                     format: image.format,
-                    first_state: access,
+                    first_layout: access,
                     last_state: access,
                 },
             );
@@ -433,12 +610,12 @@ impl CommandStream {
                 },
             );
         }
-    }
+    }*/
 
-    pub fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
+    /*pub fn use_image_view(&mut self, image_view: &ImageView, state: ImageAccess) {
         self.reference_resource(image_view);
-        self.use_image(image_view.image(), state);
-    }
+        //self.use_image(image_view.image(), state);
+    }*/
 
     pub(crate) fn create_command_buffer_raw(&mut self) -> vk::CommandBuffer {
         let raw_device = self.device.raw();
@@ -496,12 +673,17 @@ impl CommandStream {
         }
     }
 
-    /// Emits all pending pipeline barriers to the current command buffer,
+    /*/// Emits all pending pipeline barriers to the current command buffer,
     /// and clears the list of pending barriers.
     ///
     /// This is typically called before a draw or dispatch command.
     pub(crate) fn flush_barriers(&mut self) {
-        if self.pending_image_barriers.is_empty() && self.pending_buffer_barriers.is_empty() {
+
+        /*if self.pending_image_barriers.is_empty() && self.pending_buffer_barriers.is_empty() {
+            return;
+        }*/
+
+        if self.pending_image_barriers.is_empty() && self.pending_barrier.dst_stage_mask == vk::PipelineStageFlags::NONE && self.pending_barrier.dst_access_mask == vk::AccessFlags::empty() {
             return;
         }
 
@@ -524,7 +706,7 @@ impl CommandStream {
         }
         self.pending_buffer_barriers.clear();
         self.pending_image_barriers.clear();
-    }
+    }*/
 
     /// Acquires the next image in a swapchain.
     pub unsafe fn acquire_next_swapchain_image(
@@ -593,8 +775,7 @@ impl CommandStream {
     }
 
     pub fn present(&mut self, swapchain_image: &SwapchainImage) -> VkResult<bool> {
-        self.use_image(&swapchain_image.image, ImageAccess::PRESENT);
-        self.flush_barriers();
+        self.barrier(Barrier::new().present(&swapchain_image.image));
 
         // Signal a semaphore when rendering is finished
         let render_finished = self.get_or_create_semaphore().0;
@@ -643,73 +824,94 @@ impl CommandStream {
 
         // Update the state of each resource used by the command buffer in the device tracker,
         // and insert pipeline barriers if necessary.
-        let mut buffer_barriers = Vec::new();
-        let mut image_barriers = Vec::new();
+        {
+            let (src_stage_mask, src_access_mask) = tracker.writes.to_vk_scope_flags();
+            let (dst_stage_mask, dst_access_mask) = self.initial_access.to_vk_scope_flags();
+            // TODO: verify that a barrier is necessary
+            let global_memory_barrier = Some(vk::MemoryBarrier2 {
+                src_stage_mask,
+                src_access_mask,
+                dst_stage_mask,
+                dst_access_mask,
+                ..Default::default()
+            });
 
-        for (_, state) in self.tracked_buffers.drain() {
-            let last_access = tracker
-                .buffers
-                .insert(state.buffer.id(), state.last_state)
-                .unwrap_or(BufferAccess::empty());
-            if last_access != state.first_state || !state.first_state.all_ordered() {
-                buffer_barriers.push(make_buffer_barrier(state.handle, last_access, state.first_state));
+            let mut image_barriers = Vec::new();
+            for (_, state) in self.tracked_images.drain() {
+                let prev_access = tracker
+                    .images
+                    .insert(state.image.id(), state.last_access)
+                    .unwrap_or(MemoryAccess::UNINITIALIZED); // if the image was not previously tracked, the contents are undefined
+                if prev_access != state.first_access {
+                    let format = state.image.format;
+                    image_barriers.push(vk::ImageMemoryBarrier2 {
+                        src_stage_mask,
+                        src_access_mask,
+                        dst_stage_mask,
+                        dst_access_mask,
+                        old_layout: prev_access.to_vk_image_layout(format),
+                        new_layout: state.first_access.to_vk_image_layout(format),
+                        image: state.image.handle,
+                        subresource_range: vk::ImageSubresourceRange {
+                            aspect_mask: aspects_for_format(format),
+                            base_mip_level: 0,
+                            level_count: vk::REMAINING_MIP_LEVELS,
+                            base_array_layer: 0,
+                            layer_count: vk::REMAINING_ARRAY_LAYERS,
+                        },
+                        ..Default::default()
+                    });
+                }
             }
-        }
 
-        for (_, state) in self.tracked_images.drain() {
-            let last_access = tracker
-                .images
-                .insert(state.image.id(), state.last_state)
-                .unwrap_or(ImageAccess::UNINITIALIZED);
-            if last_access != state.first_state || !state.first_state.all_ordered() {
-                image_barriers.push(make_image_barrier(
-                    state.handle,
-                    state.format,
-                    last_access,
-                    state.first_state,
-                ));
-            }
-        }
+            tracker.writes = self.tracked_writes;
+            self.tracked_writes = MemoryAccess::empty();
+            self.seen_initial_barrier = false;
 
-        // If we need a pipeline barrier before submitting the command buffers, we insert a "fixup" command buffer
-        // containing the pipeline barrier, before the others.
-        if !buffer_barriers.is_empty() || !image_barriers.is_empty() {
-            let fixup_command_buffer = self.command_pool.alloc(&self.device.raw());
-            unsafe {
-                self.device
-                    .begin_command_buffer(
+            // If we need a pipeline barrier before submitting the command buffers, we insert a "fixup" command buffer
+            // containing the pipeline barrier, before the others.
+            //if !buffer_barriers.is_empty() || !image_barriers.is_empty() {
+            if global_memory_barrier.is_some() || !image_barriers.is_empty() {
+                let fixup_command_buffer = self.command_pool.alloc(&self.device.raw());
+                unsafe {
+                    self.device
+                        .begin_command_buffer(
+                            fixup_command_buffer,
+                            &vk::CommandBufferBeginInfo {
+                                flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap();
+                    vk_ext_debug_utils().cmd_begin_debug_utils_label(
                         fixup_command_buffer,
-                        &vk::CommandBufferBeginInfo {
-                            flags: vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT,
+                        &vk::DebugUtilsLabelEXT {
+                            p_label_name: b"barrier fixup\0".as_ptr() as *const c_char,
+                            color: [0.0, 0.0, 0.0, 0.0],
                             ..Default::default()
                         },
-                    )
-                    .unwrap();
-                vk_ext_debug_utils().cmd_begin_debug_utils_label(
-                    fixup_command_buffer,
-                    &vk::DebugUtilsLabelEXT {
-                        p_label_name: b"barrier fixup\0".as_ptr() as *const c_char,
-                        color: [0.0, 0.0, 0.0, 0.0],
-                        ..Default::default()
-                    },
-                );
-                self.device.cmd_pipeline_barrier2(
-                    fixup_command_buffer,
-                    &vk::DependencyInfo {
-                        dependency_flags: Default::default(),
-                        memory_barrier_count: 0,
-                        p_memory_barriers: ptr::null(),
-                        buffer_memory_barrier_count: buffer_barriers.len() as u32,
-                        p_buffer_memory_barriers: buffer_barriers.as_ptr(),
-                        image_memory_barrier_count: image_barriers.len() as u32,
-                        p_image_memory_barriers: image_barriers.as_ptr(),
-                        ..Default::default()
-                    },
-                );
-                vk_ext_debug_utils().cmd_end_debug_utils_label(fixup_command_buffer);
-                self.device.end_command_buffer(fixup_command_buffer).unwrap();
+                    );
+                    self.device.cmd_pipeline_barrier2(
+                        fixup_command_buffer,
+                        &vk::DependencyInfo {
+                            dependency_flags: Default::default(),
+                            memory_barrier_count: global_memory_barrier.iter().len() as u32,
+                            p_memory_barriers: global_memory_barrier
+                                .as_ref()
+                                .map(|b| b as *const vk::MemoryBarrier2)
+                                .unwrap_or(ptr::null()),
+                            buffer_memory_barrier_count: 0,
+                            p_buffer_memory_barriers: ptr::null(),
+                            image_memory_barrier_count: image_barriers.len() as u32,
+                            p_image_memory_barriers: image_barriers.as_ptr(),
+                            ..Default::default()
+                        },
+                    );
+                    vk_ext_debug_utils().cmd_end_debug_utils_label(fixup_command_buffer);
+                    self.device.end_command_buffer(fixup_command_buffer).unwrap();
+                }
+                command_buffers.insert(0, fixup_command_buffer);
             }
-            command_buffers.insert(0, fixup_command_buffer);
         }
 
         // Build submission
@@ -831,7 +1033,7 @@ impl CommandStream {
 
         tracker.active_submissions.push_back(ActiveSubmission {
             index: self.submission_index,
-            queue: self.queue.index,
+            //queue: self.queue.index,
             command_pools: vec![retired_command_pool],
         });
 

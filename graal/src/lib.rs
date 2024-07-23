@@ -8,7 +8,6 @@ mod surface;
 mod types;
 pub mod util;
 
-use ash::vk::Handle;
 use std::{
     borrow::Cow,
     marker::PhantomData,
@@ -18,7 +17,7 @@ use std::{
     path::Path,
     ptr::NonNull,
     sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc,
     },
 };
@@ -44,22 +43,49 @@ pub use instance::*;
 pub use surface::*;
 pub use types::*;
 // proc-macros
-pub use graal_macros::{Arguments, Attachments, Vertex};
+pub use graal_macros::Vertex;
 
 pub mod prelude {
     pub use crate::{
         util::{CommandStreamExt, DeviceExt},
-        vk, Arguments, Attachments, Buffer, BufferUsage, ClearColorValue, ColorBlendEquation, ColorTargetState,
-        CommandStream, ComputeEncoder, DepthStencilState, Device, Format, FragmentState, GraphicsPipeline,
-        GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageType, ImageUsage, ImageView, MemoryLocation,
-        PipelineBindPoint, PipelineLayoutDescriptor, Point2D, PreRasterizationShaders, RasterizationState, Rect2D,
-        RenderEncoder, Sampler, SamplerCreateInfo, ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StencilState,
-        Vertex, VertexBufferDescriptor, VertexBufferLayoutDescription, VertexInputAttributeDescription,
-        VertexInputState,
+        vk, Buffer, BufferUsage, ClearColorValue, ColorBlendEquation, ColorTargetState, CommandStream, ComputeEncoder,
+        DepthStencilState, Device, Format, FragmentState, GraphicsPipeline, GraphicsPipelineCreateInfo, Image,
+        ImageCreateInfo, ImageType, ImageUsage, ImageView, MemoryLocation, PipelineBindPoint, PipelineLayoutDescriptor,
+        Point2D, PreRasterizationShaders, RasterizationState, Rect2D, RenderEncoder, Sampler, SamplerCreateInfo,
+        ShaderCode, ShaderEntryPoint, ShaderSource, Size2D, StencilState, Vertex, VertexBufferDescriptor,
+        VertexBufferLayoutDescription, VertexInputAttributeDescription, VertexInputState,
     };
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// Device address of a GPU buffer.
+#[derive(Copy, Clone, Debug, Ord, PartialOrd, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct DeviceAddressUntyped {
+    pub address: vk::DeviceAddress,
+}
+
+/// Device address of a GPU buffer with its associated type.
+///
+/// The type should be `T: Copy` for a buffer containing a single element of type T,
+/// or `[T] where T: Copy` for slices of elements of type T.
+#[repr(transparent)]
+pub struct DeviceAddress<T: ?Sized + 'static> {
+    pub address: vk::DeviceAddress,
+    pub _phantom: PhantomData<T>,
+}
+
+impl<T: ?Sized + 'static> Clone for DeviceAddress<T> {
+    fn clone(&self) -> Self {
+        DeviceAddress {
+            address: self.address,
+            _phantom: PhantomData,
+        }
+    }
+}
+
+impl<T: ?Sized + 'static> Copy for DeviceAddress<T> {}
 
 /// Represents a swap chain.
 #[derive(Debug)]
@@ -89,7 +115,7 @@ pub struct GraphicsPipeline {
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     // Push descriptors require live VkDescriptorSetLayouts (kill me already)
-    descriptor_set_layouts: Vec<DescriptorSetLayout>,
+    _descriptor_set_layouts: Vec<DescriptorSetLayout>,
 }
 
 impl GraphicsPipeline {
@@ -110,7 +136,7 @@ pub struct ComputePipeline {
     pub(crate) device: Device,
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
-    descriptor_set_layouts: Vec<DescriptorSetLayout>,
+    _descriptor_set_layouts: Vec<DescriptorSetLayout>,
 }
 
 impl ComputePipeline {
@@ -222,93 +248,6 @@ impl CommandPool {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-/*
-struct ResourceMapsWithAccess {
-    pub buffers: FxHashMap<BufferId, (Arc<BufferInner>, BufferAccess)>,
-    pub images: FxHashMap<ImageId, (Arc<ImageInner>, ImageAccess)>,
-    pub image_views: FxHashMap<ImageViewId, Arc<ImageViewInner>>,
-}
-
-impl ResourceMapsWithAccess {
-    fn new() -> Self {
-        Self {
-            buffers: FxHashMap::default(),
-            images: FxHashMap::default(),
-            image_views: FxHashMap::default(),
-        }
-    }
-}*/
-
-/*
-#[derive(Default)]
-struct ResourceMaps {
-    pub buffers: FxHashMap<BufferId, Arc<BufferInner>>,
-    pub images: FxHashMap<ImageId, Arc<ImageInner>>,
-    pub image_views: FxHashMap<ImageViewId, Arc<ImageViewInner>>,
-}
-
-impl ResourceMaps {
-    fn new() -> Self {
-        Self {
-            buffers: FxHashMap::default(),
-            images: FxHashMap::default(),
-            image_views: FxHashMap::default(),
-        }
-    }
-}
-
-impl ResourceMaps {
-    fn insert<R: Resource>(&mut self, resource: Arc<R>) {
-        R::insert(self, resource)
-    }
-}*/
-
-fn make_buffer_barrier(buffer: vk::Buffer, src: BufferAccess, dst: BufferAccess) -> vk::BufferMemoryBarrier2 {
-    let (src_stage_mask, src_access_mask) = map_buffer_access_to_barrier(src);
-    let (dst_stage_mask, dst_access_mask) = map_buffer_access_to_barrier(dst);
-    vk::BufferMemoryBarrier2 {
-        src_stage_mask,
-        src_access_mask,
-        dst_stage_mask,
-        dst_access_mask,
-        buffer,
-        offset: 0,
-        size: vk::WHOLE_SIZE,
-        ..Default::default()
-    }
-}
-
-fn make_image_barrier(
-    image: vk::Image,
-    format: vk::Format,
-    src: ImageAccess,
-    dst: ImageAccess,
-) -> vk::ImageMemoryBarrier2 {
-    let (src_stage_mask, src_access_mask) = map_image_access_to_barrier(src);
-    let (dst_stage_mask, dst_access_mask) = map_image_access_to_barrier(dst);
-
-    let src_layout = map_image_access_to_layout(src, format);
-    let dst_layout = map_image_access_to_layout(dst, format);
-
-    vk::ImageMemoryBarrier2 {
-        src_stage_mask,
-        src_access_mask,
-        dst_stage_mask,
-        dst_access_mask,
-        old_layout: src_layout,
-        new_layout: dst_layout,
-        image,
-        subresource_range: vk::ImageSubresourceRange {
-            aspect_mask: aspects_for_format(format),
-            base_mip_level: 0,
-            level_count: vk::REMAINING_MIP_LEVELS,
-            base_array_layer: 0,
-            layer_count: vk::REMAINING_ARRAY_LAYERS,
-        },
-        ..Default::default()
-    }
-}
-
 pub trait GpuResource {
     fn set_last_submission_index(&self, submission_index: u64);
 }
@@ -317,11 +256,9 @@ pub trait GpuResource {
 struct BufferInner {
     device: Device,
     id: BufferId,
-    /// Number of user references to this image (via `graal::Image`)
-    user_ref_count: AtomicU32,
+    memory_location: MemoryLocation,
     last_submission_index: AtomicU64,
     allocation: ResourceAllocation,
-    group: Option<GroupId>,
     handle: vk::Buffer,
     device_address: vk::DeviceAddress,
 }
@@ -382,8 +319,10 @@ impl BufferUntyped {
         }
     }
 
-    pub fn device_address(&self) -> vk::DeviceAddress {
-        self.inner.as_ref().unwrap().device_address
+    pub fn device_address(&self) -> DeviceAddressUntyped {
+        DeviceAddressUntyped {
+            address: self.inner.as_ref().unwrap().device_address,
+        }
     }
 
     pub(crate) fn id(&self) -> BufferId {
@@ -398,6 +337,11 @@ impl BufferUntyped {
     /// Returns the usage flags of the buffer.
     pub fn usage(&self) -> BufferUsage {
         self.usage
+    }
+
+    /// Returns the buffer's memory location.
+    pub fn memory_location(&self) -> MemoryLocation {
+        self.inner.as_ref().unwrap().memory_location
     }
 
     /// Returns the buffer handle.
@@ -433,9 +377,7 @@ struct ImageInner {
     //user_ref_count: AtomicU32,
     last_submission_index: AtomicU64,
     allocation: ResourceAllocation,
-    group: Option<GroupId>,
     handle: vk::Image,
-    format: vk::Format,
     swapchain_image: bool,
 }
 
@@ -596,11 +538,8 @@ impl Drop for ImageViewInner {
 #[derive(Clone, Debug)]
 pub struct ImageView {
     inner: Option<Arc<ImageViewInner>>,
-    image: ImageId,
-    image_handle: vk::Image,
     handle: vk::ImageView,
     format: Format,
-    original_format: Format,
     size: Size3D,
 }
 
@@ -660,18 +599,6 @@ impl ImageView {
         self.inner.as_ref().unwrap().id
     }
 
-    pub(crate) fn image_handle(&self) -> vk::Image {
-        self.image_handle
-    }
-
-    pub(crate) fn original_format(&self) -> vk::Format {
-        self.original_format
-    }
-
-    pub(crate) fn image_id(&self) -> ImageId {
-        self.image.clone()
-    }
-
     pub fn texture_descriptor(&self, layout: vk::ImageLayout) -> Descriptor {
         Descriptor::SampledImage {
             image_view: self.clone(),
@@ -709,6 +636,7 @@ impl Drop for DescriptorSetLayout {
     }
 }
 
+/*
 /// Self-contained descriptor set.
 pub struct DescriptorSet {
     device: Device,
@@ -745,7 +673,7 @@ impl Drop for DescriptorSet {
                 });
         }
     }
-}
+}*/
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -865,6 +793,10 @@ impl<T: ?Sized> Buffer<T> {
         self.untyped.usage()
     }
 
+    pub fn memory_location(&self) -> MemoryLocation {
+        self.untyped.memory_location()
+    }
+
     /// Returns the buffer handle.
     pub fn handle(&self) -> vk::Buffer {
         self.untyped.handle()
@@ -873,6 +805,15 @@ impl<T: ?Sized> Buffer<T> {
     /// Returns the device on which the buffer was created.
     pub fn device(&self) -> &Device {
         self.untyped.device()
+    }
+}
+
+impl<T: Copy + 'static> Buffer<T> {
+    pub fn device_address(&self) -> DeviceAddress<T> {
+        DeviceAddress {
+            address: self.untyped.device_address().address,
+            _phantom: PhantomData,
+        }
     }
 }
 
@@ -885,6 +826,13 @@ impl<T> Buffer<[T]> {
     /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
     pub fn mapped_data(&self) -> Option<*mut T> {
         self.untyped.mapped_data().map(|ptr| ptr as *mut T)
+    }
+
+    pub fn device_address(&self) -> DeviceAddress<[T]> {
+        DeviceAddress {
+            address: self.untyped.device_address().address,
+            _phantom: PhantomData,
+        }
     }
 
     /// Element range.
@@ -1005,60 +953,68 @@ impl<T> BufferRange<[T]> {
 
 /// Describes a color, depth, or stencil attachment.
 #[derive(Clone)]
-pub struct ColorAttachment {
-    pub image_view: ImageView,
+pub struct ColorAttachment<'a> {
+    pub image_view: &'a ImageView,
+    pub clear_value: Option<[f64; 4]>,
+    /*pub image_view: ImageView,
     pub load_op: vk::AttachmentLoadOp,
     pub store_op: vk::AttachmentStoreOp,
-    pub clear_value: [f64; 4],
+    pub clear_value: [f64; 4],*/
 }
 
-impl ColorAttachment {
+impl ColorAttachment<'_> {
     pub(crate) fn get_vk_clear_color_value(&self) -> vk::ClearColorValue {
-        match format_numeric_type(self.image_view.format) {
-            FormatNumericType::UInt => vk::ClearColorValue {
-                uint32: [
-                    self.clear_value[0] as u32,
-                    self.clear_value[1] as u32,
-                    self.clear_value[2] as u32,
-                    self.clear_value[3] as u32,
-                ],
-            },
-            FormatNumericType::SInt => vk::ClearColorValue {
-                int32: [
-                    self.clear_value[0] as i32,
-                    self.clear_value[1] as i32,
-                    self.clear_value[2] as i32,
-                    self.clear_value[3] as i32,
-                ],
-            },
-            FormatNumericType::Float => vk::ClearColorValue {
-                float32: [
-                    self.clear_value[0] as f32,
-                    self.clear_value[1] as f32,
-                    self.clear_value[2] as f32,
-                    self.clear_value[3] as f32,
-                ],
-            },
+        if let Some(clear_value) = self.clear_value {
+            match format_numeric_type(self.image_view.format) {
+                FormatNumericType::UInt => vk::ClearColorValue {
+                    uint32: [
+                        clear_value[0] as u32,
+                        clear_value[1] as u32,
+                        clear_value[2] as u32,
+                        clear_value[3] as u32,
+                    ],
+                },
+                FormatNumericType::SInt => vk::ClearColorValue {
+                    int32: [
+                        clear_value[0] as i32,
+                        clear_value[1] as i32,
+                        clear_value[2] as i32,
+                        clear_value[3] as i32,
+                    ],
+                },
+                FormatNumericType::Float => vk::ClearColorValue {
+                    float32: [
+                        clear_value[0] as f32,
+                        clear_value[1] as f32,
+                        clear_value[2] as f32,
+                        clear_value[3] as f32,
+                    ],
+                },
+            }
+        } else {
+            vk::ClearColorValue::default()
         }
     }
 }
 
 #[derive(Clone)]
-pub struct DepthStencilAttachment {
-    pub image_view: ImageView,
-    pub depth_load_op: vk::AttachmentLoadOp,
+pub struct DepthStencilAttachment<'a> {
+    pub image_view: &'a ImageView,
+    pub depth_clear_value: Option<f64>,
+    pub stencil_clear_value: Option<u32>,
+    /*pub depth_load_op: vk::AttachmentLoadOp,
     pub depth_store_op: vk::AttachmentStoreOp,
     pub stencil_load_op: vk::AttachmentLoadOp,
     pub stencil_store_op: vk::AttachmentStoreOp,
     pub depth_clear_value: f64,
-    pub stencil_clear_value: u32,
+    pub stencil_clear_value: u32,*/
 }
 
-impl DepthStencilAttachment {
+impl DepthStencilAttachment<'_> {
     pub(crate) fn get_vk_clear_depth_stencil_value(&self) -> vk::ClearDepthStencilValue {
         vk::ClearDepthStencilValue {
-            depth: self.depth_clear_value as f32,
-            stencil: self.stencil_clear_value,
+            depth: self.depth_clear_value.unwrap_or(0.0) as f32,
+            stencil: self.stencil_clear_value.unwrap_or(0),
         }
     }
 }
@@ -1269,22 +1225,6 @@ macro_rules! graphics_pipeline_interface {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-fn is_write_access(mask: vk::AccessFlags2) -> bool {
-    // TODO: this is not exhaustive
-    mask.intersects(
-        vk::AccessFlags2::SHADER_WRITE
-            | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE
-            | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE
-            | vk::AccessFlags2::TRANSFER_WRITE
-            | vk::AccessFlags2::HOST_WRITE
-            | vk::AccessFlags2::MEMORY_WRITE
-            | vk::AccessFlags2::TRANSFORM_FEEDBACK_WRITE_EXT
-            | vk::AccessFlags2::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT
-            | vk::AccessFlags2::ACCELERATION_STRUCTURE_WRITE_KHR
-            | vk::AccessFlags2::COMMAND_PREPROCESS_WRITE_NV,
-    )
-}
-
 /// Computes the number of mip levels for a 2D image of the given size.
 ///
 /// # Examples
@@ -1302,19 +1242,19 @@ pub fn mip_level_count(width: u32, height: u32) -> u32 {
 pub fn is_depth_and_stencil_format(fmt: vk::Format) -> bool {
     matches!(
         fmt,
-        vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT
+        Format::D16_UNORM_S8_UINT | Format::D24_UNORM_S8_UINT | Format::D32_SFLOAT_S8_UINT
     )
 }
 
 pub fn is_depth_only_format(fmt: vk::Format) -> bool {
     matches!(
         fmt,
-        vk::Format::D16_UNORM | vk::Format::X8_D24_UNORM_PACK32 | vk::Format::D32_SFLOAT
+        Format::D16_UNORM | Format::X8_D24_UNORM_PACK32 | Format::D32_SFLOAT
     )
 }
 
 pub fn is_stencil_only_format(fmt: vk::Format) -> bool {
-    matches!(fmt, vk::Format::S8_UINT)
+    matches!(fmt, Format::S8_UINT)
 }
 
 pub fn aspects_for_format(fmt: vk::Format) -> vk::ImageAspectFlags {
@@ -1390,6 +1330,7 @@ pub fn format_numeric_type(fmt: vk::Format) -> FormatNumericType {
     }
 }
 
+/*
 fn map_buffer_access_to_barrier(state: BufferAccess) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
     let mut stages = vk::PipelineStageFlags2::empty();
     let mut access = vk::AccessFlags2::empty();
@@ -1507,7 +1448,7 @@ fn map_image_access_to_layout(access: ImageAccess, format: Format) -> vk::ImageL
             }
         }
     }
-}
+}*/
 
 // Implementation detail of the VertexInput macro
 #[doc(hidden)]

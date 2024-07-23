@@ -1,7 +1,6 @@
 //! Abstractions over a vulkan device & queues.
 use std::{
     borrow::Cow,
-    cell::Cell,
     collections::{HashMap, VecDeque},
     ffi::{c_char, c_void, CString},
     fmt,
@@ -14,21 +13,17 @@ use std::{
 use crate::{
     compile_shader, get_vulkan_entry, get_vulkan_instance,
     instance::{vk_ext_debug_utils, vk_khr_surface},
-    is_depth_and_stencil_format, is_write_access, platform_impl, BufferAccess, BufferInner, BufferUntyped, BufferUsage,
-    CommandPool, CommandStream, ComputePipeline, ComputePipelineCreateInfo, DescriptorSetLayout, Error,
-    GraphicsPipeline, GraphicsPipelineCreateInfo, Image, ImageAccess, ImageCreateInfo, ImageInner, ImageType,
-    ImageUsage, ImageView, ImageViewInfo, ImageViewInner, MemoryLocation, PreRasterizationShaders, Sampler,
-    SamplerCreateInfo, ShaderCode, ShaderStage, Size3D, Swapchain,
+    is_depth_and_stencil_format, platform_impl, BufferInner, BufferUntyped, BufferUsage, CommandPool, CommandStream,
+    ComputePipeline, ComputePipelineCreateInfo, DescriptorSetLayout, Error, GraphicsPipeline,
+    GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageInner, ImageType, ImageUsage, ImageView, ImageViewInfo,
+    ImageViewInner, MemoryAccess, MemoryLocation, PreRasterizationShaders, Sampler, SamplerCreateInfo, ShaderCode,
+    ShaderStage, Size3D, Swapchain,
 };
 
 use ash::vk;
 use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 use slotmap::{SecondaryMap, SlotMap};
-use std::{
-    ffi::CStr,
-    mem,
-    sync::atomic::{AtomicU32, AtomicU64},
-};
+use std::{ffi::CStr, mem, sync::atomic::AtomicU64};
 use tracing::{debug, error};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -74,24 +69,22 @@ impl fmt::Debug for WeakDevice {
 //////////////////////////////////////////////////////////////////////////////////////////////////////
 pub(crate) struct ActiveSubmission {
     pub index: u64,
-    pub queue: u32,
+    //pub queue: u32,
     pub command_pools: Vec<CommandPool>,
 }
 
 pub(crate) struct DeviceTracker {
     pub active_submissions: VecDeque<ActiveSubmission>,
-    pub buffers: SecondaryMap<BufferId, BufferAccess>,
-    pub images: SecondaryMap<ImageId, ImageAccess>,
+    pub writes: MemoryAccess,
+    pub images: SecondaryMap<ImageId, MemoryAccess>,
 }
 
 impl DeviceTracker {
     fn new() -> DeviceTracker {
         DeviceTracker {
             active_submissions: VecDeque::new(),
-            buffers: SecondaryMap::new(),
+            writes: MemoryAccess::empty(),
             images: SecondaryMap::new(),
-            //retired_command_pools: Vec::new(),
-            //free_command_pools: Vec::new(),
         }
     }
 }
@@ -121,7 +114,7 @@ pub(crate) struct DeviceInner {
     device: ash::Device,
 
     /// Platform-specific extension functions
-    platform_extensions: platform_impl::PlatformExtensions,
+    _platform_extensions: platform_impl::PlatformExtensions,
     physical_device: vk::PhysicalDevice,
     queues: Vec<Arc<QueueShared>>,
     allocator: Mutex<gpu_allocator::vulkan::Allocator>,
@@ -133,26 +126,27 @@ pub(crate) struct DeviceInner {
     //vk_ext_descriptor_buffer: ash::extensions::ext::DescriptorBuffer,
 
     // physical device properties
-    physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
-    physical_device_descriptor_buffer_properties: vk::PhysicalDeviceDescriptorBufferPropertiesEXT,
+    _physical_device_memory_properties: vk::PhysicalDeviceMemoryProperties,
+    _physical_device_descriptor_buffer_properties: vk::PhysicalDeviceDescriptorBufferPropertiesEXT,
     physical_device_properties: vk::PhysicalDeviceProperties2,
 
     // We don't need to hold strong refs here, we just need an ID for them.
     pub(crate) image_ids: Mutex<SlotMap<ImageId, ()>>,
     pub(crate) buffer_ids: Mutex<SlotMap<BufferId, ()>>,
     pub(crate) image_view_ids: Mutex<SlotMap<ImageViewId, ()>>,
-    groups: Mutex<ResourceGroupMap>,
+
     // Command pools per queue and thread.
     free_command_pools: Mutex<Vec<CommandPool>>,
-
     next_submission_index: AtomicU64,
     /// Resources that have a zero user reference count and that should be ready for deletion soon,
     /// but we're waiting for the GPU to finish using them.
     dropped_resources: Mutex<Vec<(u64, Box<dyn DeleteLater>)>>,
     pub(crate) tracker: Mutex<DeviceTracker>,
-
     sampler_cache: Mutex<HashMap<SamplerCreateInfo, Sampler>>,
-    compiler: shaderc::Compiler,
+    //compiler: shaderc::Compiler,
+    //groups: Mutex<ResourceGroupMap>,
+
+    //image_handles: Mutex<SlotMap<I>>
 }
 /// Errors during device creation.
 #[derive(thiserror::Error, Debug)]
@@ -170,23 +164,10 @@ pub struct QueueFamilyConfig {
 pub(crate) struct QueueShared {
     /// Family index.
     pub family: u32,
-    /// Index within queues of the same family (see vkGetDeviceQueue).
-    pub index_in_family: u32,
-    pub index: u32,
+    //pub index_in_family: u32,
+    //pub index: u32,
     pub queue: vk::Queue,
     pub timeline: vk::Semaphore,
-}
-
-pub(crate) struct ResourceGroup {
-    // The timeline values that a pass needs to wait for to ensure an execution dependency between the pass
-    // and all writers of the resources in the group.
-    //pub(crate) wait: TimelineValues,
-    // ignored if waiting on multiple queues
-    pub(crate) src_stage_mask: vk::PipelineStageFlags2,
-    pub(crate) dst_stage_mask: vk::PipelineStageFlags2,
-    // ignored if waiting on multiple queues
-    pub(crate) src_access_mask: vk::AccessFlags2,
-    pub(crate) dst_access_mask: vk::AccessFlags2,
 }
 
 pub(crate) fn get_vk_sample_count(count: u32) -> vk::SampleCountFlags {
@@ -231,12 +212,6 @@ pub enum ResourceAllocation {
     External,
 }
 
-impl ResourceAllocation {
-    fn is_external(&self) -> bool {
-        matches!(self, ResourceAllocation::External)
-    }
-}
-
 /// Chooses a swapchain surface format among a list of supported formats.
 ///
 /// TODO there's only one supported format right now...
@@ -260,8 +235,6 @@ pub unsafe fn create_device_and_command_stream(
     let command_stream = device.create_command_stream(0);
     Ok((device, command_stream))
 }
-
-type ResourceGroupMap = SlotMap<GroupId, ResourceGroup>;
 
 struct PhysicalDeviceAndProperties {
     physical_device: vk::PhysicalDevice,
@@ -375,17 +348,16 @@ unsafe fn find_queue_family(
 
 const DEVICE_EXTENSIONS: &[&str] = &[
     "VK_KHR_swapchain",
-    //"VK_KHR_dynamic_rendering",   // promoted to core in 1.3
     "VK_KHR_push_descriptor",
     "VK_EXT_extended_dynamic_state3",
-    "VK_EXT_line_rasterization",
     "VK_EXT_mesh_shader",
     "VK_EXT_conservative_rasterization",
-    "VK_EXT_fragment_shader_interlock", //"VK_EXT_descriptor_buffer",
+    "VK_EXT_fragment_shader_interlock",
+    //"VK_EXT_descriptor_buffer",
 ];
 
 impl Device {
-    fn find_compatible_memory_type_internal(
+    /*fn find_compatible_memory_type_internal(
         &self,
         memory_type_bits: u32,
         memory_properties: vk::MemoryPropertyFlags,
@@ -400,8 +372,9 @@ impl Device {
             }
         }
         None
-    }
+    }*/
 
+    /*
     /// Returns the index of the first memory type compatible with the specified memory type bitmask and additional memory property flags.
     pub(crate) fn find_compatible_memory_type(
         &self,
@@ -415,7 +388,7 @@ impl Device {
             required_memory_properties | preferred_memory_properties,
         )
         .or_else(|| self.find_compatible_memory_type_internal(memory_type_bits, required_memory_properties))
-    }
+    }*/
 
     /*/// Returns whether this device is compatible for presentation on the specified surface.
     ///
@@ -457,11 +430,11 @@ impl Device {
                     .create_semaphore(&semaphore_create_info, None)
                     .expect("failed to queue timeline semaphore");
 
-                let global_index = queues.len() as u32;
+                //let global_index = queues.len() as u32;
                 queues.push(Arc::new(QueueShared {
                     family: cfg.family_index,
-                    index_in_family: i,
-                    index: global_index,
+                    //index_in_family: i,
+                    //index: global_index,
                     queue,
                     timeline,
                 }));
@@ -501,16 +474,16 @@ impl Device {
         instance.get_physical_device_properties2(physical_device, &mut physical_device_properties);
 
         // Create the shader compiler instance
-        let compiler = shaderc::Compiler::new().expect("failed to create the shader compiler");
+        //let compiler = shaderc::Compiler::new().expect("failed to create the shader compiler");
 
         Ok(Device {
             inner: Rc::new(DeviceInner {
                 device,
-                platform_extensions,
+                _platform_extensions: platform_extensions,
                 physical_device,
                 physical_device_properties,
-                physical_device_descriptor_buffer_properties,
-                physical_device_memory_properties,
+                _physical_device_descriptor_buffer_properties: physical_device_descriptor_buffer_properties,
+                _physical_device_memory_properties: physical_device_memory_properties,
                 queues,
                 allocator: Mutex::new(allocator),
                 vk_khr_swapchain,
@@ -523,8 +496,7 @@ impl Device {
                 buffer_ids: Mutex::new(Default::default()),
                 tracker: Mutex::new(DeviceTracker::new()),
                 sampler_cache: Mutex::new(Default::default()),
-                compiler,
-                groups: Mutex::new(Default::default()),
+                //compiler,
                 free_command_pools: Mutex::new(Default::default()),
                 image_view_ids: Mutex::new(Default::default()),
                 dropped_resources: Mutex::new(vec![]),
@@ -620,16 +592,8 @@ impl Device {
             ..Default::default()
         };
 
-        let mut line_rasterization_features = vk::PhysicalDeviceLineRasterizationFeaturesEXT {
-            p_next: &mut ext_dynamic_state as *mut _ as *mut c_void,
-            bresenham_lines: vk::TRUE,
-            smooth_lines: vk::TRUE,
-            rectangular_lines: vk::TRUE,
-            ..Default::default()
-        };
-
         let mut vk13_features = vk::PhysicalDeviceVulkan13Features {
-            p_next: &mut line_rasterization_features as *mut _ as *mut c_void,
+            p_next: &mut ext_dynamic_state as *mut _ as *mut c_void,
             synchronization2: vk::TRUE,
             dynamic_rendering: vk::TRUE,
             ..Default::default()
@@ -747,6 +711,10 @@ impl Device {
         &self.inner.vk_ext_mesh_shader
     }
 
+    pub fn ext_shader_object(&self) -> &ash::extensions::ext::ShaderObject {
+        &self.inner.vk_ext_shader_object
+    }
+
     /*pub fn ext_descriptor_buffer(&self) -> &ash::extensions::ext::DescriptorBuffer {
         &self.inner.vk_ext_descriptor_buffer
     }*/
@@ -844,11 +812,10 @@ impl Device {
             inner: Some(Arc::new(BufferInner {
                 device: self.clone(),
                 id,
-                user_ref_count: AtomicU32::new(1),
                 last_submission_index: AtomicU64::new(0),
                 allocation,
-                group: None,
                 handle,
+                memory_location,
                 device_address,
             })),
             handle,
@@ -899,10 +866,8 @@ impl Device {
                 id,
                 last_submission_index: AtomicU64::new(0),
                 allocation: ResourceAllocation::External,
-                group: None,
                 handle,
                 swapchain_image: true,
-                format,
             })),
             handle,
             usage: ImageUsage::TRANSFER_DST | ImageUsage::COLOR_ATTACHMENT,
@@ -988,10 +953,8 @@ impl Device {
                 id,
                 last_submission_index: AtomicU64::new(0),
                 allocation: ResourceAllocation::Allocation { allocation },
-                group: None,
                 handle,
                 swapchain_image: false,
-                format: image_info.format,
             })),
             usage: image_info.usage,
             type_: image_info.type_,
@@ -1048,11 +1011,8 @@ impl Device {
                 handle,
                 last_submission_index: AtomicU64::new(0),
             })),
-            image: image.id(),
             handle,
-            image_handle: image.handle,
             format: info.format,
-            original_format: image.format,
             // TODO: size of mip level
             size: image.size,
         }
@@ -1062,7 +1022,7 @@ impl Device {
     // RESOURCE GROUPS
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
-    /// Creates a resource group.
+    /*/// Creates a resource group.
     ///
     /// Resource group hold a set of static resources that can be synchronized with as a group.
     /// This is useful for large sets of long-lived static resources, like texture maps,
@@ -1081,12 +1041,7 @@ impl Device {
             src_access_mask: Default::default(),
             dst_access_mask,
         })
-    }
-
-    /// Destroys a resource group.
-    pub fn destroy_resource_group(&self, group_id: GroupId) {
-        self.inner.groups.lock().unwrap().remove(group_id);
-    }
+    }*/
 
     pub fn delete_later<T: 'static>(&self, submission_index: u64, object: T) {
         let queue_timeline = self.inner.queues[0].timeline;
@@ -1465,7 +1420,7 @@ impl Device {
             device: self.clone(),
             pipeline,
             pipeline_layout,
-            descriptor_set_layouts: create_info.set_layouts.to_vec(),
+            _descriptor_set_layouts: create_info.set_layouts.to_vec(),
         })
     }
 
@@ -1795,7 +1750,7 @@ impl Device {
             device: self.clone(),
             pipeline,
             pipeline_layout,
-            descriptor_set_layouts: create_info.set_layouts.to_vec(),
+            _descriptor_set_layouts: create_info.set_layouts.to_vec(),
         })
     }
 }

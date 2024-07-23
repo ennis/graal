@@ -1,7 +1,7 @@
 use std::{borrow::Cow, path::Path};
 
 // TODO: eventually all vk types should disappear from the public API
-use crate::ShaderEntryPoint;
+use crate::{aspects_for_format, ShaderEntryPoint};
 use ash::vk;
 use bitflags::bitflags;
 use gpu_allocator::MemoryLocation;
@@ -56,6 +56,167 @@ pub struct ImageViewInfo {
     pub format: vk::Format,
     pub subresource_range: ImageSubresourceRange,
     pub component_mapping: [vk::ComponentSwizzle; 4],
+}
+
+bitflags! {
+    /// NOTE: if you modify this, also update `graal-macros/argument.rs`, it uses the raw values.
+    #[derive(Copy,Clone,Debug,PartialEq,Eq,Hash)]
+    pub struct MemoryAccess: u64 {
+        const UNINITIALIZED = 1 << 0;
+        const TRANSFER_READ = 1 << 1;
+        const TRANSFER_WRITE = 1 << 2;
+        const INDEX_READ = 1 << 3;
+        const VERTEX_READ = 1 << 4;
+        const UNIFORM_READ = 1 << 5;
+        const INDIRECT_READ = 1 << 6;
+        const MAP_READ = 1 << 7;
+        const MAP_WRITE = 1 << 8;
+        const SHADER_STORAGE_READ = 1 << 9;
+        const SHADER_STORAGE_WRITE = 1 << 10;
+        const SAMPLED_READ = 1 << 11;
+        //const COLOR_ATTACHMENT_READ = 1 << 12;
+        const COLOR_ATTACHMENT_WRITE = 1 << 13;
+        const DEPTH_STENCIL_ATTACHMENT_READ = 1 << 14;
+        const DEPTH_STENCIL_ATTACHMENT_WRITE = 1 << 15;
+        const PRESENT = 1 << 16;
+
+        // Stage flags
+        const VERTEX_SHADER = 1 << 20;
+        const COMPUTE_SHADER = 1 << 21;
+        const FRAGMENT_SHADER = 1 << 22;
+        const MESH_SHADER = 1 << 23;
+        const TASK_SHADER = 1 << 24;
+        const ALL_STAGES = Self::STAGE_FLAGS.bits();
+
+        const WRITE_FLAGS = Self::TRANSFER_WRITE.bits()
+            | Self::COLOR_ATTACHMENT_WRITE.bits()
+            | Self::DEPTH_STENCIL_ATTACHMENT_WRITE.bits()
+            | Self::SHADER_STORAGE_WRITE.bits();
+
+        const STAGE_FLAGS = Self::VERTEX_SHADER.bits()
+            | Self::COMPUTE_SHADER.bits()
+            | Self::FRAGMENT_SHADER.bits()
+            | Self::MESH_SHADER.bits()
+            | Self::TASK_SHADER.bits();
+    }
+}
+
+impl MemoryAccess {
+    pub(crate) fn scope_flags(self) -> MemoryAccess {
+        self.difference(MemoryAccess::STAGE_FLAGS)
+    }
+
+    pub(crate) fn write_flags(self) -> MemoryAccess {
+        self.intersection(MemoryAccess::WRITE_FLAGS | MemoryAccess::STAGE_FLAGS)
+    }
+
+    pub(crate) fn to_vk_scope_flags(self) -> (vk::PipelineStageFlags2, vk::AccessFlags2) {
+        let mut stages = vk::PipelineStageFlags2::empty();
+        let mut access = vk::AccessFlags2::empty();
+
+        if self.contains(MemoryAccess::TRANSFER_READ) {
+            stages |= vk::PipelineStageFlags2::TRANSFER;
+            access |= vk::AccessFlags2::TRANSFER_READ;
+        }
+        if self.contains(MemoryAccess::TRANSFER_WRITE) {
+            stages |= vk::PipelineStageFlags2::TRANSFER;
+            access |= vk::AccessFlags2::TRANSFER_WRITE;
+        }
+        if self.contains(MemoryAccess::INDEX_READ) {
+            stages |= vk::PipelineStageFlags2::VERTEX_INPUT;
+            access |= vk::AccessFlags2::INDEX_READ;
+        }
+        if self.contains(MemoryAccess::VERTEX_READ) {
+            stages |= vk::PipelineStageFlags2::VERTEX_INPUT;
+            access |= vk::AccessFlags2::VERTEX_ATTRIBUTE_READ;
+        }
+        if self.contains(MemoryAccess::UNIFORM_READ) {
+            access |= vk::AccessFlags2::UNIFORM_READ;
+        }
+
+        if self.contains(MemoryAccess::INDIRECT_READ) {
+            stages |= vk::PipelineStageFlags2::DRAW_INDIRECT;
+            access |= vk::AccessFlags2::INDIRECT_COMMAND_READ;
+        }
+
+        if self.contains(MemoryAccess::SAMPLED_READ) {
+            access |= vk::AccessFlags2::SHADER_SAMPLED_READ;
+        }
+
+        if self.contains(MemoryAccess::COLOR_ATTACHMENT_WRITE) {
+            stages |= vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT;
+            access |= vk::AccessFlags2::COLOR_ATTACHMENT_READ | vk::AccessFlags2::COLOR_ATTACHMENT_WRITE;
+        }
+
+        if self.contains(MemoryAccess::DEPTH_STENCIL_ATTACHMENT_READ) {
+            stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+            access |= vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ;
+        }
+
+        if self.contains(MemoryAccess::DEPTH_STENCIL_ATTACHMENT_WRITE) {
+            stages |= vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS;
+            access |=
+                vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_READ | vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE;
+        }
+
+        if self.contains(MemoryAccess::SHADER_STORAGE_READ) {
+            access |= vk::AccessFlags2::SHADER_STORAGE_READ;
+        }
+
+        if self.contains(MemoryAccess::SHADER_STORAGE_WRITE) {
+            access |= vk::AccessFlags2::SHADER_STORAGE_WRITE;
+        }
+
+        if self.contains(MemoryAccess::VERTEX_SHADER) {
+            stages |= vk::PipelineStageFlags2::VERTEX_SHADER;
+        }
+
+        if self.contains(MemoryAccess::FRAGMENT_SHADER) {
+            stages |= vk::PipelineStageFlags2::FRAGMENT_SHADER;
+        }
+
+        if self.contains(MemoryAccess::COMPUTE_SHADER) {
+            stages |= vk::PipelineStageFlags2::COMPUTE_SHADER;
+        }
+
+        if self.contains(MemoryAccess::MESH_SHADER) {
+            stages |= vk::PipelineStageFlags2::MESH_SHADER_EXT;
+        }
+
+        if self.contains(MemoryAccess::TASK_SHADER) {
+            stages |= vk::PipelineStageFlags2::TASK_SHADER_EXT;
+        }
+
+        if self.contains(MemoryAccess::PRESENT) {
+            (vk::PipelineStageFlags2::TOP_OF_PIPE, vk::AccessFlags2::empty())
+        } else {
+            (stages, access)
+        }
+    }
+
+    pub(crate) fn to_vk_image_layout(self, format: Format) -> vk::ImageLayout {
+        let is_color = aspects_for_format(format).contains(vk::ImageAspectFlags::COLOR);
+
+        match self.scope_flags() {
+            MemoryAccess::UNINITIALIZED => vk::ImageLayout::UNDEFINED,
+            MemoryAccess::TRANSFER_READ => vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+            MemoryAccess::TRANSFER_WRITE => vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            MemoryAccess::SAMPLED_READ if is_color => vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+            MemoryAccess::COLOR_ATTACHMENT_WRITE => vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+            MemoryAccess::DEPTH_STENCIL_ATTACHMENT_READ | MemoryAccess::DEPTH_STENCIL_ATTACHMENT_WRITE => {
+                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+            }
+            _ => {
+                if self == MemoryAccess::PRESENT {
+                    vk::ImageLayout::PRESENT_SRC_KHR
+                } else if is_color {
+                    vk::ImageLayout::GENERAL
+                } else {
+                    vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL
+                }
+            }
+        }
+    }
 }
 
 bitflags! {
@@ -837,6 +998,7 @@ impl_vertex_attr!([i8; 4], R8G8B8A8_SINT);
 
 // Vertex types from glam --------------------------------------------------------------------------
 
+/*
 #[cfg(feature = "graal-glam")]
 impl_vertex_attr!(
     glam::Vec2,
@@ -866,6 +1028,7 @@ impl_vertex_attr!(
     },
     R32G32B32A32_SFLOAT
 );
+*/
 
 // Index data types --------------------------------------------------------------------------------
 macro_rules! impl_index_data {
