@@ -18,7 +18,7 @@ use crate::{
     aspects_for_format,
     device::{ActiveSubmission, QueueShared},
     vk, vk_ext_debug_utils, BufferAccess, BufferUntyped, CommandPool, Descriptor, Device, GpuResource, Image,
-    ImageAccess, ImageId, ImageView, ImageViewId, MemoryAccess, Swapchain, SwapchainImage,
+    ImageAccess, ImageId, MemoryAccess, Swapchain, SwapchainImage,
 };
 
 mod blit;
@@ -147,8 +147,7 @@ pub struct CommandStream {
     // Buffer writes that need to be made available
     tracked_writes: MemoryAccess,
     tracked_images: FxHashMap<ImageId, CommandBufferImageState>,
-    pub(crate) tracked_image_views: FxHashMap<ImageViewId, ImageView>,
-
+    //pub(crate) tracked_image_views: FxHashMap<ImageViewId, ImageView>,
     seen_initial_barrier: bool,
     //initial_writes: MemoryAccess,
     initial_access: MemoryAccess,
@@ -244,11 +243,29 @@ impl CommandStream {
             command_buffers_to_submit: vec![],
             command_buffer: None,
             tracked_images: Default::default(),
-            tracked_image_views: Default::default(),
             seen_initial_barrier: false,
             initial_access: MemoryAccess::empty(),
             tracked_writes: MemoryAccess::empty(),
         }
+    }
+
+    unsafe fn bind_bindless_descriptor_sets(
+        &mut self,
+        command_buffer: vk::CommandBuffer,
+        bind_point: vk::PipelineBindPoint,
+        pipeline_layout: vk::PipelineLayout,
+    ) {
+        let texture_set = self.device.inner.texture_descriptors.lock().unwrap().set;
+        let image_set = self.device.inner.image_descriptors.lock().unwrap().set;
+        let sampler_set = self.device.inner.sampler_descriptors.lock().unwrap().set;
+        self.device.cmd_bind_descriptor_sets(
+            command_buffer,
+            bind_point,
+            pipeline_layout,
+            0,
+            &[texture_set, image_set, sampler_set],
+            &[],
+        );
     }
 
     unsafe fn do_cmd_push_descriptor_set(

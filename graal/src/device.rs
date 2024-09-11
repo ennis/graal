@@ -1,4 +1,6 @@
 //! Abstractions over a vulkan device & queues.
+mod bindless;
+
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -17,9 +19,10 @@ use crate::{
     ComputePipeline, ComputePipelineCreateInfo, DescriptorSetLayout, Error, GraphicsPipeline,
     GraphicsPipelineCreateInfo, Image, ImageCreateInfo, ImageInner, ImageType, ImageUsage, ImageView, ImageViewInfo,
     ImageViewInner, MemoryAccess, MemoryLocation, PreRasterizationShaders, Sampler, SamplerCreateInfo, ShaderCode,
-    ShaderStage, Size3D, Swapchain,
+    ShaderStage, Size3D, Swapchain, SUBGROUP_SIZE,
 };
 
+use crate::device::bindless::BindlessDescriptorTable;
 use ash::vk;
 use gpu_allocator::vulkan::{AllocationCreateDesc, AllocationScheme};
 use slotmap::{SecondaryMap, SlotMap};
@@ -27,6 +30,10 @@ use std::{ffi::CStr, mem, sync::atomic::AtomicU64};
 use tracing::{debug, error};
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
+
+pub(crate) const BINDLESS_TEXTURE_SET: u32 = 0;
+pub(crate) const BINDLESS_STORAGE_IMAGE_SET: u32 = 1;
+pub(crate) const BINDLESS_SAMPLER_SET: u32 = 2;
 
 /// Wrapper around a vulkan device, associated queues and tracked resources.
 #[derive(Clone)]
@@ -132,6 +139,7 @@ pub(crate) struct DeviceInner {
 
     // We don't need to hold strong refs here, we just need an ID for them.
     pub(crate) image_ids: Mutex<SlotMap<ImageId, ()>>,
+    pub(crate) sampler_ids: Mutex<SlotMap<SamplerId, ()>>,
     pub(crate) buffer_ids: Mutex<SlotMap<BufferId, ()>>,
     pub(crate) image_view_ids: Mutex<SlotMap<ImageViewId, ()>>,
 
@@ -145,7 +153,9 @@ pub(crate) struct DeviceInner {
     sampler_cache: Mutex<HashMap<SamplerCreateInfo, Sampler>>,
     //compiler: shaderc::Compiler,
     //groups: Mutex<ResourceGroupMap>,
-
+    pub(crate) texture_descriptors: Mutex<BindlessDescriptorTable>,
+    pub(crate) image_descriptors: Mutex<BindlessDescriptorTable>,
+    pub(crate) sampler_descriptors: Mutex<BindlessDescriptorTable>,
     //image_handles: Mutex<SlotMap<I>>
 }
 /// Errors during device creation.
@@ -196,6 +206,20 @@ slotmap::new_key_type! {
 
     /// Identifies a resource group.
     pub struct GroupId;
+
+    pub struct SamplerId;
+}
+
+impl ImageViewId {
+    pub(crate) fn index(&self) -> u32 {
+        (self.0.as_ffi() & 0xFFFF_FFFF) as u32
+    }
+}
+
+impl SamplerId {
+    pub(crate) fn index(&self) -> u32 {
+        (self.0.as_ffi() & 0xFFFF_FFFF) as u32
+    }
 }
 
 /// Describes how a resource got its memory.
@@ -353,6 +377,7 @@ const DEVICE_EXTENSIONS: &[&str] = &[
     "VK_EXT_mesh_shader",
     "VK_EXT_conservative_rasterization",
     "VK_EXT_fragment_shader_interlock",
+    "VK_EXT_shader_image_atomic_int64",
     //"VK_EXT_descriptor_buffer",
 ];
 
@@ -476,6 +501,19 @@ impl Device {
         // Create the shader compiler instance
         //let compiler = shaderc::Compiler::new().expect("failed to create the shader compiler");
 
+        // Create global descriptor tables
+        let texture_descriptors = Mutex::new(BindlessDescriptorTable::new(
+            &device,
+            vk::DescriptorType::SAMPLED_IMAGE,
+            4096,
+        ));
+        let image_descriptors = Mutex::new(BindlessDescriptorTable::new(
+            &device,
+            vk::DescriptorType::STORAGE_IMAGE,
+            4096,
+        ));
+        let sampler_descriptors = Mutex::new(BindlessDescriptorTable::new(&device, vk::DescriptorType::SAMPLER, 4096));
+
         Ok(Device {
             inner: Rc::new(DeviceInner {
                 device,
@@ -493,6 +531,7 @@ impl Device {
                 vk_ext_extended_dynamic_state3,
                 //vk_ext_descriptor_buffer,
                 image_ids: Mutex::new(Default::default()),
+                sampler_ids: Mutex::new(Default::default()),
                 buffer_ids: Mutex::new(Default::default()),
                 tracker: Mutex::new(DeviceTracker::new()),
                 sampler_cache: Mutex::new(Default::default()),
@@ -501,6 +540,9 @@ impl Device {
                 image_view_ids: Mutex::new(Default::default()),
                 dropped_resources: Mutex::new(vec![]),
                 next_submission_index: AtomicU64::new(1),
+                texture_descriptors,
+                image_descriptors,
+                sampler_descriptors,
             }),
         })
     }
@@ -596,6 +638,7 @@ impl Device {
             p_next: &mut ext_dynamic_state as *mut _ as *mut c_void,
             synchronization2: vk::TRUE,
             dynamic_rendering: vk::TRUE,
+            subgroup_size_control: vk::TRUE,
             ..Default::default()
         };
 
@@ -604,6 +647,7 @@ impl Device {
             descriptor_indexing: vk::TRUE,
             descriptor_binding_variable_descriptor_count: vk::TRUE,
             descriptor_binding_partially_bound: vk::TRUE,
+            descriptor_binding_update_unused_while_pending: vk::TRUE,
             shader_uniform_buffer_array_non_uniform_indexing: vk::TRUE,
             shader_storage_buffer_array_non_uniform_indexing: vk::TRUE,
             shader_sampled_image_array_non_uniform_indexing: vk::TRUE,
@@ -628,6 +672,7 @@ impl Device {
                 shader_int64: vk::TRUE,
                 shader_storage_image_extended_formats: vk::TRUE,
                 fragment_stores_and_atomics: vk::TRUE,
+                depth_clamp: vk::TRUE,
                 ..Default::default()
             },
             ..Default::default()
@@ -1004,6 +1049,17 @@ impl Device {
 
         let id = self.inner.image_view_ids.lock().unwrap().insert(());
 
+        // Update the global descriptor table
+        let usage = image.usage();
+        unsafe {
+            if usage.contains(ImageUsage::SAMPLED) {
+                self.write_global_texture_descriptor(id, handle);
+            }
+            if usage.contains(ImageUsage::STORAGE) {
+                self.write_global_storage_image_descriptor(id, handle);
+            }
+        }
+
         ImageView {
             inner: Some(Arc::new(ImageViewInner {
                 image: image.clone(),
@@ -1250,7 +1306,15 @@ impl Device {
                 .create_sampler(&create_info, None)
                 .expect("failed to create sampler")
         };
-        let sampler = Sampler::new(self, sampler);
+        let id = self.inner.sampler_ids.lock().unwrap().insert(());
+        unsafe {
+            self.write_global_sampler_descriptor(id, sampler);
+        }
+        let sampler = Sampler {
+            device: self.weak(),
+            id,
+            sampler,
+        };
         self.inner
             .sampler_cache
             .lock()
@@ -1335,7 +1399,16 @@ impl Device {
         descriptor_set_layouts: &[DescriptorSetLayout],
         push_constants_size: usize,
     ) -> vk::PipelineLayout {
-        let layout_handles: Vec<_> = descriptor_set_layouts.iter().map(|layout| layout.handle).collect();
+        let layout_handles: Vec<_> = if descriptor_set_layouts.is_empty() {
+            // Empty set layouts means use the universal bindless layouts
+            vec![
+                self.inner.texture_descriptors.lock().unwrap().layout,
+                self.inner.image_descriptors.lock().unwrap().layout,
+                self.inner.sampler_descriptors.lock().unwrap().layout,
+            ]
+        } else {
+            descriptor_set_layouts.iter().map(|layout| layout.handle).collect()
+        };
 
         let pc_range = if push_constants_size != 0 {
             Some(match bind_point {
@@ -1383,15 +1456,24 @@ impl Device {
             create_info.push_constants_size,
         );
 
+        let bindless = create_info.set_layouts.is_empty();
+
         let compute_shader = self.create_shader_module(
             ShaderStage::Compute,
             &create_info.compute_shader.code,
             create_info.compute_shader.entry_point,
         )?;
 
+        let req_subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo {
+            required_subgroup_size: SUBGROUP_SIZE,
+            p_next: ptr::null_mut(),
+            ..Default::default()
+        };
+
         let cpci = vk::ComputePipelineCreateInfo {
             flags: vk::PipelineCreateFlags::empty(),
             stage: vk::PipelineShaderStageCreateInfo {
+                p_next: &req_subgroup_size as *const _ as *const c_void,
                 flags: Default::default(),
                 stage: vk::ShaderStageFlags::COMPUTE,
                 module: compute_shader,
@@ -1421,6 +1503,7 @@ impl Device {
             pipeline,
             pipeline_layout,
             _descriptor_set_layouts: create_info.set_layouts.to_vec(),
+            bindless,
         })
     }
 
@@ -1431,6 +1514,8 @@ impl Device {
             create_info.set_layouts,
             create_info.push_constants_size,
         );
+
+        let bindless = create_info.set_layouts.is_empty();
 
         // ------ Dynamic states ------
 
@@ -1491,6 +1576,13 @@ impl Device {
         };
 
         // ------ Shader stages ------
+
+        let req_subgroup_size = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo {
+            required_subgroup_size: SUBGROUP_SIZE,
+            p_next: ptr::null_mut(),
+            ..Default::default()
+        };
+
         let mut stages = Vec::new();
         match create_info.pre_rasterization_shaders {
             PreRasterizationShaders::PrimitiveShading {
@@ -1514,6 +1606,7 @@ impl Device {
                     .transpose()?;
 
                 stages.push(vk::PipelineShaderStageCreateInfo {
+                    p_next: &req_subgroup_size as *const _ as *const c_void,
                     flags: Default::default(),
                     stage: vk::ShaderStageFlags::VERTEX,
                     module: vertex,
@@ -1523,6 +1616,7 @@ impl Device {
                 });
                 if let Some(tess_control) = tess_control {
                     stages.push(vk::PipelineShaderStageCreateInfo {
+                        p_next: &req_subgroup_size as *const _ as *const c_void,
                         flags: Default::default(),
                         stage: vk::ShaderStageFlags::TESSELLATION_CONTROL,
                         module: tess_control,
@@ -1533,6 +1627,7 @@ impl Device {
                 }
                 if let Some(tess_evaluation) = tess_evaluation {
                     stages.push(vk::PipelineShaderStageCreateInfo {
+                        p_next: &req_subgroup_size as *const _ as *const c_void,
                         flags: Default::default(),
                         stage: vk::ShaderStageFlags::TESSELLATION_EVALUATION,
                         module: tess_evaluation,
@@ -1543,6 +1638,7 @@ impl Device {
                 }
                 if let Some(geometry) = geometry {
                     stages.push(vk::PipelineShaderStageCreateInfo {
+                        p_next: &req_subgroup_size as *const _ as *const c_void,
                         flags: Default::default(),
                         stage: vk::ShaderStageFlags::GEOMETRY,
                         module: geometry,
@@ -1556,6 +1652,7 @@ impl Device {
                 if let Some(task) = task {
                     let task = self.create_shader_module(ShaderStage::Task, &task.code, task.entry_point)?;
                     stages.push(vk::PipelineShaderStageCreateInfo {
+                        p_next: &req_subgroup_size as *const _ as *const c_void,
                         flags: Default::default(),
                         stage: vk::ShaderStageFlags::TASK_EXT,
                         module: task,
@@ -1567,6 +1664,7 @@ impl Device {
 
                 let mesh = self.create_shader_module(ShaderStage::Mesh, &mesh.code, mesh.entry_point)?;
                 stages.push(vk::PipelineShaderStageCreateInfo {
+                    p_next: &req_subgroup_size as *const _ as *const c_void,
                     flags: Default::default(),
                     stage: vk::ShaderStageFlags::MESH_EXT,
                     module: mesh,
@@ -1631,7 +1729,7 @@ impl Device {
 
         let rasterization_state = vk::PipelineRasterizationStateCreateInfo {
             p_next: &conservative_rasterization_state as *const _ as *const _,
-            depth_clamp_enable: 0,
+            depth_clamp_enable: create_info.rasterization.depth_clamp_enable.into(),
             rasterizer_discard_enable: 0,
             polygon_mode: create_info.rasterization.polygon_mode.into(),
             cull_mode: create_info.rasterization.cull_mode.into(),
@@ -1751,6 +1849,7 @@ impl Device {
             pipeline,
             pipeline_layout,
             _descriptor_set_layouts: create_info.set_layouts.to_vec(),
+            bindless,
         })
     }
 }

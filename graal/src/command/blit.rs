@@ -165,45 +165,6 @@ impl CommandStream {
         }
     }
 
-    /// Short-hand to `blit_image` for blitting the top-level mip level of an image.
-    pub fn blit_full_image_top_mip_level(&mut self, src: &Image, dst: &Image) {
-        let width = src.width() as i32;
-        let height = src.height() as i32;
-        self.blit_image(
-            &src,
-            ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            Rect3D {
-                min: Point3D { x: 0, y: 0, z: 0 },
-                max: Point3D {
-                    x: width,
-                    y: height,
-                    z: 1,
-                },
-            },
-            &dst,
-            ImageSubresourceLayers {
-                aspect_mask: vk::ImageAspectFlags::COLOR,
-                mip_level: 0,
-                base_array_layer: 0,
-                layer_count: 1,
-            },
-            Rect3D {
-                min: Point3D { x: 0, y: 0, z: 0 },
-                max: Point3D {
-                    x: width,
-                    y: height,
-                    z: 1,
-                },
-            },
-            vk::Filter::NEAREST,
-        );
-    }
-
     // TODO the call-site verbosity of this method is ridiculous, fix that
     pub fn blit_image(
         &mut self,

@@ -950,3 +950,11 @@ Consider graal as an implementation detail of the vulkan backend. So remove stuf
 
 - BlitEncoders: move to CommandStream
 - enums should typedef to vk types
+
+# Enhancements
+
+# Dev notes
+
+- it's **very easy** to forget calling `reference_resource` on transient resources; not obvious at first glance, no
+  warnings from validation layers with buffer device address.
+    - TODO: methods to create "pre-referenced" transient resources so that we don't have to call reference_resource

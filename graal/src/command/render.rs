@@ -2,11 +2,10 @@
 use std::{mem, mem::MaybeUninit, ops::Range, ptr, slice};
 
 use ash::vk;
-use fxhash::FxHashMap;
 
 use crate::{
     is_depth_and_stencil_format, Barrier, BufferRangeUntyped, ClearColorValue, ColorAttachment, CommandStream,
-    DepthStencilAttachment, Descriptor, Device, GpuResource, GraphicsPipeline, ImageView, ImageViewId, Rect2D,
+    DepthStencilAttachment, Descriptor, Device, GpuResource, GraphicsPipeline, Rect2D,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -19,7 +18,6 @@ pub struct RenderEncoder<'a> {
     command_buffer: vk::CommandBuffer,
     render_area: vk::Rect2D,
     pipeline_layout: vk::PipelineLayout,
-    pub(crate) used_image_views: FxHashMap<ImageViewId, ImageView>,
 }
 
 impl<'a> RenderEncoder<'a> {
@@ -134,6 +132,13 @@ impl<'a> RenderEncoder<'a> {
                 vk::PipelineBindPoint::GRAPHICS,
                 pipeline.pipeline,
             );
+            if pipeline.bindless {
+                self.stream.bind_bindless_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline.pipeline_layout,
+                );
+            }
             self.pipeline_layout = pipeline.pipeline_layout;
             // TODO strong ref to pipeline
         }
@@ -380,23 +385,8 @@ impl<'a> RenderEncoder<'a> {
     }
 
     fn do_finish(&mut self) {
-        /*for (_, (buffer, access)) in self.used_buffers.drain() {
-            self.stream.use_buffer(&buffer, access);
-        }
-
-        for (_, (image, access)) in self.used_images.drain() {
-            self.stream.use_image(&image, access);
-        }*/
-
-        for (_, image_view) in self.used_image_views.drain() {
-            self.stream.tracked_image_views.insert(image_view.id(), image_view);
-        }
-
-        self.stream.close_command_buffer();
-
         unsafe {
             self.stream.device.cmd_end_rendering(self.command_buffer);
-            self.stream.set_current_command_buffer(self.command_buffer);
         }
     }
 }
@@ -550,7 +540,7 @@ impl CommandStream {
             ..Default::default()
         };
 
-        let command_buffer = self.create_command_buffer_raw();
+        let command_buffer = self.get_or_create_command_buffer();
         unsafe {
             self.device.cmd_begin_rendering(command_buffer, &rendering_info);
         }
@@ -560,7 +550,6 @@ impl CommandStream {
             command_buffer,
             render_area,
             pipeline_layout: Default::default(),
-            used_image_views: Default::default(),
         };
 
         encoder.set_viewport(

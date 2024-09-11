@@ -55,8 +55,16 @@ impl<'a> ComputeEncoder<'a> {
         let device = self.stream.device();
         unsafe {
             device.cmd_bind_pipeline(self.command_buffer, vk::PipelineBindPoint::COMPUTE, pipeline.pipeline);
+            if pipeline.bindless {
+                self.stream.bind_bindless_descriptor_sets(
+                    self.command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    pipeline.pipeline_layout,
+                );
+            }
         }
         self.pipeline_layout = pipeline.pipeline_layout;
+
         // TODO: we need to hold a reference to the pipeline until the command buffers are submitted
     }
 

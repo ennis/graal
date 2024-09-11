@@ -1,7 +1,7 @@
 //! Shader compilation utilities.
 use crate::{Error, ShaderSource, ShaderStage};
 use once_cell::sync::Lazy;
-use shaderc::{EnvVersion, SpirvVersion, TargetEnv};
+use shaderc::{EnvVersion, OptimizationLevel, SpirvVersion, TargetEnv};
 use std::borrow::Cow;
 use tracing::error;
 
@@ -105,6 +105,7 @@ pub fn compile_shader(
     compile_options.set_target_env(TargetEnv::Vulkan, EnvVersion::Vulkan1_3 as u32);
     compile_options.set_target_spirv(SpirvVersion::V1_5);
     compile_options.set_generate_debug_info();
+    compile_options.set_optimization_level(OptimizationLevel::Zero);
     match kind {
         shaderc::ShaderKind::Vertex => {
             compile_options.add_macro_definition("__VERTEX__", None);

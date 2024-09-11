@@ -786,6 +786,7 @@ pub struct RasterizationState {
     pub polygon_mode: vk::PolygonMode,
     pub cull_mode: vk::CullModeFlags,
     pub front_face: vk::FrontFace,
+    pub depth_clamp_enable: bool,
     pub conservative_rasterization_mode: vk::ConservativeRasterizationModeEXT,
 }
 

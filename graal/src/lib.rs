@@ -1,3 +1,4 @@
+//mod bindless;
 mod command;
 mod device;
 mod instance;
@@ -59,6 +60,9 @@ pub mod prelude {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// Standard subgroup size.
+pub const SUBGROUP_SIZE: u32 = 32;
+
 /// Device address of a GPU buffer.
 #[derive(Copy, Clone, Debug, Ord, PartialOrd, PartialEq, Eq, Hash)]
 #[repr(transparent)]
@@ -66,7 +70,7 @@ pub struct DeviceAddressUntyped {
     pub address: vk::DeviceAddress,
 }
 
-/// Device address of a GPU buffer with its associated type.
+/// Device address of a GPU buffer containing elements of type `T` its associated type.
 ///
 /// The type should be `T: Copy` for a buffer containing a single element of type T,
 /// or `[T] where T: Copy` for slices of elements of type T.
@@ -74,6 +78,15 @@ pub struct DeviceAddressUntyped {
 pub struct DeviceAddress<T: ?Sized + 'static> {
     pub address: vk::DeviceAddress,
     pub _phantom: PhantomData<T>,
+}
+
+impl<T: 'static> DeviceAddress<[T]> {
+    pub fn offset(self, offset: usize) -> Self {
+        DeviceAddress {
+            address: self.address + (offset * mem::size_of::<T>()) as u64,
+            _phantom: PhantomData,
+        }
+    }
 }
 
 impl<T: ?Sized + 'static> Clone for DeviceAddress<T> {
@@ -86,6 +99,30 @@ impl<T: ?Sized + 'static> Clone for DeviceAddress<T> {
 }
 
 impl<T: ?Sized + 'static> Copy for DeviceAddress<T> {}
+
+/// Handle to an image in a shader.
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct ImageHandle {
+    /// Index of the image in the image descriptor array.
+    pub index: u32,
+}
+
+/// Handle to an image in a shader.
+#[derive(Copy, Clone, Debug, Default)]
+#[repr(C)]
+pub struct Texture2DHandleRange {
+    pub index: u32,
+    pub count: u32,
+}
+
+/// Handle to a sampler in a shader.
+#[derive(Copy, Clone, Debug)]
+#[repr(transparent)]
+pub struct SamplerHandle {
+    /// Index of the image in the sampler descriptor array.
+    pub index: u32,
+}
 
 /// Represents a swap chain.
 #[derive(Debug)]
@@ -109,13 +146,16 @@ pub struct SwapchainImage {
 }
 
 /// Graphics pipelines.
-// TODO this should be a GpuResource
+///
+/// TODO Drop impl
+#[derive(Clone)]
 pub struct GraphicsPipeline {
     pub(crate) device: Device,
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     // Push descriptors require live VkDescriptorSetLayouts (kill me already)
     _descriptor_set_layouts: Vec<DescriptorSetLayout>,
+    pub(crate) bindless: bool,
 }
 
 impl GraphicsPipeline {
@@ -132,11 +172,15 @@ impl GraphicsPipeline {
 }
 
 /// Compute pipelines.
+///
+/// TODO Drop impl
+#[derive(Clone)]
 pub struct ComputePipeline {
     pub(crate) device: Device,
     pub(crate) pipeline: vk::Pipeline,
     pub(crate) pipeline_layout: vk::PipelineLayout,
     _descriptor_set_layouts: Vec<DescriptorSetLayout>,
+    pub(crate) bindless: bool,
 }
 
 impl ComputePipeline {
@@ -157,17 +201,11 @@ impl ComputePipeline {
 pub struct Sampler {
     // A weak ref is sufficient, the device already owns samplers in its cache
     device: WeakDevice,
+    id: SamplerId,
     sampler: vk::Sampler,
 }
 
 impl Sampler {
-    pub(crate) fn new(device: &Device, sampler: vk::Sampler) -> Sampler {
-        Sampler {
-            device: device.weak(),
-            sampler,
-        }
-    }
-
     pub fn set_name(&self, label: &str) {
         unsafe {
             self.device
@@ -187,6 +225,10 @@ impl Sampler {
 
     pub fn descriptor(&self) -> Descriptor {
         Descriptor::Sampler { sampler: self.clone() }
+    }
+
+    pub fn device_handle(&self) -> SamplerHandle {
+        SamplerHandle { index: self.id.index() }
     }
 }
 
@@ -354,9 +396,17 @@ impl BufferUntyped {
         &self.inner.as_ref().unwrap().device
     }
 
-    /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
-    pub fn mapped_data(&self) -> Option<*mut u8> {
-        self.mapped_ptr.map(|ptr| ptr.as_ptr() as *mut u8)
+    /// Returns whether the buffer is host-visible, and mapped in host memory.
+    pub fn host_visible(&self) -> bool {
+        self.mapped_ptr.is_some()
+    }
+
+    /// Returns a pointer to the buffer mapped in host memory. Panics if the buffer was not mapped in
+    /// host memory.
+    pub fn as_mut_ptr(&self) -> *mut u8 {
+        self.mapped_ptr
+            .expect("buffer was not mapped in host memory (consider using MemoryLocation::CpuToGpu)")
+            .as_ptr() as *mut u8
     }
 }
 
@@ -612,6 +662,15 @@ impl ImageView {
             layout,
         }
     }
+
+    /// Returns the bindless texture handle of this image view.
+    pub fn device_image_handle(&self) -> ImageHandle {
+        ImageHandle {
+            index: self.id().index(),
+        }
+    }
+
+    //pub fn device_handle(&self) ->
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -771,6 +830,12 @@ impl<T: ?Sized> Clone for Buffer<T> {
     }
 }
 
+impl<T: ?Sized> GpuResource for Buffer<T> {
+    fn set_last_submission_index(&self, submission_index: u64) {
+        self.untyped.set_last_submission_index(submission_index);
+    }
+}
+
 impl<T: ?Sized> Buffer<T> {
     fn new(buffer: BufferUntyped) -> Self {
         Self {
@@ -802,6 +867,17 @@ impl<T: ?Sized> Buffer<T> {
         self.untyped.handle()
     }
 
+    pub fn host_visible(&self) -> bool {
+        self.untyped.host_visible()
+    }
+
+    pub fn device_address(&self) -> DeviceAddress<T> {
+        DeviceAddress {
+            address: self.untyped.device_address().address,
+            _phantom: PhantomData,
+        }
+    }
+
     /// Returns the device on which the buffer was created.
     pub fn device(&self) -> &Device {
         self.untyped.device()
@@ -809,11 +885,9 @@ impl<T: ?Sized> Buffer<T> {
 }
 
 impl<T: Copy + 'static> Buffer<T> {
-    pub fn device_address(&self) -> DeviceAddress<T> {
-        DeviceAddress {
-            address: self.untyped.device_address().address,
-            _phantom: PhantomData,
-        }
+    /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
+    pub fn as_mut_ptr(&self) -> *mut T {
+        self.untyped.as_mut_ptr() as *mut T
     }
 }
 
@@ -824,16 +898,16 @@ impl<T> Buffer<[T]> {
     }
 
     /// If the buffer is mapped in host memory, returns a pointer to the mapped memory.
-    pub fn mapped_data(&self) -> Option<*mut T> {
-        self.untyped.mapped_data().map(|ptr| ptr as *mut T)
+    pub fn as_mut_ptr(&self) -> *mut T {
+        self.untyped.as_mut_ptr() as *mut T
     }
 
-    pub fn device_address(&self) -> DeviceAddress<[T]> {
+    /*pub fn device_address(&self) -> DeviceAddress<[T]> {
         DeviceAddress {
             address: self.untyped.device_address().address,
             _phantom: PhantomData,
         }
-    }
+    }*/
 
     /// Element range.
     pub fn slice(&self, range: impl RangeBounds<usize>) -> BufferRange<[T]> {
@@ -1132,6 +1206,7 @@ impl<'a> PreRasterizationShaders<'a> {
 
 #[derive(Copy, Clone, Debug)]
 pub struct GraphicsPipelineCreateInfo<'a> {
+    /// If left empty, use the universal descriptor set layout.
     pub set_layouts: &'a [DescriptorSetLayout],
     // None of the relevant drivers on desktop seem to care about precise push constant ranges,
     // so we just store the total size of push constants.
@@ -1145,85 +1220,11 @@ pub struct GraphicsPipelineCreateInfo<'a> {
 
 #[derive(Copy, Clone, Debug)]
 pub struct ComputePipelineCreateInfo<'a> {
+    /// If left empty, use the universal descriptor set layout.
     pub set_layouts: &'a [DescriptorSetLayout],
     pub push_constants_size: usize,
     pub compute_shader: ShaderEntryPoint<'a>,
 }
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-/*
-/// Specifies the type of a graphics pipeline with the given vertex input, arguments and push constants.
-#[macro_export]
-macro_rules! graphics_pipeline_interface {
-    [
-        $(#[$meta:meta])*
-        $v:vis struct $name:ident {
-            arguments {
-                $(
-                    $(#[$arg_meta:meta])*
-                    $arg_binding:literal => $arg_method:ident($arg_ty:ty)
-                ),*
-            }
-
-            $(push_constants {
-                $(#[$push_cst_meta:meta])*
-                $push_constants_method:ident($push_constants_ty:ty)
-            })?
-
-            $(output_attachments($attachments_ty:ty))?
-        }
-    ] => {
-        $(#[$meta])*
-        $v struct $name<'a> {
-            p: crate::encoder::RenderEncoder<'a>,
-        }
-
-        impl<'a> $name<'a> {
-            $(
-                $(#[$arg_meta])*
-                pub fn $arg_method(&mut self, arg: &$arg_ty) {
-                    unsafe {
-                        self.p.bind_arguments($arg_binding, &arg)
-                    }
-                }
-            )*
-
-            $(
-                $(#[$push_cst_meta])*
-                pub fn $push_constants_method(&mut self, push_constants: &$push_constants_ty) {
-                    unsafe {
-                        self.p.bind_push_constants(push_constants)
-                    }
-                }
-            )?
-        }
-
-        impl<'a> crate::device::StaticPipelineInterface for $name<'a> {
-            const ARGUMENTS: &'static [&'static crate::argument::ArgumentsLayout<'static>] = &[
-                $(
-                    &$arg_ty::LAYOUT
-                ),*
-            ];
-
-            const PUSH_CONSTANTS: &'static [crate::vk::PushConstantRange] = graphics_pipeline_interface!(@push_constants $($push_constants_ty)?);
-
-            type Attachments = graphics_pipeline_interface!(@attachments $($attachments_ty)?);
-        }
-    };
-
-    //------------------------------------------------
-
-    // No push constants -> empty constant ranges
-    (@push_constants ) => { &[] };
-    (@push_constants $t:ty) => { <$t as $crate::argument::StaticPushConstants>::PUSH_CONSTANT_RANGES };
-
-    // Default attachment type if left unspecified
-    (@attachments ) => { () };
-    (@attachments $t:ty) => { $t };
-}*/
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
 
 /// Computes the number of mip levels for a 2D image of the given size.
 ///
